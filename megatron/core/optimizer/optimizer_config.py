@@ -146,6 +146,27 @@ class OptimizerConfig:
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
+    ####################
+    # DP-SGD (differential privacy)
+    ####################
+    dp_sgd: bool = False
+    """Enable differentially private SGD."""
+
+    dp_noise_multiplier: float = 0.0
+    """Noise multiplier sigma for DP-SGD. Noise variance = (sigma * C)^2."""
+
+    dp_delta: float = 1e-7
+    """Target delta for (epsilon, delta)-DP guarantee."""
+
+    dp_epsilon_budget: float = float('inf')
+    """Maximum epsilon budget. Training halts when exceeded."""
+
+    dp_clipping_norm: float = 1.0
+    """Per-example gradient clipping norm C (mirrored from TransformerConfig)."""
+
+    dp_num_dataset_examples: int = 0
+    """Total number of privacy units N (for DP accounting)."""
+
     def __post_init__(self):
         """Check the validity of the config."""
         if self.use_precision_aware_optimizer:

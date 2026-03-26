@@ -58,6 +58,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
 
+    parser = _add_dp_sgd_args(parser)
+
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
@@ -265,6 +267,43 @@ def validate_args(args, defaults={}):
 
     if args.expert_tensor_parallel_size is None:
         args.expert_tensor_parallel_size = args.tensor_model_parallel_size
+
+    # DP-SGD validation and auto-configuration.
+    if args.dp_sgd:
+        assert args.dp_num_dataset_examples > 0, \
+            '--dp-num-dataset-examples must be set when --dp-sgd is enabled'
+        assert args.pipeline_model_parallel_size == 1, \
+            'DP-SGD requires PP=1 (pipeline parallelism not supported)'
+        # Auto-disable incompatible features.
+        if hasattr(args, 'gradient_accumulation_fusion') and args.gradient_accumulation_fusion:
+            if args.rank == 0:
+                print('WARNING: --dp-sgd auto-disabling --gradient-accumulation-fusion')
+            args.gradient_accumulation_fusion = False
+        if hasattr(args, 'overlap_grad_reduce') and args.overlap_grad_reduce:
+            if args.rank == 0:
+                print('WARNING: --dp-sgd auto-disabling --overlap-grad-reduce')
+            args.overlap_grad_reduce = False
+        if hasattr(args, 'overlap_param_gather') and args.overlap_param_gather:
+            if args.rank == 0:
+                print('WARNING: --dp-sgd auto-disabling --overlap-param-gather')
+            args.overlap_param_gather = False
+        # Disable standard gradient clipping (DP-SGD has its own).
+        args.clip_grad = 0.0
+        # Untie embeddings — avoids VocabParallel ghost clipping complexity.
+        if hasattr(args, 'untie_embeddings_and_output_weights'):
+            if not args.untie_embeddings_and_output_weights:
+                if args.rank == 0:
+                    print('WARNING: --dp-sgd auto-enabling --untie-embeddings-and-output-weights')
+                args.untie_embeddings_and_output_weights = True
+        # Disable sequence parallelism (per-example norms need extra SP all-reduces).
+        if hasattr(args, 'sequence_parallel') and args.sequence_parallel:
+            if args.rank == 0:
+                print('WARNING: --dp-sgd auto-disabling --sequence-parallel')
+            args.sequence_parallel = False
+        if args.rank == 0:
+            print(f'DP-SGD enabled: sigma={args.dp_noise_multiplier}, '
+                  f'C={args.dp_clipping_norm}, delta={args.dp_delta}, '
+                  f'epsilon_budget={args.dp_epsilon_budget}, N={args.dp_num_dataset_examples}')
 
     # Deprecated arguments.
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -2386,4 +2425,30 @@ def _add_experimental_args(parser):
                        help='Dtype of exp_avg when enabling precision-aware-optimizer')
     group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
                        help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+    return parser
+
+
+def _add_dp_sgd_args(parser):
+    group = parser.add_argument_group(title='differential privacy (DP-SGD)')
+
+    group.add_argument('--dp-sgd', action='store_true', default=False,
+                       help='Enable differentially private SGD (per-example gradient '
+                       'clipping + Gaussian noise injection).')
+    group.add_argument('--dp-noise-multiplier', type=float, default=0.6,
+                       help='Noise multiplier sigma for DP-SGD. '
+                       'Noise variance per coordinate = (sigma * C)^2.')
+    group.add_argument('--dp-clipping-norm', type=float, default=1.0,
+                       help='Per-example gradient clipping norm C.')
+    group.add_argument('--dp-delta', type=float, default=1e-7,
+                       help='Target delta for (epsilon, delta)-DP guarantee.')
+    group.add_argument('--dp-epsilon-budget', type=float, default=float('inf'),
+                       help='Maximum epsilon budget. Training halts before the step '
+                       'that would exceed this.')
+    group.add_argument('--dp-loss-aggregation', type=str, default='mean',
+                       choices=['mean', 'sum'],
+                       help='Per-example loss aggregation over tokens. '
+                       'Mean keeps gradient norms length-invariant.')
+    group.add_argument('--dp-num-dataset-examples', type=int, default=0,
+                       help='Total number of privacy units N in the dataset '
+                       '(for DP accounting). Required when --dp-sgd is set.')
     return parser

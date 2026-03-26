@@ -432,6 +432,18 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    ####################
+    # DP-SGD (differential privacy)
+    ####################
+    dp_sgd: bool = False
+    """Enable differentially private SGD (per-example gradient clipping + noise)."""
+
+    dp_clipping_norm: float = 1.0
+    """Per-example gradient clipping norm C for DP-SGD."""
+
+    dp_noise_multiplier: float = 0.0
+    """Noise multiplier sigma for DP-SGD. Noise std = sigma * C."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
