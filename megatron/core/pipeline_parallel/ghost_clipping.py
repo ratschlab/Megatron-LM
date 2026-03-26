@@ -65,15 +65,13 @@ class GhostClippingContext:
         self._input_norms_sq: Dict[int, torch.Tensor] = {}  # module_id → [B]
         # LayerNorm: normalized input norms saved in forward
         self._ln_xhat_dim_sq: Dict[int, torch.Tensor] = {}  # module_id → [B, H]
-        # Embedding: token ids saved in forward
-        self._embedding_input_ids: Optional[torch.Tensor] = None
+        # Embedding: token ids saved in forward, keyed by module id
+        self._embedding_input_ids: Dict[int, torch.Tensor] = {}
         # Per-example squared norm contributions, split by TP classification.
         # Sharded params: each TP rank holds a partial norm (all-reduce to get total).
         # Replicated params: identical across TP ranks (count only on rank 0).
         self._per_example_norm_sq_sharded: List[torch.Tensor] = []   # from TP-sharded params
         self._per_example_norm_sq_replicated: List[torch.Tensor] = []  # from replicated params
-        # Legacy accessor for backward compatibility
-        self._per_example_norm_sq: List[torch.Tensor] = []  # combined (for Phase 2 compat)
         # Track which params are covered by hooks
         self._hooked_params: Set[int] = set()
         # Track expected norm contributions for verification
@@ -148,7 +146,7 @@ class GhostClippingContext:
 
     def compute_clip_factors(self) -> torch.Tensor:
         """Aggregate per-example norms across all layers, return clip factors [B]."""
-        all_norms = self._per_example_norm_sq_sharded + self._per_example_norm_sq_replicated + self._per_example_norm_sq
+        all_norms = self._per_example_norm_sq_sharded + self._per_example_norm_sq_replicated
         assert len(all_norms) > 0, "No norms computed — did backward run?"
         assert len(all_norms) >= self._expected_norm_contributions, (
             f"DP-SGD ghost clipping: expected >= {self._expected_norm_contributions} norm "
@@ -162,11 +160,14 @@ class GhostClippingContext:
         # Sum sharded norms (partial on each TP rank → all-reduce gives total)
         if self._per_example_norm_sq_sharded:
             total_sharded = torch.stack(self._per_example_norm_sq_sharded).sum(dim=0)
+        elif self._per_example_norm_sq_replicated:
+            total_sharded = torch.zeros_like(self._per_example_norm_sq_replicated[0])
         else:
-            total_sharded = torch.zeros(1, device='cuda')
+            # Fallback — shouldn't happen if hooks fired correctly
+            total_sharded = torch.zeros(1)
 
         # Sum replicated norms (identical on all TP ranks → count only on rank 0)
-        replicated_list = self._per_example_norm_sq_replicated + self._per_example_norm_sq
+        replicated_list = self._per_example_norm_sq_replicated
         if replicated_list:
             total_replicated = torch.stack(replicated_list).sum(dim=0)
         else:
@@ -193,11 +194,11 @@ class GhostClippingContext:
         self._hooks.clear()
         self._input_norms_sq.clear()
         self._ln_xhat_dim_sq.clear()
-        self._per_example_norm_sq.clear()
         self._per_example_norm_sq_sharded.clear()
         self._per_example_norm_sq_replicated.clear()
         self._hooked_params.clear()
-        self._embedding_input_ids = None
+        self._embedding_input_ids.clear()
+        self._expected_norm_contributions = 0  # reset for reuse
 
     # ---- Linear layer hooks ----
 
@@ -226,9 +227,8 @@ class GhostClippingContext:
         if x_norm_sq is not None:
             weight_norm = go_norm_sq * x_norm_sq
             # Append to correct accumulator based on TP sharding
-            is_sharded = getattr(module, 'tensor_model_parallel', False) or \
-                         any(getattr(p, 'tensor_model_parallel', False)
-                             for p in module.parameters())
+            is_sharded = getattr(module.weight, 'tensor_model_parallel', False) \
+                         if hasattr(module, 'weight') else False
             if is_sharded:
                 self._per_example_norm_sq_sharded.append(weight_norm)
             else:
@@ -299,8 +299,8 @@ class GhostClippingContext:
         self._hooks.extend([h1, h2])
 
     def _embedding_forward_hook(self, module, args, output):
-        """Save token ids for scatter-add in backward."""
-        self._embedding_input_ids = args[0]  # [B, S]
+        """Save token ids for scatter-add in backward, keyed by module id."""
+        self._embedding_input_ids[id(module)] = args[0]  # [B, S]
         # Check for TP-sharded embedding (VocabParallelEmbedding has vocab_start_index)
         assert not getattr(module, 'reduce_scatter_embeddings', False), \
             "DP-SGD embedding hooks assume reduce_scatter_embeddings=False (SP disabled)"
@@ -308,10 +308,10 @@ class GhostClippingContext:
     def _embedding_backward_hook(self, module, grad_input, grad_output):
         """Exact per-example embedding gradient norm via scatter-add."""
         go = grad_output[0]  # shape varies — may be [B, S, H] or [S, B, H]
-        if go is None or self._embedding_input_ids is None:
+        if go is None or id(module) not in self._embedding_input_ids:
             return
 
-        input_ids = self._embedding_input_ids
+        input_ids = self._embedding_input_ids[id(module)]
 
         # Handle vocab-sharded embedding (VocabParallelEmbedding with TP > 1)
         vocab_start = getattr(module, 'vocab_start_index', 0)
@@ -332,7 +332,8 @@ class GhostClippingContext:
         for i in range(B):
             # For TP-sharded embedding: mask out-of-shard tokens, remap to local indices
             ids = input_ids[i]
-            if vocab_start > 0 or vocab_end < 65536:  # vocab-sharded (VocabParallel)
+            is_vocab_sharded = hasattr(module, 'vocab_start_index')  # VocabParallelEmbedding
+            if is_vocab_sharded:
                 mask = (ids >= vocab_start) & (ids < vocab_end)
                 local_ids = (ids - vocab_start).clamp(0, V_local - 1)
                 go_masked = go_f[i] * mask.unsqueeze(-1).float()

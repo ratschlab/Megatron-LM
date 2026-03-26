@@ -279,8 +279,9 @@ def validate_args(args, defaults={}):
         assert not getattr(args, 'num_experts', None), \
             'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
         # Phase 3: force calculate_per_token_loss=True to prevent DDP 1/DP gradient pre-scaling
-        if hasattr(args, 'calculate_per_token_loss'):
-            args.calculate_per_token_loss = True
+        assert hasattr(args, 'calculate_per_token_loss'), \
+            'DP-SGD requires calculate_per_token_loss support (Megatron version too old?)'
+        args.calculate_per_token_loss = True
         # Phase 3: distributed optimizer requires single instance
         if getattr(args, 'num_distributed_optimizer_instances', 1) != 1:
             raise ValueError('DP-SGD requires num_distributed_optimizer_instances=1')
