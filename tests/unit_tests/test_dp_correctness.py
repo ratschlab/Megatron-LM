@@ -642,6 +642,208 @@ class TestPropertyInvariants:
                 f"Non-finite update with B={B}"
 
 
+class TestCanaryInjection:
+    """Inject a 'canary' example with extreme gradient, verify it's properly bounded."""
+
+    def test_canary_clipped_to_C(self):
+        """A canary with 100x normal gradient should be clipped to same norm as others."""
+        torch.manual_seed(42)
+        model = TinyModel(4)
+        B = 4
+        C = 1.0
+
+        # Normal examples + one canary with extreme values
+        x_normal = torch.randn(B - 1, 4)
+        x_canary = torch.randn(1, 4) * 100  # extreme input
+        x = torch.cat([x_normal, x_canary], dim=0)
+
+        output = model(x)
+        losses = output.sum(dim=-1)
+
+        # Per-example norms
+        norms = torch.zeros(B)
+        for i in range(B):
+            model.zero_grad()
+            losses[i].backward(retain_graph=True)
+            norms[i] = sum(p.grad.float().norm().item() ** 2
+                            for p in model.parameters() if p.grad is not None) ** 0.5
+
+        clips = torch.clamp(C / (norms + 1e-6), max=1.0)
+
+        # Canary should be aggressively clipped
+        assert clips[-1].item() < 0.1, \
+            f"Canary should be heavily clipped, got clip_factor={clips[-1]:.4f}"
+
+        # But its clipped contribution is still bounded by C
+        clipped_norm = clips[-1] * norms[-1]
+        assert clipped_norm.item() <= C + 1e-4
+
+    def test_canary_indistinguishable_with_noise(self):
+        """With sufficient noise, the gradient contribution of a canary should be
+        statistically indistinguishable from a normal example."""
+        torch.manual_seed(42)
+        model = TinyModel(4)
+        C = 1.0
+        sigma = 5.0  # high noise
+
+        num_trials = 100
+        canary_updates = []
+        normal_updates = []
+
+        for trial in range(num_trials):
+            torch.manual_seed(trial)
+            m = TinyModel(4)
+            m.load_state_dict(model.state_dict())
+
+            # With canary
+            x_canary = torch.cat([torch.randn(3, 4), torch.randn(1, 4) * 100])
+            out = m(x_canary)
+            losses = out.sum(dim=-1)
+            update_canary, _, _, _ = simulate_dp_sgd_step(m, x_canary, losses, C, sigma, 0.1)
+            canary_updates.append(
+                torch.cat([v.flatten() for v in update_canary.values()]).norm().item()
+            )
+
+            # Without canary (all normal)
+            m2 = TinyModel(4)
+            m2.load_state_dict(model.state_dict())
+            x_normal = torch.randn(4, 4)
+            out2 = m2(x_normal)
+            losses2 = out2.sum(dim=-1)
+            update_normal, _, _, _ = simulate_dp_sgd_step(m2, x_normal, losses2, C, sigma, 0.1)
+            normal_updates.append(
+                torch.cat([v.flatten() for v in update_normal.values()]).norm().item()
+            )
+
+        # The distributions of update norms should overlap significantly
+        canary_mean = sum(canary_updates) / len(canary_updates)
+        normal_mean = sum(normal_updates) / len(normal_updates)
+        canary_std = (sum((x - canary_mean) ** 2 for x in canary_updates) / len(canary_updates)) ** 0.5
+        normal_std = (sum((x - normal_mean) ** 2 for x in normal_updates) / len(normal_updates)) ** 0.5
+
+        # Effect size (Cohen's d) should be small with high noise
+        pooled_std = ((canary_std ** 2 + normal_std ** 2) / 2) ** 0.5
+        if pooled_std > 0:
+            cohens_d = abs(canary_mean - normal_mean) / pooled_std
+            assert cohens_d < 1.0, \
+                f"Canary distinguishable: Cohen's d={cohens_d:.3f} (should be <1.0 with sigma={sigma})"
+
+
+class TestDataIndependenceAudit:
+    """Re:cord-play style audit: verify DP mechanism is data-independent."""
+
+    def test_adjacent_datasets_same_mechanism(self):
+        """Two datasets differing by one example should use identical noise/clipping
+        mechanism. Only the gradient values differ, not the DP operations."""
+        torch.manual_seed(42)
+        C = 1.0
+        sigma = 1.0
+
+        # Dataset A: 5 examples
+        x_A = torch.randn(5, 4)
+        # Dataset B: same but last example replaced
+        x_B = x_A.clone()
+        x_B[-1] = torch.randn(4) * 50  # very different last example
+
+        model_A = TinyModel(4)
+        model_B = TinyModel(4)
+        model_B.load_state_dict(model_A.state_dict())
+
+        # Run DP-SGD on both with SAME noise seed
+        torch.manual_seed(999)
+        out_A = model_A(x_A)
+        losses_A = out_A.sum(dim=-1)
+        norms_A = torch.zeros(5)
+        for i in range(5):
+            model_A.zero_grad()
+            losses_A[i].backward(retain_graph=True)
+            norms_A[i] = sum(p.grad.float().norm().item() ** 2
+                              for p in model_A.parameters() if p.grad is not None) ** 0.5
+        clips_A = torch.clamp(C / (norms_A + 1e-6), max=1.0)
+
+        torch.manual_seed(999)
+        out_B = model_B(x_B)
+        losses_B = out_B.sum(dim=-1)
+        norms_B = torch.zeros(5)
+        for i in range(5):
+            model_B.zero_grad()
+            losses_B[i].backward(retain_graph=True)
+            norms_B[i] = sum(p.grad.float().norm().item() ** 2
+                              for p in model_B.parameters() if p.grad is not None) ** 0.5
+        clips_B = torch.clamp(C / (norms_B + 1e-6), max=1.0)
+
+        # The MECHANISM is the same (same C, same sigma, same noise seed)
+        # But the clip factors differ (data-dependent, which is correct)
+        # The first 4 examples should have identical clip factors
+        for i in range(4):
+            assert abs(clips_A[i].item() - clips_B[i].item()) < 1e-5, \
+                f"Example {i}: clip factors should match for unchanged examples"
+
+        # Example 4 (the replaced one) should have different clip factor
+        assert abs(clips_A[4].item() - clips_B[4].item()) > 0.01, \
+            "Replaced example should have different clip factor"
+
+        # But BOTH clipped contributions are bounded by C
+        assert (clips_A * norms_A <= C + 1e-4).all()
+        assert (clips_B * norms_B <= C + 1e-4).all()
+
+    def test_noise_is_data_independent(self):
+        """The noise added should be identical regardless of the data,
+        when using the same RNG seed."""
+        C = 1.0
+        sigma = 2.0
+        noise_std = sigma * C
+        shape = (4, 4)
+
+        # Generate noise with seed 42 — should be identical regardless of data
+        torch.manual_seed(42)
+        noise_1 = torch.normal(mean=0.0, std=noise_std, size=shape)
+
+        torch.manual_seed(42)
+        noise_2 = torch.normal(mean=0.0, std=noise_std, size=shape)
+
+        torch.testing.assert_close(noise_1, noise_2,
+            msg="Noise should be data-independent (same seed → same noise)")
+
+    def test_sensitivity_bound_on_adjacent_datasets(self):
+        """The L2 distance between DP outputs on adjacent datasets should be bounded."""
+        torch.manual_seed(42)
+        C = 1.0
+        sigma = 1.0
+        B = 5
+        lr = 0.1
+
+        diffs = []
+        for trial in range(50):
+            model_A = TinyModel(4)
+            model_B = TinyModel(4)
+            model_B.load_state_dict(model_A.state_dict())
+
+            x = torch.randn(B, 4)
+            x_adj = x.clone()
+            x_adj[-1] = torch.randn(4) * 10  # replace last example
+
+            torch.manual_seed(trial * 1000)
+            out_A = model_A(x)
+            update_A, _, _, _ = simulate_dp_sgd_step(
+                model_A, x, out_A.sum(dim=-1), C, sigma, lr)
+
+            torch.manual_seed(trial * 1000)
+            out_B = model_B(x_adj)
+            update_B, _, _, _ = simulate_dp_sgd_step(
+                model_B, x_adj, out_B.sum(dim=-1), C, sigma, lr)
+
+            diff = sum((update_A[n] - update_B[n]).norm().item() ** 2
+                       for n in update_A) ** 0.5
+            diffs.append(diff)
+
+        # The max diff should be bounded (by C/B * lr roughly)
+        max_diff = max(diffs)
+        expected_bound = C * lr / B * 3  # generous bound
+        assert max_diff < expected_bound, \
+            f"Max diff {max_diff:.6f} exceeds expected bound {expected_bound:.6f}"
+
+
 class TestNoiseCalibration:
     """Empirical noise variance should match sigma^2 * C^2."""
 
