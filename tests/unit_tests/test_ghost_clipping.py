@@ -499,3 +499,298 @@ class TestParameterCoverage:
                     hooked.add(id(p))
 
         assert hooked == all_trainable, "All params should now be covered"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 implementation-specific tests
+# ---------------------------------------------------------------------------
+
+class TestPerExampleLossComputation:
+    """Test the per-example loss computation from pretrain_gpt.py loss_func."""
+
+    def test_per_example_sum_aggregation(self):
+        """Per-example losses with sum aggregation = per-position loss summed over seq."""
+        B, S = 3, 5
+        output_tensor = torch.randn(B, S).abs()  # per-position losses (positive)
+        loss_mask = torch.ones(B * S)
+        loss_mask[3] = 0.0  # mask one position
+        loss_mask = loss_mask.view(-1).float()
+
+        losses_2d = output_tensor.float().view(B, S)
+        mask_2d = loss_mask.view(B, S)
+        per_example = (losses_2d * mask_2d).sum(dim=-1)
+
+        # Verify shape
+        assert per_example.shape == (B,)
+        # Verify masked position is excluded
+        assert per_example[0] < losses_2d[0].sum()  # position 3 in example 0 was masked
+
+    def test_per_example_mean_aggregation(self):
+        """Mean aggregation divides by per-example token count."""
+        B, S = 2, 4
+        output_tensor = torch.ones(B, S)
+        loss_mask = torch.ones(B * S)
+        loss_mask[4:6] = 0.0  # mask 2 positions in example 1
+        loss_mask = loss_mask.view(-1).float()
+
+        losses_2d = output_tensor.float().view(B, S)
+        mask_2d = loss_mask.view(B, S)
+        per_example = (losses_2d * mask_2d).sum(dim=-1)
+        per_example = per_example / mask_2d.sum(dim=-1).clamp(min=1.0)
+
+        # Example 0: all tokens valid → mean = 4/4 = 1.0
+        assert abs(per_example[0].item() - 1.0) < 1e-6
+        # Example 1: 2 tokens masked → mean = 2/2 = 1.0
+        assert abs(per_example[1].item() - 1.0) < 1e-6
+
+    def test_per_example_losses_require_grad(self):
+        """per_example_losses must be differentiable for backward pass."""
+        B, S = 2, 4
+        output_tensor = torch.randn(B, S, requires_grad=True)
+        loss_mask = torch.ones(B * S).view(-1).float()
+
+        losses_2d = output_tensor.float().view(B, S)
+        mask_2d = loss_mask.view(B, S)
+        per_example = (losses_2d * mask_2d).sum(dim=-1)
+
+        assert per_example.requires_grad
+        per_example.sum().backward()
+        assert output_tensor.grad is not None
+
+
+class TestClipFactorComputation:
+    """Test clip factor math and edge cases."""
+
+    def test_clip_factors_bounded(self):
+        """All clip factors must be in [0, 1]."""
+        norms = torch.tensor([0.5, 1.0, 2.0, 5.0, 0.01, 100.0])
+        C = 1.0
+        clip_factors = torch.clamp(C / (norms + 1e-6), max=1.0)
+        assert (clip_factors >= 0).all()
+        assert (clip_factors <= 1.0).all()
+
+    def test_clip_factors_identity_for_small_norms(self):
+        """Norms < C should produce clip_factor = 1.0 (no clipping)."""
+        norms = torch.tensor([0.1, 0.5, 0.99])
+        C = 1.0
+        clip_factors = torch.clamp(C / (norms + 1e-6), max=1.0)
+        assert (clip_factors == 1.0).all()
+
+    def test_clip_factors_scale_for_large_norms(self):
+        """Norms > C should produce clip_factor = C/norm."""
+        norms = torch.tensor([2.0, 5.0, 10.0])
+        C = 1.0
+        clip_factors = torch.clamp(C / (norms + 1e-6), max=1.0)
+        for i, n in enumerate(norms):
+            expected = C / (n.item() + 1e-6)
+            assert abs(clip_factors[i].item() - expected) < 1e-5
+
+    def test_nan_to_num_handles_inf(self):
+        """Non-finite clip factors should be zeroed, not cause crashes."""
+        norms = torch.tensor([0.0, float('inf'), float('nan'), 1.0])
+        C = 1.0
+        raw_clip = C / (norms + 1e-6)
+        safe_clip = torch.nan_to_num(raw_clip, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_clip = torch.clamp(safe_clip, max=1.0)
+        assert torch.isfinite(safe_clip).all()
+        assert abs(safe_clip[3].item() - 1.0) < 1e-5  # normal case preserved
+
+    def test_scaled_loss_produces_clipped_gradient(self):
+        """Backward through (clip_i * L_i).sum() should produce clipped gradients."""
+        torch.manual_seed(42)
+        model = SimpleLinear(4, 2)
+        B = 3
+        x = torch.randn(B, 4)
+        output = model(x)
+        per_example_losses = output.sum(dim=-1)  # [B]
+
+        # Compute naive per-example norms
+        naive_norms = compute_naive_per_example_norms(model, x, per_example_losses)
+
+        # Compute clip factors
+        C = 0.5
+        clip_factors = torch.clamp(C / (naive_norms + 1e-6), max=1.0)
+
+        # Verify each example's clipped contribution is bounded by C
+        for i in range(B):
+            model.zero_grad()
+            output_i = model(x)
+            loss_i = output_i.sum(dim=-1)
+            (clip_factors[i].detach() * loss_i[i]).backward()
+            contrib_norm = sum(p.grad.float().norm().item() ** 2
+                             for p in model.parameters() if p.grad is not None) ** 0.5
+            assert contrib_norm <= C + 1e-4, \
+                f"Example {i}: clipped contribution {contrib_norm:.4f} > C={C}"
+
+
+class TestReplayableIteratorRobust:
+    """Additional _ReplayableIterator tests."""
+
+    def test_tensor_identity_on_replay(self):
+        """Replayed batch should be the exact same tensor objects."""
+        from megatron.core.pipeline_parallel.ghost_clipping import _ReplayableIterator
+
+        t = torch.randn(3, 4)
+        data = [{'tokens': t}]
+        it = _ReplayableIterator(iter(data))
+
+        b1 = next(it)
+        it.rewind()
+        b2 = next(it)
+
+        # Same object, not just equal values
+        assert b1['tokens'] is b2['tokens']
+
+    def test_iter_protocol(self):
+        """_ReplayableIterator should support iter() protocol."""
+        from megatron.core.pipeline_parallel.ghost_clipping import _ReplayableIterator
+
+        data = [1, 2, 3]
+        it = _ReplayableIterator(iter(data))
+        assert iter(it) is it
+
+
+class TestForwardDataStorePlumbing:
+    """Test that dp_per_example_losses is properly handled."""
+
+    def test_per_example_losses_in_dict(self):
+        """per_example_losses stored in loss_reduced dict should be extractable."""
+        per_example = torch.randn(4)
+        loss_reduced = {'lm loss': (torch.tensor(1.0), torch.tensor(100))}
+        loss_reduced['dp_per_example_losses'] = per_example
+
+        # Extract
+        extracted = loss_reduced.get('dp_per_example_losses')
+        assert extracted is not None
+        assert torch.equal(extracted, per_example)
+
+    def test_cleanup_removes_tensor_key(self):
+        """dp_per_example_losses must be removed before reaching training logger."""
+        per_example = torch.randn(4)
+        forward_data_store = [
+            {'lm loss': (torch.tensor(1.0), torch.tensor(100)),
+             'dp_per_example_losses': per_example}
+        ]
+
+        # Simulate cleanup from schedules.py
+        for entry in forward_data_store:
+            if isinstance(entry, dict):
+                entry.pop('dp_per_example_losses', None)
+
+        assert 'dp_per_example_losses' not in forward_data_store[0]
+        assert 'lm loss' in forward_data_store[0]  # other keys preserved
+
+
+class TestGhostClipEndToEnd:
+    """End-to-end test of ghost clipping math on a simple model."""
+
+    def test_ghost_clip_full_pipeline(self):
+        """Full pipeline: hooks → norms → clip → scaled backward → bounded contributions."""
+        torch.manual_seed(42)
+        model = MultiLayerModel(dim=8)
+        B, S = 3, 4
+        C = 1.0
+
+        # Input
+        x = torch.randn(S, B, 8)
+
+        # Step 1: Compute naive per-example norms (ground truth)
+        output = model(x)
+        per_example_losses = output.sum(dim=(0, 2))
+        naive_norms = compute_naive_per_example_norms(model, x, per_example_losses)
+
+        # Step 2: Compute ghost clipping norms via hooks
+        model.zero_grad()
+        output2 = model(x)
+        per_example_losses2 = output2.sum(dim=(0, 2))
+
+        # Register hooks manually (since we can't use GhostClippingContext with nn.Linear)
+        input_norms = {}
+        norm_sq_list = []
+
+        def fwd_hook(mod, args, out):
+            inp = args[0]
+            input_norms[id(mod)] = (inp.float() ** 2).sum(dim=(0, 2))
+
+        def bwd_hook(mod, gi, go_tuple):
+            go = go_tuple[0]
+            if go is None:
+                return
+            go_f = go.float()
+            go_sq = (go_f ** 2).sum(dim=(0, 2))
+            x_sq = input_norms.get(id(mod))
+            if x_sq is not None:
+                norm_sq_list.append(go_sq * x_sq)
+            if hasattr(mod, 'bias') and mod.bias is not None:
+                bias_grad = go_f.sum(dim=0)
+                norm_sq_list.append((bias_grad ** 2).sum(dim=-1))
+
+        hooks = []
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(fwd_hook))
+                hooks.append(module.register_full_backward_hook(bwd_hook))
+
+        # Also hook LayerNorm
+        def ln_fwd_hook(mod, args, out):
+            x_f = args[0].float()
+            eps = getattr(mod, 'eps', 1e-5)
+            mean = x_f.mean(dim=-1, keepdim=True)
+            var = x_f.var(dim=-1, keepdim=True, unbiased=False)
+            x_hat = (x_f - mean) / torch.sqrt(var + eps)
+            input_norms[('ln', id(mod))] = (x_hat ** 2).sum(dim=0)
+
+        def ln_bwd_hook(mod, gi, go_tuple):
+            go = go_tuple[0]
+            if go is None:
+                return
+            go_f = go.float()
+            if mod.bias is not None:
+                beta_grad = go_f.sum(dim=0)
+                norm_sq_list.append((beta_grad ** 2).sum(dim=-1))
+            if mod.weight is not None:
+                xhat_sq = input_norms.get(('ln', id(mod)))
+                if xhat_sq is not None:
+                    go_sq = (go_f ** 2).sum(dim=0)
+                    norm_sq_list.append((go_sq * xhat_sq).sum(dim=-1))
+
+        for name, module in model.named_modules():
+            if isinstance(module, nn.LayerNorm):
+                hooks.append(module.register_forward_hook(ln_fwd_hook))
+                hooks.append(module.register_full_backward_hook(ln_bwd_hook))
+
+        # Forward + backward with hooks
+        output3 = model(x)
+        per_example_losses3 = output3.sum(dim=(0, 2))
+        per_example_losses3.sum().backward()
+
+        for h in hooks:
+            h.remove()
+
+        # Step 3: Compute ghost norms
+        total_sq = torch.stack(norm_sq_list).sum(dim=0)
+        ghost_norms = total_sq.sqrt()
+
+        # Step 4: Verify upper bound
+        for i in range(B):
+            assert ghost_norms[i].item() >= naive_norms[i].item() - 1e-4, \
+                f"Example {i}: ghost={ghost_norms[i]:.4f} < naive={naive_norms[i]:.4f}"
+
+        # Step 5: Compute clip factors and verify bounded contributions
+        clip_factors = torch.clamp(C / (ghost_norms + 1e-6), max=1.0)
+
+        for i in range(B):
+            model.zero_grad()
+            # Fresh forward to get a new graph for each example
+            out_i = model(x)
+            loss_i = out_i.sum(dim=(0, 2))
+            (clip_factors[i].detach() * loss_i[i]).backward()
+            contrib_norm_sq = sum(
+                p.grad.float().norm().item() ** 2
+                for p in model.parameters() if p.grad is not None
+            )
+            contrib_norm = contrib_norm_sq ** 0.5
+            # Since ghost norms are upper bounds, clipping with them guarantees
+            # each contribution is ≤ C (possibly less)
+            assert contrib_norm <= C + 1e-3, \
+                f"Example {i}: contribution {contrib_norm:.4f} > C={C}"
