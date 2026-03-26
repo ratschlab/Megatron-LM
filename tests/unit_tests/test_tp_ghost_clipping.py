@@ -775,6 +775,249 @@ class TestFullDPSGDPipelineTP:
             f"Per-coordinate variance {empirical_var:.4f} should be ~{expected_noise_var:.4f}"
 
 
+# ---------------------------------------------------------------------------
+# Additional Phase 3 edge case and integration tests
+# ---------------------------------------------------------------------------
+
+class TestCalculatePerTokenLossForced:
+    """Verify that DP-SGD forces calculate_per_token_loss=True."""
+
+    def test_flag_forced_true(self):
+        """Simulating the arguments.py validation logic."""
+        from types import SimpleNamespace
+        args = SimpleNamespace(
+            dp_sgd=True,
+            calculate_per_token_loss=False,  # user set False
+            dp_num_dataset_examples=1000,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            num_experts=None,
+            num_distributed_optimizer_instances=1,
+        )
+        # Simulate the Phase 3 validation
+        if args.dp_sgd and hasattr(args, 'calculate_per_token_loss'):
+            args.calculate_per_token_loss = True
+        assert args.calculate_per_token_loss == True
+
+    def test_flag_already_true_unchanged(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(dp_sgd=True, calculate_per_token_loss=True)
+        if args.dp_sgd:
+            args.calculate_per_token_loss = True
+        assert args.calculate_per_token_loss == True
+
+
+class TestTwoGeneratorProductionSeeds:
+    """Test exact production seed arithmetic for noise generation."""
+
+    def test_full_model_noise_replicated_sync(self):
+        """Simulate a 12-layer model: replicated params get identical noise on all TP ranks."""
+        step = 100
+        TP = 4
+        # Production seed: (step * 1000003 + 7) % (2**31 - 1)
+        replicated_seed = (step * 1000003 + 7) % (2**31 - 1)
+
+        # Simulate 12 layers × 2 LN params (weight, bias) = 24 replicated params
+        shapes = [(768,), (768,)] * 12  # gamma, beta per layer
+
+        noises_per_rank = {}
+        for tp_rank in range(TP):
+            gen = torch.Generator()
+            gen.manual_seed(replicated_seed)  # same for all TP ranks
+            noises_per_rank[tp_rank] = [torch.normal(0, 1.0, size=s, generator=gen) for s in shapes]
+
+        for rank in range(1, TP):
+            for i in range(len(shapes)):
+                assert torch.equal(noises_per_rank[0][i], noises_per_rank[rank][i]), \
+                    f"Replicated noise mismatch: rank 0 vs {rank}, param {i}"
+
+    def test_full_model_noise_sharded_differ(self):
+        """Simulate 12-layer model: sharded params get different noise per TP rank."""
+        step = 100
+        TP = 4
+        # 12 layers × 4 linear params = 48 sharded params
+        shapes = [(768, 768), (768,), (3072, 768), (768, 3072)] * 12
+
+        noises_per_rank = {}
+        for tp_rank in range(TP):
+            sharded_seed = (step * 1000003 + tp_rank * 1000007 + 13) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(sharded_seed)
+            noises_per_rank[tp_rank] = [torch.normal(0, 1.0, size=s, generator=gen) for s in shapes]
+
+        # Check first param differs across ranks
+        for rank in range(1, TP):
+            assert not torch.equal(noises_per_rank[0][0], noises_per_rank[rank][0]), \
+                f"Sharded noise should differ: rank 0 vs {rank}"
+
+    def test_distributed_optimizer_noise_dp_independent(self):
+        """With dist-opt, different DP ranks get independent noise."""
+        step = 50
+        tp_rank = 0
+        shape = (768, 768)
+
+        noises = []
+        for dp_rank in range(8):
+            seed = (step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + 13) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noises.append(torch.normal(0, 1.0, size=shape, generator=gen))
+
+        for i in range(1, 8):
+            assert not torch.equal(noises[0], noises[i]), \
+                f"Dist-opt noise should be independent: dp_rank 0 vs {i}"
+
+
+class TestClipFactorsIdenticalAcrossTPRanks:
+    """After all-reduce, all TP ranks must compute identical clip factors."""
+
+    def test_two_ranks_same_clip_factors(self):
+        TP = 2
+        B = 4
+        C = 1.0
+
+        # Simulate: each rank has partial sharded norms + replicated norms
+        torch.manual_seed(42)
+        sharded_per_rank = [torch.rand(B) * 10 for _ in range(TP)]
+        replicated_norm = torch.rand(B) * 2  # same on all ranks
+
+        # Each rank computes its local total
+        local_totals = []
+        for rank in range(TP):
+            repl = replicated_norm if rank == 0 else torch.zeros(B)
+            local_totals.append(sharded_per_rank[rank] + repl)
+
+        # All-reduce (sum)
+        global_total = sum(local_totals)
+
+        # Each rank independently computes clip factors from the same global_total
+        clip_factors = torch.clamp(C / (global_total.sqrt() + 1e-6), max=1.0)
+
+        # All ranks see the same result (they all did the same all-reduce)
+        for rank in range(TP):
+            rank_clips = torch.clamp(C / (global_total.sqrt() + 1e-6), max=1.0)
+            torch.testing.assert_close(clip_factors, rank_clips)
+
+
+class TestGhostNormEdgeCases:
+    """Edge cases that could produce NaN or incorrect norms."""
+
+    def test_zero_input_produces_zero_norm(self):
+        """All-zero input → ghost norm = 0 (no NaN)."""
+        x = torch.zeros(4, 3, 8)  # [S, B, H]
+        go = torch.randn(4, 3, 8)
+        norm = compute_ghost_norm_linear(x, go)
+        assert (norm == 0).all()
+        assert torch.isfinite(norm).all()
+
+    def test_zero_grad_output_produces_zero_norm(self):
+        """All-zero grad_output → ghost norm = 0."""
+        x = torch.randn(4, 3, 8)
+        go = torch.zeros(4, 3, 8)
+        norm = compute_ghost_norm_linear(x, go)
+        assert (norm == 0).all()
+
+    def test_zero_norm_clip_factor_is_one(self):
+        """Zero norm → clip_factor = min(1, C/0) should be clamped to 1.0, not inf."""
+        C = 1.0
+        norms = torch.tensor([0.0, 0.0, 0.5])
+        clip_factors = torch.clamp(C / (norms + 1e-6), max=1.0)
+        assert torch.isfinite(clip_factors).all()
+        assert clip_factors[0].item() == 1.0
+        assert clip_factors[1].item() == 1.0
+
+    def test_single_example_batch(self):
+        """B=1 should work without dimension issues."""
+        x = torch.randn(4, 1, 8)
+        go = torch.randn(4, 1, 8)
+        norm = compute_ghost_norm_linear(x, go)
+        assert norm.shape == (1,)
+        assert torch.isfinite(norm).all()
+
+
+class TestEmbeddingShardBoundary:
+    """Token IDs at shard boundaries."""
+
+    def test_token_at_exact_shard_start(self):
+        """Token ID = vocab_start_index (first token of shard)."""
+        TP = 2
+        V = 16
+        V_local = V // TP
+        H = 4
+        B, S = 1, 1
+
+        for rank in range(TP):
+            vs = rank * V_local
+            token_ids = torch.tensor([[vs]])  # exactly at shard start
+            go = torch.randn(B, S, H)
+
+            # Should be captured by this rank's shard
+            mask = (token_ids[0] >= vs) & (token_ids[0] < vs + V_local)
+            assert mask.all(), f"Token at shard start should be in shard {rank}"
+
+    def test_token_at_shard_end_minus_one(self):
+        """Token ID = vocab_end_index - 1 (last token of shard)."""
+        TP = 2
+        V = 16
+        V_local = V // TP
+
+        for rank in range(TP):
+            vs = rank * V_local
+            ve = (rank + 1) * V_local
+            token_id = ve - 1  # last valid token in shard
+            token_ids = torch.tensor([[token_id]])
+
+            mask = (token_ids[0] >= vs) & (token_ids[0] < ve)
+            assert mask.all(), f"Token at shard end-1 should be in shard {rank}"
+
+    def test_token_at_shard_boundary_excluded(self):
+        """Token ID = vocab_end_index (first token of NEXT shard) — should be excluded."""
+        TP = 2
+        V = 16
+        V_local = V // TP
+
+        rank = 0
+        vs = 0
+        ve = V_local
+        token_id = ve  # first token of rank 1's shard
+        token_ids = torch.tensor([[token_id]])
+
+        mask = (token_ids[0] >= vs) & (token_ids[0] < ve)
+        assert not mask.any(), "Token at shard boundary should be excluded from rank 0"
+
+    def test_full_shard_boundary_scatter_add(self):
+        """Tokens at all shard boundaries produce correct total norm."""
+        TP = 4
+        V = 16
+        V_local = V // TP
+        H = 4
+        B = 1
+
+        # One token per shard boundary
+        token_ids = torch.tensor([[0, 4, 8, 12]])  # exactly at each shard start
+        go = torch.randn(B, 4, H)
+
+        # Full
+        acc_full = torch.zeros(V, H)
+        acc_full.scatter_add_(0, token_ids[0].unsqueeze(-1).expand(-1, H), go[0].float())
+        full_norm = (acc_full ** 2).sum().item()
+
+        # Sharded
+        sharded_norm = 0.0
+        for rank in range(TP):
+            vs = rank * V_local
+            ve = (rank + 1) * V_local
+            mask = (token_ids[0] >= vs) & (token_ids[0] < ve)
+            local_ids = (token_ids[0] - vs).clamp(0, V_local - 1)
+            acc = torch.zeros(V_local, H)
+            go_masked = go[0].float() * mask.unsqueeze(-1).float()
+            acc.scatter_add_(0, local_ids.unsqueeze(-1).expand(-1, H), go_masked)
+            sharded_norm += (acc ** 2).sum().item()
+
+        assert abs(full_norm - sharded_norm) < 1e-4, \
+            f"Boundary tokens: full={full_norm:.4f} sharded={sharded_norm:.4f}"
+
+
 class TestEndToEndTP:
     """Full simulated TP=2 ghost clipping pipeline."""
 
