@@ -30,6 +30,21 @@ from megatron.core.tensor_parallel.layers import (
 LINEAR_CLASSES = (ColumnParallelLinear, RowParallelLinear)
 EMBEDDING_CLASSES = (VocabParallelEmbedding,)
 
+# Norm classes that are safe for the layernorm-style Cauchy-Schwarz hook.
+# Any module NOT in this list that falls through to the catch-all will trigger
+# an assertion failure — better to crash than silently compute wrong norms.
+_NORM_CLASSES: tuple = (nn.LayerNorm,)
+try:
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm, FusedRMSNorm
+    _NORM_CLASSES = _NORM_CLASSES + (FusedLayerNorm, FusedRMSNorm)
+except ImportError:
+    pass
+try:
+    from megatron.core.extensions.transformer_engine import TENorm
+    _NORM_CLASSES = _NORM_CLASSES + (TENorm,)
+except ImportError:
+    pass
+
 
 class GhostClippingContext:
     """Manages forward/backward hooks for per-example gradient norm computation.
@@ -92,12 +107,14 @@ class GhostClippingContext:
                 if p.requires_grad
             )
             if has_unhooked and not isinstance(module, LINEAR_CLASSES + EMBEDDING_CLASSES):
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.info(
-                    f"DP-SGD ghost clipping: applying layernorm-style hooks to "
-                    f"'{name}' ({type(module).__name__}). This assumes the module "
-                    f"performs normalization. If not, norms may be inaccurate."
+                # Only apply layernorm-style hooks to known normalization classes.
+                # Silently applying LN math to a Linear or Embedding would give
+                # wrong norms and break the DP guarantee.
+                assert isinstance(module, _NORM_CLASSES), (
+                    f"DP-SGD ghost clipping: module '{name}' ({type(module).__name__}) "
+                    f"has trainable params but is not a recognized linear, embedding, "
+                    f"or normalization layer. Cannot compute per-example gradient norms. "
+                    f"Either add a custom hook or freeze this module's parameters."
                 )
                 self._register_layernorm_hooks(module)
                 self._expected_norm_contributions += 1  # track for verification

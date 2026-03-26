@@ -498,9 +498,12 @@ def _dp_sgd_ghost_forward_backward(
         # Compute clip factors from hook data
         clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
-        # Check for inf/nan (fp16 underflow → skip step)
-        if not torch.isfinite(clip_factors).all():
-            return forward_data_store
+        # Handle inf/nan in clip factors (fp16 underflow).
+        # Do NOT return early — that would cause a distributed deadlock
+        # (other DP ranks would hang in finalize_model_grads all-reduce).
+        # Instead, zero out non-finite clip factors. The resulting NaN/zero
+        # gradients in Pass 2 will be caught by Megatron's optimizer skip logic.
+        clip_factors = torch.nan_to_num(clip_factors, nan=0.0, posinf=0.0, neginf=0.0)
 
     finally:
         # Cleanup Pass 1 (exception-safe)
