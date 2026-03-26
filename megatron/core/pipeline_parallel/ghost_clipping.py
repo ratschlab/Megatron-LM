@@ -28,7 +28,7 @@ from megatron.core.tensor_parallel.layers import (
 
 
 LINEAR_CLASSES = (ColumnParallelLinear, RowParallelLinear)
-EMBEDDING_CLASSES = (VocabParallelEmbedding,)
+EMBEDDING_CLASSES = (VocabParallelEmbedding, nn.Embedding)
 
 # Norm classes that are safe for the layernorm-style Cauchy-Schwarz hook.
 # Any module NOT in this list that falls through to the catch-all will trigger
