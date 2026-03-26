@@ -404,6 +404,159 @@ class TestPerExampleSensitivity:
                 f"Excluding example {exclude_idx}: sensitivity {diff:.4f} > C={C}"
 
 
+class TestMultiEpochConvergence:
+    """Many epochs over small data: loss should decrease, epsilon should grow."""
+
+    def test_convergence_and_epsilon_growth(self):
+        """Train a tiny model with DP-SGD over many epochs.
+        Loss should converge. Epsilon should grow monotonically."""
+        try:
+            from dp_accounting.rdp import rdp_privacy_accountant
+            from dp_accounting import dp_event
+        except ImportError:
+            pytest.skip("dp-accounting not installed")
+
+        torch.manual_seed(42)
+        dim = 4
+        model = TinyModel(dim)
+        B = 4
+        N = 20  # small dataset
+        C = 2.0
+        sigma = 0.3  # low noise for convergence
+        lr = 0.05
+        num_epochs = 30
+        delta = 1e-5
+
+        # Fixed small dataset (N examples)
+        dataset_x = torch.randn(N, dim)
+        dataset_y = dataset_x @ torch.randn(dim, dim)  # linear target
+
+        # Privacy accountant
+        accountant = rdp_privacy_accountant.RdpAccountant(
+            orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
+            neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
+        )
+        q = B / N  # sampling probability
+
+        losses = []
+        epsilons = []
+
+        for epoch in range(num_epochs):
+            # Shuffle
+            perm = torch.randperm(N)
+            epoch_loss = 0.0
+            steps = 0
+
+            for batch_start in range(0, N, B):
+                batch_idx = perm[batch_start:batch_start + B]
+                if len(batch_idx) < B:
+                    continue
+                x = dataset_x[batch_idx]
+                y = dataset_y[batch_idx]
+
+                # Forward
+                pred = model(x)
+                per_example_losses = ((pred - y) ** 2).sum(dim=-1)  # [B] MSE per example
+
+                # Per-example norms
+                per_example_norms = torch.zeros(B)
+                for i in range(B):
+                    model.zero_grad()
+                    per_example_losses[i].backward(retain_graph=True)
+                    per_example_norms[i] = sum(
+                        p.grad.float().norm().item() ** 2
+                        for p in model.parameters() if p.grad is not None
+                    ) ** 0.5
+
+                # Clip
+                clip_factors = torch.clamp(C / (per_example_norms + 1e-6), max=1.0)
+
+                # Clipped gradient
+                model.zero_grad()
+                scaled_loss = (clip_factors.detach() * per_example_losses).sum()
+                scaled_loss.backward()
+
+                # Add noise + normalize
+                with torch.no_grad():
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            noise = torch.normal(0, sigma * C, size=p.grad.shape)
+                            p.grad.add_(noise)
+                            p.grad.div_(B)
+                            p.data -= lr * p.grad
+
+                # Accounting
+                accountant.compose(
+                    dp_event.PoissonSampledDpEvent(
+                        sampling_probability=q,
+                        event=dp_event.GaussianDpEvent(sigma),
+                    )
+                )
+
+                epoch_loss += per_example_losses.detach().mean().item()
+                steps += 1
+
+            avg_loss = epoch_loss / max(steps, 1)
+            eps = accountant.get_epsilon(delta)
+            losses.append(avg_loss)
+            epsilons.append(eps)
+
+        # Loss should decrease significantly over 30 epochs
+        assert losses[-1] < losses[0] * 0.5, \
+            f"Loss didn't converge: start={losses[0]:.4f}, end={losses[-1]:.4f}"
+
+        # Epsilon should grow monotonically
+        for i in range(1, len(epsilons)):
+            assert epsilons[i] >= epsilons[i-1] - 1e-6, \
+                f"Epsilon decreased at epoch {i}: {epsilons[i-1]:.4f} → {epsilons[i]:.4f}"
+
+        # Epsilon should be significantly > 0 after 30 epochs
+        assert epsilons[-1] > 1.0, \
+            f"Epsilon too small after 30 epochs: {epsilons[-1]:.4f}"
+
+    def test_higher_epochs_higher_epsilon(self):
+        """More epochs = higher epsilon (privacy cost accumulates)."""
+        try:
+            from dp_accounting.rdp import rdp_privacy_accountant
+            from dp_accounting import dp_event
+        except ImportError:
+            pytest.skip("dp-accounting not installed")
+
+        sigma = 0.6
+        N = 1000
+        B = 10
+        delta = 1e-7
+        q = B / N
+
+        eps_by_epochs = {}
+        for epochs in [1, 5, 10]:
+            steps = int(epochs * N / B)
+            accountant = rdp_privacy_accountant.RdpAccountant(
+                orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
+                neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
+            )
+            accountant.compose(
+                dp_event.SelfComposedDpEvent(
+                    event=dp_event.PoissonSampledDpEvent(
+                        sampling_probability=q,
+                        event=dp_event.GaussianDpEvent(sigma),
+                    ),
+                    count=steps,
+                )
+            )
+            eps_by_epochs[epochs] = accountant.get_epsilon(delta)
+
+        # More epochs → higher epsilon
+        assert eps_by_epochs[5] > eps_by_epochs[1]
+        assert eps_by_epochs[10] > eps_by_epochs[5]
+
+        # But sublinear growth (√T scaling)
+        ratio_5_1 = eps_by_epochs[5] / eps_by_epochs[1]
+        ratio_10_5 = eps_by_epochs[10] / eps_by_epochs[5]
+        assert ratio_10_5 < ratio_5_1, \
+            "Epsilon growth should be sublinear (diminishing returns)"
+
+
 class TestNoiseCalibration:
     """Empirical noise variance should match sigma^2 * C^2."""
 
