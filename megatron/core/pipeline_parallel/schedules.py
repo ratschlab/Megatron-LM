@@ -556,6 +556,12 @@ def _dp_sgd_ghost_forward_backward(
         n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
         config.finalize_model_grads_func([model], n_batch)
 
+    # Remove per-example losses from logging dict — training.py expects scalar values
+    # and would crash on .item() if this tensor-valued key is present.
+    for entry in forward_data_store:
+        if isinstance(entry, dict):
+            entry.pop('dp_per_example_losses', None)
+
     return forward_data_store
 
 

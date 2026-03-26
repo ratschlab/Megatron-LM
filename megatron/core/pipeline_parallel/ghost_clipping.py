@@ -56,6 +56,8 @@ class GhostClippingContext:
         self._per_example_norm_sq: List[torch.Tensor] = []  # list of [B]
         # Track which params are covered by hooks
         self._hooked_params: Set[int] = set()
+        # Track expected norm contributions for verification
+        self._expected_norm_contributions: int = 0
 
     def register_hooks(self):
         """Register hooks on all modules with trainable parameters.
@@ -69,16 +71,20 @@ class GhostClippingContext:
         for name, module in self.model.named_modules():
             if isinstance(module, LINEAR_CLASSES):
                 self._register_linear_hooks(module)
+                self._expected_norm_contributions += 1  # weight (+ bias counted inside hook)
                 for p in module.parameters():
                     if p.requires_grad:
                         self._hooked_params.add(id(p))
             elif isinstance(module, EMBEDDING_CLASSES):
                 self._register_embedding_hooks(module)
+                self._expected_norm_contributions += 1
                 for p in module.parameters():
                     if p.requires_grad:
                         self._hooked_params.add(id(p))
 
         # Step 2: Everything else (norm layers, any remaining small params)
+        # These get layernorm-style hooks (Cauchy-Schwarz bound). This is valid for
+        # normalization layers but may be inaccurate for other module types.
         for name, module in self.model.named_modules():
             has_unhooked = any(
                 id(p) not in self._hooked_params
@@ -86,7 +92,15 @@ class GhostClippingContext:
                 if p.requires_grad
             )
             if has_unhooked and not isinstance(module, LINEAR_CLASSES + EMBEDDING_CLASSES):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"DP-SGD ghost clipping: applying layernorm-style hooks to "
+                    f"'{name}' ({type(module).__name__}). This assumes the module "
+                    f"performs normalization. If not, norms may be inaccurate."
+                )
                 self._register_layernorm_hooks(module)
+                self._expected_norm_contributions += 1  # track for verification
                 for p in module.parameters(recurse=False):
                     if p.requires_grad:
                         self._hooked_params.add(id(p))
@@ -102,6 +116,13 @@ class GhostClippingContext:
     def compute_clip_factors(self) -> torch.Tensor:
         """Aggregate per-example norms across all layers, return clip factors [B]."""
         assert len(self._per_example_norm_sq) > 0, "No norms computed — did backward run?"
+        # Verify we got at least as many contributions as expected (some modules
+        # contribute multiple: weight + bias). Fewer means a hook didn't fire.
+        assert len(self._per_example_norm_sq) >= self._expected_norm_contributions, (
+            f"DP-SGD ghost clipping: expected >= {self._expected_norm_contributions} norm "
+            f"contributions but got {len(self._per_example_norm_sq)}. "
+            f"A forward/backward hook may have failed to fire."
+        )
         total_sq = torch.stack(self._per_example_norm_sq).sum(dim=0)  # [B]
         # Phase 2: TP=1, no all-reduce needed.
         # Phase 3 will add: torch.distributed.all_reduce(total_sq, group=tp_group)
@@ -219,12 +240,13 @@ class GhostClippingContext:
         input_ids = self._embedding_input_ids
         V = module.weight.shape[0]  # local vocab size
 
-        # Normalize shapes to [B, S, H]
-        if go.dim() == 3:
-            if go.shape[0] == input_ids.shape[0]:
-                pass  # already [B, S, H]
-            else:
-                go = go.transpose(0, 1).contiguous()  # [S, B, H] → [B, S, H]
+        # Phase 2: TP=1, so embedding output is always [B, S, H] (no reduce-scatter).
+        # The grad_output follows the same layout.
+        if go.dim() == 3 and go.shape[0] != input_ids.shape[0]:
+            go = go.transpose(0, 1).contiguous()  # [S, B, H] → [B, S, H]
+        assert go.shape[0] == input_ids.shape[0] and go.shape[1] == input_ids.shape[1], (
+            f"Embedding grad_output shape {go.shape} doesn't match input_ids {input_ids.shape}"
+        )
 
         B, S, H = go.shape
         go_f = go.float()

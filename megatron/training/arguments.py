@@ -280,6 +280,12 @@ def validate_args(args, defaults={}):
             'DP-SGD requires context_parallel_size=1'
         assert not getattr(args, 'num_experts', None), \
             'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
+        # Require local transformer impl (TE linear modules not covered by ghost clipping hooks)
+        if hasattr(args, 'transformer_impl') and args.transformer_impl != 'local':
+            if args.rank == 0:
+                print('WARNING: --dp-sgd auto-setting --transformer-impl local '
+                      '(TE modules not supported by ghost clipping hooks)')
+            args.transformer_impl = 'local'
         # Auto-disable incompatible features.
         if hasattr(args, 'gradient_accumulation_fusion') and args.gradient_accumulation_fusion:
             if args.rank == 0:
