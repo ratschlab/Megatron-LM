@@ -519,7 +519,10 @@ def _dp_sgd_ghost_forward_backward(
                 print(f'DIAGNOSTIC OK: Pass 1 isolation verified (main_grad norm = {main_grad_norm:.2e})')
 
             # Clip factor statistics
-            norms_sq = torch.stack(ghost_ctx._per_example_norm_sq).sum(dim=0)
+            all_norms = (ghost_ctx._per_example_norm_sq_sharded +
+                         ghost_ctx._per_example_norm_sq_replicated +
+                         ghost_ctx._per_example_norm_sq)
+            norms_sq = torch.stack(all_norms).sum(dim=0) if all_norms else torch.zeros(1, device='cuda')
             norms = norms_sq.sqrt()
             frac_clipped = (clip_factors < 1.0).float().mean().item()
             print(f'DIAGNOSTIC: clip stats: frac_clipped={frac_clipped:.2f}, '
