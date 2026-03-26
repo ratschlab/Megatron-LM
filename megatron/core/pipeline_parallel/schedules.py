@@ -283,9 +283,13 @@ def forward_step(
         if not collect_non_loss_data:
             outputs = loss_func(output_tensor)
             if len(outputs) == 4:
-                # DP-SGD: loss_func returns per-example losses as 4th element
+                # DP-SGD: loss_func returns per-example losses as 4th element.
+                # The ghost clipping schedule backwards through per_example_losses,
+                # not output_tensor. Detach output_tensor to avoid in-place ops
+                # on the scalar loss interfering with per_example_losses' grad graph.
                 output_tensor, num_tokens, loss_reduced, per_example_losses = outputs
                 loss_reduced['dp_per_example_losses'] = per_example_losses
+                output_tensor = output_tensor.detach()
                 if not config.calculate_per_token_loss:
                     output_tensor /= num_tokens
                     output_tensor /= num_microbatches
