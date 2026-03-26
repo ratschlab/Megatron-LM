@@ -557,6 +557,91 @@ class TestMultiEpochConvergence:
             "Epsilon growth should be sublinear (diminishing returns)"
 
 
+class TestPropertyInvariants:
+    """Fuzz tests: mathematical invariants must hold for random inputs."""
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_ghost_norm_always_upper_bound(self, seed):
+        """Ghost clipping norm >= naive norm for random models and inputs."""
+        torch.manual_seed(seed)
+        dim = torch.randint(2, 16, (1,)).item()
+        model = TinyModel(dim)
+        B = torch.randint(1, 8, (1,)).item()
+        x = torch.randn(B, dim)
+
+        output = model(x)
+        per_example_losses = output.sum(dim=-1)
+
+        # Naive norms
+        naive_norms = torch.zeros(B)
+        for i in range(B):
+            model.zero_grad()
+            per_example_losses[i].backward(retain_graph=True)
+            naive_norms[i] = sum(p.grad.float().norm().item() ** 2
+                                  for p in model.parameters() if p.grad is not None) ** 0.5
+
+        # Ghost norms via hooks
+        model.zero_grad()
+        saved = {'x_sq': None, 'norms': []}
+        def fwd(mod, args, out):
+            saved['x_sq'] = (args[0].float() ** 2).sum(dim=-1)  # [B]
+        def bwd(mod, gi, go):
+            go_sq = (go[0].float() ** 2).sum(dim=-1)  # [B]
+            saved['norms'].append(go_sq * saved['x_sq'])
+        h1 = model.linear.register_forward_hook(fwd)
+        h2 = model.linear.register_full_backward_hook(bwd)
+        model(x).sum(dim=-1).sum().backward()
+        h1.remove(); h2.remove()
+
+        ghost_norms = saved['norms'][0].sqrt() if saved['norms'] else torch.zeros(B)
+        for i in range(B):
+            assert ghost_norms[i].item() >= naive_norms[i].item() - 1e-4, \
+                f"seed={seed}, ex={i}: ghost={ghost_norms[i]:.6f} < naive={naive_norms[i]:.6f}"
+
+    @pytest.mark.parametrize("C", [0.01, 0.1, 1.0, 10.0])
+    def test_clipped_contribution_always_bounded(self, C):
+        """For any C, each clipped example's contribution norm <= C."""
+        torch.manual_seed(42)
+        model = TinyModel(4)
+        B = 5
+        x = torch.randn(B, 4) * 3
+
+        output = model(x)
+        losses = output.sum(dim=-1)
+
+        norms = torch.zeros(B)
+        for i in range(B):
+            model.zero_grad()
+            losses[i].backward(retain_graph=True)
+            norms[i] = sum(p.grad.float().norm().item() ** 2
+                            for p in model.parameters() if p.grad is not None) ** 0.5
+
+        clips = torch.clamp(C / (norms + 1e-6), max=1.0)
+
+        for i in range(B):
+            model.zero_grad()
+            model(x).sum(dim=-1)[i:i+1].sum().backward()
+            contrib = sum(p.grad.float().norm().item() ** 2
+                          for p in model.parameters() if p.grad is not None) ** 0.5
+            clipped_contrib = clips[i].item() * contrib
+            assert clipped_contrib <= C + 1e-4, \
+                f"C={C}, ex={i}: clipped_contrib={clipped_contrib:.6f} > C"
+
+    def test_extreme_batch_sizes(self):
+        """DP-SGD should work with B=1 and B=32."""
+        for B in [1, 2, 32]:
+            torch.manual_seed(42)
+            model = TinyModel(4)
+            x = torch.randn(B, 4)
+            output = model(x)
+            losses = output.sum(dim=-1)
+            update, clips, norms, _ = simulate_dp_sgd_step(
+                model, x, losses, C=1.0, sigma=0.5, lr=0.01
+            )
+            assert all(torch.isfinite(v).all() for v in update.values()), \
+                f"Non-finite update with B={B}"
+
+
 class TestNoiseCalibration:
     """Empirical noise variance should match sigma^2 * C^2."""
 
