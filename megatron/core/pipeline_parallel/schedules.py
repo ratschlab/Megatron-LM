@@ -447,150 +447,132 @@ def _dp_sgd_ghost_forward_backward(
     C = config.dp_clipping_norm
     model_type = get_model_type(model)
 
-    assert num_microbatches == 1, (
-        "DP-SGD requires num_microbatches == 1 "
-        "(set --micro-batch-size == --global-batch-size)."
-    )
-
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
 
-    # Wrap iterator for two-pass replay
-    replay_iter = _ReplayableIterator(data_iterator)
-    ghost_ctx = GhostClippingContext(model, C)
-
-    # Save RNG state for deterministic replay (identical dropout masks)
-    rng_cpu = torch.random.get_rng_state()
-    rng_cuda = torch.cuda.get_rng_state()
     try:
         from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
-        tp_rng = {k: v.clone() for k, v in get_cuda_rng_tracker().get_states().items()}
+        _has_tp_rng = True
     except (ImportError, AttributeError):
-        tp_rng = None
+        _has_tp_rng = False
 
-    # ===== PASS 1: Norm computation (no main_grad writes, no loss scaling) =====
-    try:
-        # Isolate main_grad: DDP hook will skip main_grad.add_()
-        for p in model.parameters():
-            if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
-                p.grad_added_to_main_grad = True
+    # ===== MICROBATCH LOOP: interleave Pass 1 + Pass 2 per microbatch =====
+    # Each microbatch: Pass 1 (norms → clip factors) → Pass 2 (clipped backward → main_grad)
+    # main_grad accumulates across all microbatches. finalize_model_grads called once at end.
 
-        ghost_ctx.register_hooks()
+    for k in range(num_microbatches):
+        is_first = (k == 0)
+        is_last = (k == num_microbatches - 1)
 
-        # Forward via standard forward_step wrapper (preserves all bookkeeping)
-        output_tensor, num_tokens = forward_step(
+        # Wrap this microbatch's data for two-pass replay
+        replay_iter = _ReplayableIterator(data_iterator)
+        ghost_ctx = GhostClippingContext(model, C)
+
+        # Save RNG state BEFORE Pass 1 (restore before Pass 2 for identical dropout)
+        rng_cpu = torch.random.get_rng_state()
+        rng_cuda = torch.cuda.get_rng_state()
+        tp_rng = ({k_: v.clone() for k_, v in get_cuda_rng_tracker().get_states().items()}
+                  if _has_tp_rng else None)
+
+        # ===== PASS 1: Norm computation (no main_grad writes) =====
+        try:
+            # Isolate main_grad: DDP hook will skip main_grad.add_()
+            for p in model.parameters():
+                if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                    p.grad_added_to_main_grad = True
+
+            ghost_ctx.register_hooks()
+
+            forward_data_store_p1 = []
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                replay_iter,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store_p1,
+                config,
+                collect_non_loss_data if is_first else False,
+                is_first_microbatch=check_first_val_step(first_val_step, False, is_first),
+                current_microbatch=k,
+            )
+
+            # Keep first microbatch's logging data
+            if is_first:
+                forward_data_store.extend(forward_data_store_p1)
+
+            per_example_losses = forward_data_store_p1[-1].get('dp_per_example_losses')
+            assert per_example_losses is not None, (
+                "loss_func did not return per-example losses."
+            )
+
+            # Backward WITHOUT grad_scale_func (norms in native precision)
+            torch.autograd.backward(per_example_losses.sum())
+
+            clip_factors = ghost_ctx.compute_clip_factors()  # [B]
+
+            # Diagnostic checks (first microbatch only to reduce noise)
+            if _diagnostic and is_first:
+                main_grad_norm = sum(
+                    p.main_grad.float().norm().item() ** 2
+                    for p in model.parameters()
+                    if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
+                ) ** 0.5
+                status = "OK" if main_grad_norm < 1e-10 else "FAIL"
+                print(f'DIAGNOSTIC {status}: Pass 1 isolation verified '
+                      f'(main_grad norm = {main_grad_norm:.2e})')
+                _pass1_loss_value = per_example_losses.detach().clone()
+
+            clip_factors = torch.nan_to_num(clip_factors, nan=0.0, posinf=0.0, neginf=0.0)
+
+        finally:
+            # Cleanup Pass 1: reset flag but do NOT zero main_grad
+            # (main_grad accumulates clipped gradients across microbatches)
+            ghost_ctx.remove_hooks()
+            for p in model.parameters():
+                if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                    p.grad_added_to_main_grad = False
+                if p.grad is not None:
+                    p.grad = None
+
+        # ===== PASS 2: Clipped gradient computation (writes to main_grad) =====
+
+        # Restore RNG for identical dropout masks
+        torch.random.set_rng_state(rng_cpu)
+        torch.cuda.set_rng_state(rng_cuda)
+        if tp_rng is not None:
+            get_cuda_rng_tracker().set_states(tp_rng)
+
+        replay_iter.rewind()
+
+        forward_data_store_p2 = []
+        output_tensor2, num_tokens2 = forward_step(
             forward_step_func,
             replay_iter,
             model,
             num_microbatches,
             input_tensor,
-            forward_data_store,
+            forward_data_store_p2,
             config,
-            collect_non_loss_data,
-            is_first_microbatch=check_first_val_step(first_val_step, False, True),
-            current_microbatch=0,
+            collect_non_loss_data=False,
+            is_first_microbatch=False,
+            current_microbatch=k,
         )
 
-        # Extract per-example losses (stored by forward_step wrapper from loss_func 4-tuple)
-        per_example_losses = forward_data_store[-1].get('dp_per_example_losses')
-        assert per_example_losses is not None, (
-            "loss_func did not return per-example losses. "
-            "Ensure pretrain_gpt.py loss_func returns 4-tuple when dp_sgd=True."
-        )
+        per_example_losses2 = forward_data_store_p2[-1].get('dp_per_example_losses')
+        assert per_example_losses2 is not None
 
-        # Backward WITHOUT grad_scale_func (norms in native precision)
-        total_loss = per_example_losses.sum()
-        torch.autograd.backward(total_loss)
+        # Diagnostic: RNG replay check (first microbatch only)
+        if _diagnostic and is_first and '_pass1_loss_value' in dir():
+            max_diff = (_pass1_loss_value - per_example_losses2.detach()).abs().max().item()
+            status = "OK" if max_diff < 1e-5 else "FAIL"
+            print(f'DIAGNOSTIC {status}: RNG replay verified (max loss diff = {max_diff:.2e})')
 
-        # Compute clip factors from hook data
-        clip_factors = ghost_ctx.compute_clip_factors()  # [B]
+        # Scaled loss: backward produces Σ(clip_i · g_i) → accumulates into main_grad
+        scaled_loss = (clip_factors.detach() * per_example_losses2).sum()
+        backward_step(input_tensor, scaled_loss, output_tensor_grad, model_type, config)
 
-        # --- DIAGNOSTIC: Pass 1 isolation check ---
-        if _diagnostic:
-            main_grad_norm = 0.0
-            for p in model.parameters():
-                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None:
-                    main_grad_norm += p.main_grad.float().norm().item() ** 2
-            main_grad_norm = main_grad_norm ** 0.5
-            if main_grad_norm > 1e-10:
-                print(f'DIAGNOSTIC FAIL: Pass 1 leaked into main_grad! '
-                      f'main_grad norm = {main_grad_norm:.6e}')
-            else:
-                print(f'DIAGNOSTIC OK: Pass 1 isolation verified (main_grad norm = {main_grad_norm:.2e})')
-
-            # Clip factor statistics
-            all_norms = (ghost_ctx._per_example_norm_sq_sharded +
-                         ghost_ctx._per_example_norm_sq_replicated +
-                         ghost_ctx._per_example_norm_sq)
-            norms_sq = torch.stack(all_norms).sum(dim=0) if all_norms else torch.zeros(1, device='cuda')
-            norms = norms_sq.sqrt()
-            frac_clipped = (clip_factors < 1.0).float().mean().item()
-            print(f'DIAGNOSTIC: clip stats: frac_clipped={frac_clipped:.2f}, '
-                  f'norm min={norms.min():.4f} med={norms.median():.4f} max={norms.max():.4f}, '
-                  f'clip min={clip_factors.min():.4f} max={clip_factors.max():.4f}')
-
-            # Save Pass 1 loss for RNG replay check
-            _pass1_loss_value = per_example_losses.detach().clone()
-
-        # Handle inf/nan in clip factors (fp16 underflow).
-        # Do NOT return early — that would cause a distributed deadlock
-        # (other DP ranks would hang in finalize_model_grads all-reduce).
-        # Instead, zero out non-finite clip factors. The resulting NaN/zero
-        # gradients in Pass 2 will be caught by Megatron's optimizer skip logic.
-        clip_factors = torch.nan_to_num(clip_factors, nan=0.0, posinf=0.0, neginf=0.0)
-
-    finally:
-        # Cleanup Pass 1 (exception-safe)
-        ghost_ctx.remove_hooks()
-        for p in model.parameters():
-            if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
-                p.grad_added_to_main_grad = False
-        # Canonical Megatron reset: zeros main_grad + resets flags
-        for model_chunk in ([model] if not isinstance(model, list) else model):
-            model_chunk.zero_grad_buffer()
-
-    # ===== PASS 2: Clipped gradient computation (standard backward path) =====
-
-    # Restore RNG state for identical dropout masks
-    torch.random.set_rng_state(rng_cpu)
-    torch.cuda.set_rng_state(rng_cuda)
-    if tp_rng is not None:
-        get_cuda_rng_tracker().set_states(tp_rng)
-
-    replay_iter.rewind()
-
-    # Forward (replay same data, identical stochastic computation)
-    forward_data_store_pass2 = []
-    output_tensor2, num_tokens2 = forward_step(
-        forward_step_func,
-        replay_iter,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store_pass2,
-        config,
-        collect_non_loss_data=False,
-        is_first_microbatch=False,
-        current_microbatch=0,
-    )
-
-    per_example_losses2 = forward_data_store_pass2[-1].get('dp_per_example_losses')
-    assert per_example_losses2 is not None
-
-    # --- DIAGNOSTIC: RNG replay check ---
-    if _diagnostic and '_pass1_loss_value' in dir():
-        max_diff = (_pass1_loss_value - per_example_losses2.detach()).abs().max().item()
-        if max_diff > 1e-5:
-            print(f'DIAGNOSTIC FAIL: RNG replay mismatch! '
-                  f'max per-example loss diff = {max_diff:.6e}')
-        else:
-            print(f'DIAGNOSTIC OK: RNG replay verified (max loss diff = {max_diff:.2e})')
-
-    # Scaled loss: backward produces Σ(clip_i · g_i) in main_grad
-    scaled_loss = (clip_factors.detach() * per_example_losses2).sum()
-
-    # Standard backward with grad_scale_func for fp16
-    backward_step(input_tensor, scaled_loss, output_tensor_grad, model_type, config)
+    # ===== AFTER ALL MICROBATCHES: finalize =====
 
     # Finalize (all-reduce + noise + N_batch normalization)
     if config.finalize_model_grads_func is not None:
@@ -602,8 +584,7 @@ def _dp_sgd_ghost_forward_backward(
         n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
         config.finalize_model_grads_func([model], n_batch)
 
-    # Remove per-example losses from logging dict — training.py expects scalar values
-    # and would crash on .item() if this tensor-valued key is present.
+    # Remove per-example losses from logging dict
     for entry in forward_data_store:
         if isinstance(entry, dict):
             entry.pop('dp_per_example_losses', None)
