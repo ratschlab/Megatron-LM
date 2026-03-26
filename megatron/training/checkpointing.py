@@ -673,6 +673,13 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     # RNG states.
     if not args.no_save_rng:
         state_dict["rng_state"] = rng_state
+
+    # DP-SGD privacy accountant state.
+    if hasattr(args, 'dp_sgd') and args.dp_sgd:
+        from megatron.training.training import _dp_accountant, _dp_current_epsilon
+        if _dp_accountant is not None:
+            state_dict['dp_sgd_epsilon'] = _dp_current_epsilon
+
     return state_dict
 
 
@@ -1275,6 +1282,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
     tokens_so_far = state_dict.get('tokens_so_far', 0)
+
+    # Restore DP-SGD privacy accountant state.
+    if 'dp_sgd_epsilon' in state_dict:
+        import megatron.training.training as training_module
+        training_module._dp_current_epsilon = state_dict['dp_sgd_epsilon']
+        print_rank_0(f'DP-SGD: Restored epsilon = {state_dict["dp_sgd_epsilon"]:.4f} from checkpoint')
 
     # Check arguments.
     assert args.consumed_train_samples == 0

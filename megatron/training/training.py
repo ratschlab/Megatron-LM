@@ -46,6 +46,11 @@ except ImportError:
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+
+# DP-SGD privacy accounting (optional dependency).
+_dp_accountant = None
+_dp_current_epsilon = 0.0
+_dp_epsilon_at_resume = 0.0  # epsilon restored from checkpoint (pre-resume expenditure)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1528,6 +1533,27 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
+    # DP-SGD: Initialize privacy accountant.
+    global _dp_accountant, _dp_current_epsilon, _dp_epsilon_at_resume
+    if hasattr(args, 'dp_sgd') and args.dp_sgd:
+        # If epsilon was restored from a checkpoint, record it as the baseline.
+        _dp_epsilon_at_resume = _dp_current_epsilon
+        try:
+            from dp_accounting.rdp import rdp_privacy_accountant
+            _dp_accountant = rdp_privacy_accountant.RdpAccountant(
+                orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
+                neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
+            )
+            _dp_current_epsilon = 0.0
+            if args.rank == 0:
+                print(f'DP-SGD: Privacy accountant initialized '
+                      f'(N={args.dp_num_dataset_examples}, delta={args.dp_delta})')
+        except ImportError:
+            raise RuntimeError(
+                'dp-accounting library required for --dp-sgd. '
+                'Install with: pip install dp-accounting'
+            )
+
     # Run training iterations till done.
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
@@ -1558,6 +1584,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
+        # DP-SGD: Check epsilon budget BEFORE the step.
+        if _dp_accountant is not None and _dp_current_epsilon >= args.dp_epsilon_budget:
+            if args.rank == 0:
+                print(f'DP-SGD: Epsilon budget exhausted (current={_dp_current_epsilon:.4f}, '
+                      f'budget={args.dp_epsilon_budget}). Stopping training.')
+            should_exit = True
+            break
+
         # Run training step.
         args.curr_iteration = iteration
         ft_integration.on_training_step_start()
@@ -1569,6 +1603,25 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        opt_param_scheduler,
                        config)
         ft_integration.on_training_step_end()
+
+        # DP-SGD: Update privacy accountant after each step.
+        if _dp_accountant is not None and skipped_iter == 0:
+            from dp_accounting import dp_event as dp_evt
+            global_batch_size = (mpu.get_data_parallel_world_size()
+                                 * args.micro_batch_size
+                                 * get_num_microbatches())
+            sampling_probability = global_batch_size / args.dp_num_dataset_examples
+            _dp_accountant.compose(
+                dp_evt.PoissonSampledDpEvent(
+                    sampling_probability=sampling_probability,
+                    event=dp_evt.GaussianDpEvent(args.dp_noise_multiplier),
+                )
+            )
+            # Add pre-resume epsilon (from checkpoint) to post-resume epsilon (from accountant).
+            _dp_current_epsilon = _dp_epsilon_at_resume + _dp_accountant.get_epsilon(args.dp_delta)
+            if args.rank == 0 and iteration % args.log_interval == 0:
+                print(f'DP-SGD: step={iteration}, epsilon={_dp_current_epsilon:.4f}, '
+                      f'delta={args.dp_delta}')
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
