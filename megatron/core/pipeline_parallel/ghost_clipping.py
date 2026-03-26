@@ -130,6 +130,17 @@ class GhostClippingContext:
             f"by any hook — DP guarantee broken"
         )
 
+        # Log coverage summary in diagnostic mode
+        import os
+        if os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1':
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"DIAGNOSTIC: Hook coverage: {len(self._hooked_params)} params, "
+                f"{self._expected_norm_contributions} modules, "
+                f"{len(self._hooks)} hooks registered"
+            )
+
     def compute_clip_factors(self) -> torch.Tensor:
         """Aggregate per-example norms across all layers, return clip factors [B]."""
         assert len(self._per_example_norm_sq) > 0, "No norms computed — did backward run?"

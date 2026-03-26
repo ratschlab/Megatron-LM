@@ -440,6 +440,9 @@ def _dp_sgd_ghost_forward_backward(
     )
     from megatron.training import get_args
 
+    import os
+    _diagnostic = os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1'
+
     args = get_args()
     C = config.dp_clipping_norm
     model_type = get_model_type(model)
@@ -502,6 +505,30 @@ def _dp_sgd_ghost_forward_backward(
         # Compute clip factors from hook data
         clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
+        # --- DIAGNOSTIC: Pass 1 isolation check ---
+        if _diagnostic:
+            main_grad_norm = 0.0
+            for p in model.parameters():
+                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None:
+                    main_grad_norm += p.main_grad.float().norm().item() ** 2
+            main_grad_norm = main_grad_norm ** 0.5
+            if main_grad_norm > 1e-10:
+                print(f'DIAGNOSTIC FAIL: Pass 1 leaked into main_grad! '
+                      f'main_grad norm = {main_grad_norm:.6e}')
+            else:
+                print(f'DIAGNOSTIC OK: Pass 1 isolation verified (main_grad norm = {main_grad_norm:.2e})')
+
+            # Clip factor statistics
+            norms_sq = torch.stack(ghost_ctx._per_example_norm_sq).sum(dim=0)
+            norms = norms_sq.sqrt()
+            frac_clipped = (clip_factors < 1.0).float().mean().item()
+            print(f'DIAGNOSTIC: clip stats: frac_clipped={frac_clipped:.2f}, '
+                  f'norm min={norms.min():.4f} med={norms.median():.4f} max={norms.max():.4f}, '
+                  f'clip min={clip_factors.min():.4f} max={clip_factors.max():.4f}')
+
+            # Save Pass 1 loss for RNG replay check
+            _pass1_loss_value = per_example_losses.detach().clone()
+
         # Handle inf/nan in clip factors (fp16 underflow).
         # Do NOT return early — that would cause a distributed deadlock
         # (other DP ranks would hang in finalize_model_grads all-reduce).
@@ -546,6 +573,15 @@ def _dp_sgd_ghost_forward_backward(
 
     per_example_losses2 = forward_data_store_pass2[-1].get('dp_per_example_losses')
     assert per_example_losses2 is not None
+
+    # --- DIAGNOSTIC: RNG replay check ---
+    if _diagnostic and '_pass1_loss_value' in dir():
+        max_diff = (_pass1_loss_value - per_example_losses2.detach()).abs().max().item()
+        if max_diff > 1e-5:
+            print(f'DIAGNOSTIC FAIL: RNG replay mismatch! '
+                  f'max per-example loss diff = {max_diff:.6e}')
+        else:
+            print(f'DIAGNOSTIC OK: RNG replay verified (max loss diff = {max_diff:.2e})')
 
     # Scaled loss: backward produces Σ(clip_i · g_i) in main_grad
     scaled_loss = (clip_factors.detach() * per_example_losses2).sum()
