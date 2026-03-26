@@ -274,6 +274,12 @@ def validate_args(args, defaults={}):
             '--dp-num-dataset-examples must be set when --dp-sgd is enabled'
         assert args.pipeline_model_parallel_size == 1, \
             'DP-SGD requires PP=1 (pipeline parallelism not supported)'
+        assert args.tensor_model_parallel_size == 1, \
+            'DP-SGD Phase 2 requires TP=1 (TP support deferred to Phase 3)'
+        assert args.context_parallel_size == 1, \
+            'DP-SGD requires context_parallel_size=1'
+        assert not getattr(args, 'num_experts', None), \
+            'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
         # Auto-disable incompatible features.
         if hasattr(args, 'gradient_accumulation_fusion') and args.gradient_accumulation_fusion:
             if args.rank == 0:

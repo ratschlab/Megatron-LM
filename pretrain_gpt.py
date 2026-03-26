@@ -220,6 +220,23 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
+
+    # DP-SGD: compute per-example losses for ghost clipping (4th return element).
+    if getattr(args, 'dp_sgd', False):
+        B = args.micro_batch_size
+        S = args.seq_length
+        losses_2d = output_tensor.float().view(B, S)
+        mask_2d = loss_mask.view(B, S)
+        per_example = (losses_2d * mask_2d).sum(dim=-1)  # [B]
+        if getattr(args, 'dp_loss_aggregation', 'mean') == 'mean':
+            per_example = per_example / mask_2d.sum(dim=-1).clamp(min=1.0)
+        return (
+            loss[0] * args.context_parallel_size,
+            local_num_tokens,
+            {'lm loss': (reporting_loss[0], reporting_loss[1])},
+            per_example,
+        )
+
     return (
         loss[0] * args.context_parallel_size,
         local_num_tokens,

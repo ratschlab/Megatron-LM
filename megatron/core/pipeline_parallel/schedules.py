@@ -282,7 +282,14 @@ def forward_step(
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
             outputs = loss_func(output_tensor)
-            if len(outputs) == 3:
+            if len(outputs) == 4:
+                # DP-SGD: loss_func returns per-example losses as 4th element
+                output_tensor, num_tokens, loss_reduced, per_example_losses = outputs
+                loss_reduced['dp_per_example_losses'] = per_example_losses
+                if not config.calculate_per_token_loss:
+                    output_tensor /= num_tokens
+                    output_tensor /= num_microbatches
+            elif len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
                     output_tensor /= num_tokens
@@ -404,7 +411,7 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
-def _dp_sgd_naive_forward_backward(
+def _dp_sgd_ghost_forward_backward(
     *,
     forward_step_func,
     data_iterator,
@@ -414,73 +421,133 @@ def _dp_sgd_naive_forward_backward(
     collect_non_loss_data,
     first_val_step,
 ):
-    """Naive DP-SGD: batch-level gradient clipping (Phase 0 stepping stone).
+    """DP-SGD with ghost clipping: per-example gradient clipping via two-pass scheme.
 
-    Phase 0 implementation — validates the DP-SGD infrastructure
-    (args, config propagation, noise injection, privacy accounting).
+    Pass 1: Forward + backward with hooks to compute per-example gradient norms.
+            main_grad is isolated (not written to). No loss scaling.
+    Pass 2: Forward + backward with per-example loss scaling by clip factors.
+            Clipped gradient sum flows into main_grad via normal DDP path.
 
-    Current: clips the global batch gradient norm to C.
-    Phase 2 will replace this with true per-example ghost clipping.
-
-    Noise injection happens in finalize_model_grads.
+    Noise injection happens in finalize_model_grads (Phase 0 code, unchanged).
     """
+    from megatron.core.pipeline_parallel.ghost_clipping import (
+        GhostClippingContext,
+        _ReplayableIterator,
+    )
+    from megatron.training import get_args
+
+    args = get_args()
     C = config.dp_clipping_norm
     model_type = get_model_type(model)
 
-    forward_data_store = []
-    input_tensor, output_tensor_grad = None, None
-    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-
-    # Phase 0 requires micro_batch_size == global_batch_size (no gradient accumulation).
     assert num_microbatches == 1, (
-        "Phase 0 naive DP-SGD requires num_microbatches == 1 "
-        "(set --micro-batch-size == --global-batch-size). "
-        "Gradient accumulation with DP-SGD is deferred to Phase 2."
+        "DP-SGD requires num_microbatches == 1 "
+        "(set --micro-batch-size == --global-batch-size)."
     )
 
-    # Step 1: Forward pass (computes loss for logging).
-    output_tensor, num_tokens = forward_step(
+    forward_data_store = []
+    input_tensor, output_tensor_grad = None, None
+
+    # Wrap iterator for two-pass replay
+    replay_iter = _ReplayableIterator(data_iterator)
+    ghost_ctx = GhostClippingContext(model, C)
+
+    # Save RNG state for deterministic replay (identical dropout masks)
+    rng_cpu = torch.random.get_rng_state()
+    rng_cuda = torch.cuda.get_rng_state()
+    try:
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+        tp_rng = {k: v.clone() for k, v in get_cuda_rng_tracker().get_states().items()}
+    except (ImportError, AttributeError):
+        tp_rng = None
+
+    # ===== PASS 1: Norm computation (no main_grad writes, no loss scaling) =====
+    try:
+        # Isolate main_grad: DDP hook will skip main_grad.add_()
+        for p in model.parameters():
+            if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                p.grad_added_to_main_grad = True
+
+        ghost_ctx.register_hooks()
+
+        # Forward via standard forward_step wrapper (preserves all bookkeeping)
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            replay_iter,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(first_val_step, False, True),
+            current_microbatch=0,
+        )
+
+        # Extract per-example losses (stored by forward_step wrapper from loss_func 4-tuple)
+        per_example_losses = forward_data_store[-1].get('dp_per_example_losses')
+        assert per_example_losses is not None, (
+            "loss_func did not return per-example losses. "
+            "Ensure pretrain_gpt.py loss_func returns 4-tuple when dp_sgd=True."
+        )
+
+        # Backward WITHOUT grad_scale_func (norms in native precision)
+        total_loss = per_example_losses.sum()
+        torch.autograd.backward(total_loss)
+
+        # Compute clip factors from hook data
+        clip_factors = ghost_ctx.compute_clip_factors()  # [B]
+
+        # Check for inf/nan (fp16 underflow → skip step)
+        if not torch.isfinite(clip_factors).all():
+            return forward_data_store
+
+    finally:
+        # Cleanup Pass 1 (exception-safe)
+        ghost_ctx.remove_hooks()
+        for p in model.parameters():
+            if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                p.grad_added_to_main_grad = False
+        # Canonical Megatron reset: zeros main_grad + resets flags
+        for model_chunk in ([model] if not isinstance(model, list) else model):
+            model_chunk.zero_grad_buffer()
+
+    # ===== PASS 2: Clipped gradient computation (standard backward path) =====
+
+    # Restore RNG state for identical dropout masks
+    torch.random.set_rng_state(rng_cpu)
+    torch.cuda.set_rng_state(rng_cuda)
+    if tp_rng is not None:
+        get_cuda_rng_tracker().set_states(tp_rng)
+
+    replay_iter.rewind()
+
+    # Forward (replay same data, identical stochastic computation)
+    forward_data_store_pass2 = []
+    output_tensor2, num_tokens2 = forward_step(
         forward_step_func,
-        data_iterator,
+        replay_iter,
         model,
         num_microbatches,
         input_tensor,
-        forward_data_store,
+        forward_data_store_pass2,
         config,
-        collect_non_loss_data,
-        is_first_microbatch=check_first_val_step(first_val_step, False, True),
+        collect_non_loss_data=False,
+        is_first_microbatch=False,
         current_microbatch=0,
     )
-    total_num_tokens += num_tokens.item()
 
-    # Step 2: Backward pass — gradients written to main_grad via DDP hooks.
-    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+    per_example_losses2 = forward_data_store_pass2[-1].get('dp_per_example_losses')
+    assert per_example_losses2 is not None
 
-    # Step 3: Clip the batch gradient norm in main_grad.
-    # TODO(Phase 2): Replace with true per-example ghost clipping.
-    total_norm_sq = torch.zeros(1, device='cuda', dtype=torch.float32)
-    params_with_grad = []
-    for param in model.parameters():
-        if param.requires_grad and hasattr(param, 'main_grad') and param.main_grad is not None:
-            total_norm_sq += param.main_grad.float().norm() ** 2
-            params_with_grad.append(param)
+    # Scaled loss: backward produces Σ(clip_i · g_i) in main_grad
+    scaled_loss = (clip_factors.detach() * per_example_losses2).sum()
 
-    # All-reduce gradient norm across TP ranks (each rank holds sharded params).
-    if parallel_state.get_tensor_model_parallel_world_size() > 1:
-        torch.distributed.all_reduce(
-            total_norm_sq, group=parallel_state.get_tensor_model_parallel_group()
-        )
+    # Standard backward with grad_scale_func for fp16
+    backward_step(input_tensor, scaled_loss, output_tensor_grad, model_type, config)
 
-    total_norm = total_norm_sq.sqrt()
-    clip_factor = torch.clamp(C / (total_norm + 1e-6), max=1.0)
-    for param in params_with_grad:
-        param.main_grad.mul_(clip_factor)
-
-    # Finalize model grads (all-reduce + noise injection).
-    # Pass fixed N_batch (global batch size) instead of data-dependent num_tokens.
+    # Finalize (all-reduce + noise + N_batch normalization)
     if config.finalize_model_grads_func is not None:
-        from megatron.training import get_args
-        args = get_args()
         global_batch_size = (
             args.micro_batch_size
             * parallel_state.get_data_parallel_world_size()
@@ -527,9 +594,9 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
-    # DP-SGD path: per-example gradient clipping + noise.
+    # DP-SGD path: per-example gradient clipping via ghost clipping + noise.
     if getattr(config, 'dp_sgd', False) and not forward_only:
-        result = _dp_sgd_naive_forward_backward(
+        result = _dp_sgd_ghost_forward_backward(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
