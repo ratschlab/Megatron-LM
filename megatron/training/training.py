@@ -1585,7 +1585,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
         # DP-SGD: Check epsilon budget BEFORE the step.
-        if _dp_accountant is not None and _dp_current_epsilon >= args.dp_epsilon_budget:
+        if (_dp_accountant is not None
+                and args.dp_noise_multiplier > 0
+                and _dp_current_epsilon >= args.dp_epsilon_budget):
             if args.rank == 0:
                 print(f'DP-SGD: Epsilon budget exhausted (current={_dp_current_epsilon:.4f}, '
                       f'budget={args.dp_epsilon_budget}). Stopping training.')
@@ -1605,7 +1607,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         ft_integration.on_training_step_end()
 
         # DP-SGD: Update privacy accountant after each step.
-        if _dp_accountant is not None and skipped_iter == 0:
+        # Skip when sigma=0 (no noise = infinite privacy cost, nothing to track).
+        if _dp_accountant is not None and skipped_iter == 0 and args.dp_noise_multiplier > 0:
             from dp_accounting import dp_event as dp_evt
             global_batch_size = (mpu.get_data_parallel_world_size()
                                  * args.micro_batch_size
