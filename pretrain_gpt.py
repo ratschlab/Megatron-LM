@@ -183,7 +183,15 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     total_tokens = loss_mask.sum()
-    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+    loss_sum = torch.sum(losses.view(-1) * loss_mask)
+
+    # DP-SGD mean aggregation: divide by token count to make gradient norms length-invariant.
+    # This is a per-example operation (deterministic function of the individual example),
+    # NOT the batch-level num_tokens normalization (which is bypassed in DP mode).
+    if getattr(args, 'dp_sgd', False) and getattr(args, 'dp_loss_aggregation', 'mean') == 'mean':
+        loss_sum = loss_sum / torch.clamp(total_tokens, min=1.0)
+
+    loss = torch.cat([loss_sum.view(1), total_tokens.view(1)])
 
     if args.context_parallel_size > 1:
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())

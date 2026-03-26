@@ -235,6 +235,52 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         expert_bias.copy_(updated_expert_bias)
 
 
+def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig):
+    """Inject Gaussian noise into gradients for DP-SGD.
+
+    Called after finish_grad_sync() (all-reduce across DP ranks), before normalization.
+    After all-reduce, all DP ranks hold identical gradients. We add identical noise
+    on all ranks using a synchronized RNG seed derived from the training step.
+
+    With distributed optimizer (Phase 3+), each rank holds a different gradient shard
+    and adds independent noise. That path will use per-shard seeds.
+    """
+    sigma = getattr(config, 'dp_noise_multiplier', 0.0)
+    C = getattr(config, 'dp_clipping_norm', 1.0)
+
+    if sigma <= 0:
+        return
+
+    noise_std = sigma * C
+
+    # Synchronized noise: all DP ranks must add identical noise so parameters stay in sync.
+    # Use a step-derived seed. The step counter is read from args.
+    from megatron.training import get_args
+    args = get_args()
+    step = getattr(args, 'curr_iteration', 0)
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    # Seed includes tp_rank so different TP shards get different noise (correct for sharded params).
+    # All DP ranks with the same tp_rank get the same seed → identical noise.
+    noise_seed = hash((step, tp_rank, 'dp_noise')) % (2**31)
+
+    rng_state = torch.cuda.get_rng_state()
+    torch.cuda.manual_seed(noise_seed)
+
+    for model_chunk in model:
+        for param in model_chunk.parameters():
+            if param.requires_grad and hasattr(param, 'main_grad') and param.main_grad is not None:
+                noise = torch.normal(
+                    mean=0.0,
+                    std=noise_std,
+                    size=param.main_grad.shape,
+                    device=param.main_grad.device,
+                    dtype=torch.float32,
+                )
+                param.main_grad.add_(noise)
+
+    torch.cuda.set_rng_state(rng_state)
+
+
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
     """
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
@@ -281,6 +327,19 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
 
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
+
+    # DP-SGD: inject noise AFTER all gradient syncs, BEFORE normalization.
+    # This is the correct injection point per the DP-SGD protocol.
+    if getattr(config, 'dp_sgd', False):
+        _dp_sgd_inject_noise(model, config)
+        # In DP mode, normalize by fixed N_batch (number of sequences in global batch)
+        # instead of num_tokens (which is data-dependent and leaks batch composition).
+        # N_batch is passed via num_tokens when dp_sgd is set (see training.py).
+        if num_tokens is not None and num_tokens > 0:
+            scaling = 1.0 / num_tokens
+            for model_chunk in model:
+                model_chunk.scale_gradients(scaling)
+        return
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

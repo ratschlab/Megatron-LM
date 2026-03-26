@@ -404,6 +404,94 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def _dp_sgd_naive_forward_backward(
+    *,
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches,
+    config,
+    collect_non_loss_data,
+    first_val_step,
+):
+    """Naive DP-SGD: batch-level gradient clipping (Phase 0 stepping stone).
+
+    Phase 0 implementation — validates the DP-SGD infrastructure
+    (args, config propagation, noise injection, privacy accounting).
+
+    Current: clips the global batch gradient norm to C.
+    Phase 2 will replace this with true per-example ghost clipping.
+
+    Noise injection happens in finalize_model_grads.
+    """
+    C = config.dp_clipping_norm
+    model_type = get_model_type(model)
+
+    forward_data_store = []
+    input_tensor, output_tensor_grad = None, None
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+
+    # Phase 0 requires micro_batch_size == global_batch_size (no gradient accumulation).
+    assert num_microbatches == 1, (
+        "Phase 0 naive DP-SGD requires num_microbatches == 1 "
+        "(set --micro-batch-size == --global-batch-size). "
+        "Gradient accumulation with DP-SGD is deferred to Phase 2."
+    )
+
+    # Step 1: Forward pass (computes loss for logging).
+    output_tensor, num_tokens = forward_step(
+        forward_step_func,
+        data_iterator,
+        model,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        config,
+        collect_non_loss_data,
+        is_first_microbatch=check_first_val_step(first_val_step, False, True),
+        current_microbatch=0,
+    )
+    total_num_tokens += num_tokens.item()
+
+    # Step 2: Backward pass — gradients written to main_grad via DDP hooks.
+    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+
+    # Step 3: Clip the batch gradient norm in main_grad.
+    # TODO(Phase 2): Replace with true per-example ghost clipping.
+    total_norm_sq = torch.zeros(1, device='cuda', dtype=torch.float32)
+    params_with_grad = []
+    for param in model.parameters():
+        if param.requires_grad and hasattr(param, 'main_grad') and param.main_grad is not None:
+            total_norm_sq += param.main_grad.float().norm() ** 2
+            params_with_grad.append(param)
+
+    # All-reduce gradient norm across TP ranks (each rank holds sharded params).
+    if parallel_state.get_tensor_model_parallel_world_size() > 1:
+        torch.distributed.all_reduce(
+            total_norm_sq, group=parallel_state.get_tensor_model_parallel_group()
+        )
+
+    total_norm = total_norm_sq.sqrt()
+    clip_factor = torch.clamp(C / (total_norm + 1e-6), max=1.0)
+    for param in params_with_grad:
+        param.main_grad.mul_(clip_factor)
+
+    # Finalize model grads (all-reduce + noise injection).
+    # Pass fixed N_batch (global batch size) instead of data-dependent num_tokens.
+    if config.finalize_model_grads_func is not None:
+        from megatron.training import get_args
+        args = get_args()
+        global_batch_size = (
+            args.micro_batch_size
+            * parallel_state.get_data_parallel_world_size()
+            * num_microbatches
+        )
+        n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
+        config.finalize_model_grads_func([model], n_batch)
+
+    return forward_data_store
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -438,6 +526,21 @@ def forward_backward_no_pipelining(
     config = get_model_config(model)
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    # DP-SGD path: per-example gradient clipping + noise.
+    if getattr(config, 'dp_sgd', False) and not forward_only:
+        result = _dp_sgd_naive_forward_backward(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            config=config,
+            collect_non_loss_data=collect_non_loss_data,
+            first_val_step=first_val_step,
+        )
+        if config.timers is not None:
+            config.timers('forward-backward').stop()
+        return result
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
