@@ -844,6 +844,262 @@ class TestDataIndependenceAudit:
             f"Max diff {max_diff:.6f} exceeds expected bound {expected_bound:.6f}"
 
 
+class TestDeterminism:
+    """Same seed should produce identical DP-SGD results."""
+
+    def test_identical_seeds_identical_updates(self):
+        """Two runs with same seed must produce bitwise identical param updates."""
+        C, sigma, lr = 1.0, 0.5, 0.1
+        B = 3
+
+        updates = []
+        for run in range(2):
+            torch.manual_seed(42)
+            model = TinyModel(4)
+            x = torch.randn(B, 4)
+            output = model(x)
+            losses = output.sum(dim=-1)
+            update, _, _, _ = simulate_dp_sgd_step(model, x, losses, C, sigma, lr)
+            updates.append(update)
+
+        for name in updates[0]:
+            torch.testing.assert_close(updates[0][name], updates[1][name],
+                msg=f"Run 1 and Run 2 differ for {name} — determinism broken")
+
+    def test_different_seeds_different_updates(self):
+        """Different seeds must produce different updates (noise differs)."""
+        C, sigma, lr = 1.0, 1.0, 0.1
+        B = 3
+
+        updates = []
+        for seed in [42, 43]:
+            torch.manual_seed(seed)
+            model = TinyModel(4)
+            x = torch.randn(B, 4)
+            output = model(x)
+            losses = output.sum(dim=-1)
+            update, _, _, _ = simulate_dp_sgd_step(model, x, losses, C, sigma, lr)
+            updates.append(update)
+
+        any_different = False
+        for name in updates[0]:
+            if not torch.equal(updates[0][name], updates[1][name]):
+                any_different = True
+        assert any_different, "Different seeds should produce different updates"
+
+
+class TestOfflineEpsilonVerification:
+    """Recompute epsilon offline from step count, verify matches accountant."""
+
+    def test_accountant_matches_offline_calculation(self):
+        """Step-by-step accountant should match single SelfComposed calculation."""
+        try:
+            from dp_accounting.rdp import rdp_privacy_accountant
+            from dp_accounting import dp_event
+        except ImportError:
+            pytest.skip("dp-accounting not installed")
+
+        sigma = 0.7
+        N = 500
+        B = 5
+        delta = 1e-7
+        q = B / N
+        num_steps = 20
+
+        # Step-by-step (like training.py does)
+        acc_step = rdp_privacy_accountant.RdpAccountant(
+            orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
+            neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
+        )
+        for _ in range(num_steps):
+            acc_step.compose(dp_event.PoissonSampledDpEvent(
+                sampling_probability=q,
+                event=dp_event.GaussianDpEvent(sigma),
+            ))
+        eps_step = acc_step.get_epsilon(delta)
+
+        # Offline batch (what we'd compute from logs: "20 steps at sigma=0.7, q=0.01")
+        acc_batch = rdp_privacy_accountant.RdpAccountant(
+            orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
+            neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
+        )
+        acc_batch.compose(dp_event.SelfComposedDpEvent(
+            event=dp_event.PoissonSampledDpEvent(
+                sampling_probability=q,
+                event=dp_event.GaussianDpEvent(sigma),
+            ),
+            count=num_steps,
+        ))
+        eps_batch = acc_batch.get_epsilon(delta)
+
+        assert abs(eps_step - eps_batch) < 1e-6, \
+            f"Step-by-step ({eps_step:.6f}) != offline ({eps_batch:.6f})"
+
+
+class TestFrozenModelNoiseVariance:
+    """Frozen model (lr=0): collected gradients should have variance = σ²C²/B²."""
+
+    def test_noise_dominates_with_frozen_model(self):
+        """With lr=0, parameters don't change. Gradient = noise / B."""
+        torch.manual_seed(42)
+        C = 1.0
+        sigma = 2.0
+        B = 4
+        dim = 8
+        num_steps = 200
+
+        model = TinyModel(dim)
+        x = torch.randn(B, dim)
+
+        # Collect noisy gradients over many steps
+        all_grads = []
+        for step in range(num_steps):
+            output = model(x)
+            losses = output.sum(dim=-1)
+
+            # Per-example norms + clip
+            norms = torch.zeros(B)
+            for i in range(B):
+                model.zero_grad()
+                losses[i].backward(retain_graph=True)
+                norms[i] = sum(p.grad.float().norm().item() ** 2
+                                for p in model.parameters() if p.grad is not None) ** 0.5
+            clips = torch.clamp(C / (norms + 1e-6), max=1.0)
+
+            model.zero_grad()
+            (clips.detach() * losses).sum().backward()
+
+            # Collect gradient + noise
+            grad_vec = torch.cat([p.grad.float().flatten()
+                                   for p in model.parameters() if p.grad is not None])
+            noise = torch.normal(0, sigma * C, size=grad_vec.shape)
+            noisy_grad = (grad_vec + noise) / B
+            all_grads.append(noisy_grad)
+
+        # Stack and compute variance per coordinate
+        stacked = torch.stack(all_grads)  # [num_steps, D]
+        empirical_var = stacked.var(dim=0).mean().item()
+
+        # Expected: signal variance + noise variance / B²
+        # Noise variance per coordinate = σ²C² / B²
+        expected_noise_var = (sigma * C) ** 2 / B ** 2
+        # Signal is constant (frozen model, same x), so variance ≈ noise variance
+        assert empirical_var > expected_noise_var * 0.3, \
+            f"Variance too low: {empirical_var:.6f} (expected ~{expected_noise_var:.6f})"
+        assert empirical_var < expected_noise_var * 3.0, \
+            f"Variance too high: {empirical_var:.6f} (expected ~{expected_noise_var:.6f})"
+
+
+class TestLossAggregationModes:
+    """Mean vs sum aggregation: mean should produce length-invariant norms."""
+
+    def test_mean_aggregation_length_invariant(self):
+        """With mean loss, examples of different lengths should have similar grad norms."""
+        torch.manual_seed(42)
+        model = TinyModel(4)
+        B = 4
+
+        # Create examples with "different lengths" via loss masks
+        x = torch.randn(B, 4)
+        output = model(x)
+        raw_losses = output.abs()  # [B, 4] simulating per-position losses
+
+        # Masks: example 0 has 4 tokens, example 1 has 1 token
+        mask_full = torch.ones(B, 4)
+        mask_short = torch.ones(B, 4)
+        mask_short[1, 1:] = 0  # example 1: only 1 token
+
+        # Sum aggregation: long examples have larger norms
+        per_ex_sum = (raw_losses * mask_short).sum(dim=-1)
+        # Mean aggregation: normalized by token count
+        tokens_per_ex = mask_short.sum(dim=-1).clamp(min=1)
+        per_ex_mean = per_ex_sum / tokens_per_ex
+
+        # Mean should reduce the gap between long and short examples
+        sum_ratio = per_ex_sum[0] / per_ex_sum[1]
+        mean_ratio = per_ex_mean[0] / per_ex_mean[1]
+        assert mean_ratio < sum_ratio, \
+            "Mean aggregation should reduce loss ratio between long/short examples"
+
+    def test_sum_aggregation_scales_with_length(self):
+        """With sum loss, gradient norm scales linearly with sequence length."""
+        torch.manual_seed(42)
+        model = TinyModel(4)
+
+        # Two "sequences": one with 4 tokens, one with 1 token (same per-token loss)
+        x = torch.randn(1, 4)
+        output = model(x)  # [1, 4]
+
+        # Full sequence loss
+        model.zero_grad()
+        output.sum().backward()
+        norm_full = sum(p.grad.float().norm().item() ** 2
+                        for p in model.parameters() if p.grad is not None) ** 0.5
+
+        # Single token loss (fresh forward to avoid graph reuse)
+        model.zero_grad()
+        model(x)[0, 0].backward()
+        norm_single = sum(p.grad.float().norm().item() ** 2
+                           for p in model.parameters() if p.grad is not None) ** 0.5
+
+        # Full should be significantly larger than single (sum aggregation scales with tokens)
+        ratio = norm_full / (norm_single + 1e-10)
+        assert ratio > 1.5, f"Sum aggregation: full/single ratio should be >1.5, got {ratio:.2f}"
+
+
+class TestGradientDirectionPreservation:
+    """Clipping should preserve gradient direction (only scale magnitude)."""
+
+    def test_cosine_similarity_near_one(self):
+        """Clipped gradient should have high cosine similarity with unclipped."""
+        torch.manual_seed(42)
+        model = TinyModel(8)
+        B = 4
+        x = torch.randn(B, 8) * 3
+        C = 0.5  # aggressive clipping
+
+        output = model(x)
+        losses = output.sum(dim=-1)
+
+        # Unclipped gradient
+        model.zero_grad()
+        losses.sum().backward()
+        unclipped = torch.cat([p.grad.float().flatten()
+                                for p in model.parameters() if p.grad is not None])
+
+        # Clipped gradient (with same data)
+        norms = torch.zeros(B)
+        for i in range(B):
+            model.zero_grad()
+            model(x).sum(dim=-1)[i].backward()
+            norms[i] = sum(p.grad.float().norm().item() ** 2
+                            for p in model.parameters() if p.grad is not None) ** 0.5
+        clips = torch.clamp(C / (norms + 1e-6), max=1.0)
+        model.zero_grad()
+        (clips.detach() * model(x).sum(dim=-1)).sum().backward()
+        clipped = torch.cat([p.grad.float().flatten()
+                              for p in model.parameters() if p.grad is not None])
+
+        # Cosine similarity
+        cos_sim = torch.dot(unclipped, clipped) / (unclipped.norm() * clipped.norm() + 1e-10)
+        assert cos_sim.item() > 0.5, \
+            f"Clipped gradient direction too different: cosine_sim={cos_sim:.4f}"
+
+    def test_zero_C_gives_zero_gradient(self):
+        """C=0 (or very small) should produce near-zero clipped gradient."""
+        torch.manual_seed(42)
+        model = TinyModel(4)
+        x = torch.randn(3, 4)
+        output = model(x)
+        losses = output.sum(dim=-1)
+
+        update, clips, _, _ = simulate_dp_sgd_step(model, x, losses, C=1e-10, sigma=0.0, lr=0.1)
+
+        total_update_norm = sum(v.norm().item() for v in update.values())
+        assert total_update_norm < 1e-8, \
+            f"C≈0 should give zero gradient, got update norm={total_update_norm:.2e}"
+
+
 class TestNoiseCalibration:
     """Empirical noise variance should match sigma^2 * C^2."""
 
