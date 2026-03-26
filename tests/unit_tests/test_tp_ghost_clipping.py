@@ -485,6 +485,296 @@ class TestNoiseTP:
 # End-to-end: full simulated TP ghost clipping
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 3 specific: two-generator noise, DDP scaling, full pipeline
+# ---------------------------------------------------------------------------
+
+class TestTwoGeneratorNoise:
+    """Verify the two-generator approach produces correct, independent noise."""
+
+    def test_generators_produce_different_noise_per_param(self):
+        """Sequential torch.normal() calls on same generator give different noise."""
+        gen = torch.Generator()
+        gen.manual_seed(42)
+        noise1 = torch.normal(0, 1.0, size=(4, 4), generator=gen)
+        noise2 = torch.normal(0, 1.0, size=(4, 4), generator=gen)
+        assert not torch.equal(noise1, noise2), \
+            "Same generator should produce different noise on consecutive calls"
+
+    def test_replicated_generator_identical_across_tp_ranks(self):
+        """gen_replicated with same seed → identical noise sequences across TP ranks."""
+        step = 42
+        num_params = 5
+        shapes = [(4,), (8, 4), (4,), (8,), (16, 8)]
+
+        noise_per_rank = {}
+        for tp_rank in range(4):
+            # Replicated: seed excludes tp_rank
+            gen = torch.Generator()
+            gen.manual_seed(step * 1000003 + 7)
+            noises = [torch.normal(0, 1.0, size=s, generator=gen) for s in shapes]
+            noise_per_rank[tp_rank] = noises
+
+        # All TP ranks should produce identical noise for replicated params
+        for rank in range(1, 4):
+            for i in range(num_params):
+                torch.testing.assert_close(
+                    noise_per_rank[0][i], noise_per_rank[rank][i],
+                    msg=f"Replicated noise differs: rank 0 vs rank {rank}, param {i}")
+
+    def test_sharded_generator_different_across_tp_ranks(self):
+        """gen_sharded with tp_rank in seed → different noise per TP rank."""
+        step = 42
+        shape = (8, 4)
+
+        noises = []
+        for tp_rank in range(4):
+            gen = torch.Generator()
+            gen.manual_seed(step * 1000003 + tp_rank * 1000007 + 13)
+            noises.append(torch.normal(0, 1.0, size=shape, generator=gen))
+
+        for i in range(1, 4):
+            assert not torch.equal(noises[0], noises[i]), \
+                f"Sharded noise should differ: rank 0 vs rank {i}"
+
+    def test_replicated_and_sharded_generators_independent(self):
+        """gen_replicated and gen_sharded produce uncorrelated sequences."""
+        step = 42
+        shape = (100,)
+
+        gen_r = torch.Generator()
+        gen_r.manual_seed(step * 1000003 + 7)
+        noise_r = torch.normal(0, 1.0, size=shape, generator=gen_r)
+
+        gen_s = torch.Generator()
+        gen_s.manual_seed(step * 1000003 + 0 * 1000007 + 13)  # tp_rank=0
+        noise_s = torch.normal(0, 1.0, size=shape, generator=gen_s)
+
+        # Should be uncorrelated (cosine similarity near 0)
+        cos_sim = torch.dot(noise_r, noise_s) / (noise_r.norm() * noise_s.norm() + 1e-10)
+        assert abs(cos_sim.item()) < 0.3, \
+            f"Replicated and sharded generators should be independent: cos_sim={cos_sim:.3f}"
+
+    def test_noise_variance_correct(self):
+        """Both generators should produce noise with correct variance."""
+        sigma, C = 2.0, 3.0
+        noise_std = sigma * C
+        shape = (10000,)
+
+        gen = torch.Generator()
+        gen.manual_seed(42)
+        noise = torch.normal(0, noise_std, size=shape, generator=gen)
+
+        empirical_var = noise.var().item()
+        expected_var = noise_std ** 2
+        assert abs(empirical_var - expected_var) / expected_var < 0.1, \
+            f"Variance {empirical_var:.2f} should be ~{expected_var:.2f}"
+
+
+class TestDDPGradientScaling:
+    """Simulate the DDP 1/DP pre-scaling issue and verify the fix."""
+
+    def test_unscaled_gradients_correct_for_dp_sgd(self):
+        """With calculate_per_token_loss=True (scaling_factor=1.0),
+        DP all-reduce gives SUM of clipped gradients (correct for DP-SGD)."""
+        DP = 4
+        B_per_rank = 3
+        dim = 4
+        C = 1.0
+        sigma = 0.5
+
+        # Simulate: each DP rank has its own clipped gradient
+        clipped_grads = [torch.randn(dim, dim) * 0.5 for _ in range(DP)]
+
+        # With scaling_factor=1.0: all-reduce gives pure SUM
+        summed = sum(clipped_grads)
+        N_batch = B_per_rank * DP
+        noise = torch.normal(0, sigma * C, size=summed.shape)
+        dp_sgd_update = (summed + noise) / N_batch
+
+        # Verify: update is sum/N_batch + noise/N_batch (correct DP-SGD)
+        expected_signal = sum(clipped_grads) / N_batch
+        actual_signal = dp_sgd_update - noise / N_batch
+        torch.testing.assert_close(actual_signal, expected_signal, atol=1e-5, rtol=1e-4)
+
+    def test_prescaled_gradients_wrong_for_dp_sgd(self):
+        """With scaling_factor=1/DP (default), DP all-reduce gives AVERAGE.
+        This attenuates signal by 1/DP while noise stays the same → bad SNR."""
+        DP = 4
+        dim = 4
+        C = 1.0
+        sigma = 0.5
+
+        clipped_grads = [torch.randn(dim, dim) * 0.5 for _ in range(DP)]
+
+        # With scaling_factor=1/DP: pre-scale then SUM = average
+        prescaled = [g / DP for g in clipped_grads]
+        averaged = sum(prescaled)  # = sum(g) / DP
+
+        N_batch = 12
+        noise = torch.normal(0, sigma * C, size=averaged.shape)
+        wrong_update = (averaged + noise) / N_batch  # signal / DP, noise unchanged
+
+        correct_summed = sum(clipped_grads)
+        correct_update = (correct_summed + noise) / N_batch
+
+        # The wrong update has DP× less signal
+        wrong_signal_norm = (wrong_update - noise / N_batch).norm().item()
+        correct_signal_norm = (correct_update - noise / N_batch).norm().item()
+        ratio = correct_signal_norm / (wrong_signal_norm + 1e-10)
+        assert abs(ratio - DP) < 0.5, \
+            f"Prescaled signal should be {DP}× weaker, got ratio={ratio:.2f}"
+
+
+class TestNamedParametersOrderStability:
+    """Verify model.named_parameters() order is deterministic (prerequisite for two-generator)."""
+
+    def test_order_stable_across_instantiations(self):
+        """Two model instantiations should have identical parameter order."""
+        torch.manual_seed(42)
+
+        class SmallModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = nn.Linear(8, 8)
+                self.norm = nn.LayerNorm(8)
+                self.linear2 = nn.Linear(8, 4)
+            def forward(self, x):
+                return self.linear2(self.norm(self.linear1(x)))
+
+        m1 = SmallModel()
+        m2 = SmallModel()
+
+        names1 = [n for n, _ in m1.named_parameters()]
+        names2 = [n for n, _ in m2.named_parameters()]
+        assert names1 == names2, f"Parameter order differs: {names1} vs {names2}"
+
+
+class TestTwoAccumulatorNormTracking:
+    """Verify the sharded/replicated two-accumulator approach works correctly."""
+
+    def test_append_time_tagging(self):
+        """Simulated backward hooks append to correct accumulator based on param attribute."""
+        sharded_norms = []
+        replicated_norms = []
+
+        # Simulate a model with mixed params
+        params = [
+            ('linear1.weight', True),   # sharded (ColumnParallel)
+            ('linear1.bias', True),     # sharded
+            ('norm.weight', False),     # replicated (LayerNorm)
+            ('norm.bias', False),       # replicated
+            ('linear2.weight', True),   # sharded (RowParallel)
+            ('linear2.bias', False),    # replicated (RowParallel bias)
+        ]
+
+        B = 3
+        for name, is_tp in params:
+            norm_sq = torch.randn(B).abs()
+            if is_tp:
+                sharded_norms.append(norm_sq)
+            else:
+                replicated_norms.append(norm_sq)
+
+        assert len(sharded_norms) == 3  # linear1.w, linear1.b, linear2.w
+        assert len(replicated_norms) == 3  # norm.w, norm.b, linear2.b
+
+    def test_dedup_produces_correct_total_with_tp2(self):
+        """TP=2: sharded norms all-reduced, replicated counted once."""
+        TP = 2
+        B = 3
+
+        # Simulate per-rank norms
+        sharded_per_rank = [torch.tensor([1.0, 2.0, 3.0]) for _ in range(TP)]
+        replicated_per_rank = [torch.tensor([0.5, 0.5, 0.5]) for _ in range(TP)]
+
+        totals = []
+        for rank in range(TP):
+            s = sharded_per_rank[rank]
+            r = replicated_per_rank[rank] if rank == 0 else torch.zeros(B)
+            totals.append(s + r)
+
+        # All-reduce (sum)
+        total = sum(totals)
+
+        # Expected: sum of sharded (TP * per_rank) + replicated (1 * per_rank)
+        expected = TP * sharded_per_rank[0] + replicated_per_rank[0]
+        torch.testing.assert_close(total, expected)
+
+
+class TestFullDPSGDPipelineTP:
+    """End-to-end DP-SGD pipeline with simulated TP=2."""
+
+    def test_sigma0_large_C_tp2_matches_tp1_sgd(self):
+        """sigma=0, C=large, TP=2 should produce same update as TP=1 SGD."""
+        torch.manual_seed(42)
+        TP = 2
+        dim = 8
+        B = 3
+        lr = 0.1
+        C = 100.0  # effectively no clipping
+
+        weight = torch.randn(dim, dim)
+        x = torch.randn(B, dim)
+        go = torch.randn(B, dim)  # simulated grad_output
+
+        # TP=1 SGD: gradient = go^T @ x
+        grad_tp1 = go.t() @ x  # [dim, dim]
+        update_tp1 = -lr * grad_tp1 / B
+
+        # TP=2 DP-SGD with sigma=0, C=large
+        # Each TP rank computes partial norms
+        norms_sq = torch.zeros(B)
+        for rank in range(TP):
+            go_shard = shard_output_column(go.unsqueeze(0), rank, TP).squeeze(0)
+            x_norm_sq = (x.float() ** 2).sum(dim=-1)
+            go_norm_sq = (go_shard.float() ** 2).sum(dim=-1)
+            norms_sq += go_norm_sq * x_norm_sq
+
+        norms = norms_sq.sqrt()
+        clips = torch.clamp(C / (norms + 1e-6), max=1.0)
+        assert (clips == 1.0).all(), "C=100 should mean no clipping"
+
+        # Clipped gradient = clip_i * go_i^T @ x_i summed
+        clipped_grad = torch.zeros(dim, dim)
+        for i in range(B):
+            clipped_grad += clips[i] * go[i:i+1].t() @ x[i:i+1]
+
+        # No noise (sigma=0), normalize by B
+        update_tp2 = -lr * clipped_grad / B
+
+        torch.testing.assert_close(update_tp1, update_tp2, atol=1e-4, rtol=1e-4,
+            msg="sigma=0 C=large TP=2 should match TP=1 SGD")
+
+    def test_noise_adds_correct_variance_per_coordinate(self):
+        """Full pipeline: after clip + noise + scale, per-coordinate variance should be σ²C²/B²."""
+        sigma = 2.0
+        C = 1.0
+        B = 4
+        dim = 8
+        num_trials = 200
+
+        updates = []
+        for trial in range(num_trials):
+            # Fixed clipped gradient (same every trial)
+            torch.manual_seed(42)
+            clipped_grad = torch.randn(dim, dim) * 0.3
+
+            # Different noise each trial
+            gen = torch.Generator()
+            gen.manual_seed(trial)
+            noise = torch.normal(0, sigma * C, size=clipped_grad.shape, generator=gen)
+            update = (clipped_grad + noise) / B
+            updates.append(update)
+
+        stacked = torch.stack(updates)
+        empirical_var = stacked.var(dim=0).mean().item()
+        expected_noise_var = (sigma * C) ** 2 / B ** 2
+        # Total var ≈ noise var (signal is constant)
+        assert abs(empirical_var - expected_noise_var) / expected_noise_var < 0.2, \
+            f"Per-coordinate variance {empirical_var:.4f} should be ~{expected_noise_var:.4f}"
+
+
 class TestEndToEndTP:
     """Full simulated TP=2 ghost clipping pipeline."""
 
