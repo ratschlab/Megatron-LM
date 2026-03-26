@@ -511,6 +511,17 @@ def _dp_sgd_ghost_forward_backward(
 
             clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
+            # Log clip stats if requested (first microbatch only)
+            if is_first and getattr(args, 'dp_log_clip_stats', False):
+                all_norms_list = ghost_ctx._per_example_norm_sq_sharded + ghost_ctx._per_example_norm_sq_replicated
+                if all_norms_list:
+                    norms = torch.stack(all_norms_list).sum(dim=0).sqrt()
+                    frac_clipped = (clip_factors < 1.0).float().mean().item()
+                    print(f'DP-SGD clip stats: frac_clipped={frac_clipped:.2f}, '
+                          f'norm min={norms.min():.2f} med={norms.median():.2f} '
+                          f'max={norms.max():.2f}, '
+                          f'clip min={clip_factors.min():.4f} max={clip_factors.max():.4f}')
+
             # Diagnostic checks (first microbatch only to reduce noise)
             if _diagnostic and is_first:
                 main_grad_norm = sum(

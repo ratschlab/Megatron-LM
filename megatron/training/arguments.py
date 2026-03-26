@@ -2468,4 +2468,12 @@ def _add_dp_sgd_args(parser):
     group.add_argument('--dp-num-dataset-examples', type=int, default=0,
                        help='Total number of privacy units N in the dataset '
                        '(for DP accounting). Required when --dp-sgd is set.')
+    group.add_argument('--dp-num-clinical-examples', type=int, default=0,
+                       help='Number of clinical privacy units (episodes). '
+                       'For dual accountant. If 0, uses dp-num-dataset-examples.')
+    group.add_argument('--dp-num-literature-examples', type=int, default=0,
+                       help='Number of literature privacy units (documents). '
+                       'For dual accountant. If 0, uses dp-num-dataset-examples.')
+    group.add_argument('--dp-log-clip-stats', action='store_true', default=False,
+                       help='Log per-step clip fraction, norm stats, and epsilon.')
     return parser
