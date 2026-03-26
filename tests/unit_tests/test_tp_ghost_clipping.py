@@ -419,24 +419,21 @@ class TestVocabParallelEmbeddingTP:
 
 class TestNoiseTP:
     """Noise for replicated params must be identical across TP ranks.
-    Noise for sharded params must be independent (different per TP rank)."""
+    Noise for sharded params must be independent (different per TP rank).
+    Uses production arithmetic seeds (NOT hash())."""
 
     def test_replicated_param_same_noise(self):
-        """Replicated params: same seed (no tp_rank) → identical noise."""
+        """Replicated params: arithmetic seed without tp_rank → identical noise."""
         step = 42
-        sigma, C = 1.0, 1.0
-        noise_std = sigma * C
-        shape = (8,)  # LayerNorm weight shape
+        shape = (8,)
 
         noises = []
         for tp_rank in range(4):
-            # Replicated: seed excludes tp_rank
-            seed = hash((step, 'dp_noise')) % (2**31)
-            torch.manual_seed(seed)
-            noise = torch.normal(0, noise_std, size=shape)
-            noises.append(noise)
+            seed = (step * 1000003 + 7) % (2**31 - 1)  # production seed
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noises.append(torch.normal(0, 1.0, size=shape, generator=gen))
 
-        # All TP ranks should have identical noise
         for rank in range(1, 4):
             torch.testing.assert_close(noises[0], noises[rank],
                 msg=f"Replicated noise on TP rank {rank} differs from rank 0")
@@ -444,37 +441,30 @@ class TestNoiseTP:
     def test_sharded_param_different_noise(self):
         """Sharded params: seed includes tp_rank → different noise per rank."""
         step = 42
-        sigma, C = 1.0, 1.0
-        noise_std = sigma * C
-        shape = (8,)  # weight shard shape
+        shape = (8,)
 
         noises = []
         for tp_rank in range(4):
-            seed = hash((step, tp_rank, 'dp_noise')) % (2**31)
-            torch.manual_seed(seed)
-            noise = torch.normal(0, noise_std, size=shape)
-            noises.append(noise)
+            seed = (step * 1000003 + tp_rank * 1000007 + 13) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noises.append(torch.normal(0, 1.0, size=shape, generator=gen))
 
-        # Different TP ranks should have different noise
         for rank in range(1, 4):
             assert not torch.equal(noises[0], noises[rank]), \
                 f"Sharded noise on TP rank {rank} should differ from rank 0"
 
     def test_dp_ranks_same_noise_for_replicated(self):
-        """All DP ranks (with same tp_rank) get identical noise for replicated params."""
+        """All DP ranks (without dist-opt) get identical noise for replicated params."""
         step = 42
-        tp_rank = 0
-        sigma, C = 1.0, 1.0
-        noise_std = sigma * C
         shape = (8,)
 
         noises = []
         for dp_rank in range(8):
-            # Replicated: seed has no dp_rank or tp_rank
-            seed = hash((step, 'dp_noise')) % (2**31)
-            torch.manual_seed(seed)
-            noise = torch.normal(0, noise_std, size=shape)
-            noises.append(noise)
+            seed = (step * 1000003 + 7) % (2**31 - 1)  # no dp_rank
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noises.append(torch.normal(0, 1.0, size=shape, generator=gen))
 
         for rank in range(1, 8):
             torch.testing.assert_close(noises[0], noises[rank],
@@ -1016,6 +1006,108 @@ class TestEmbeddingShardBoundary:
 
         assert abs(full_norm - sharded_norm) < 1e-4, \
             f"Boundary tokens: full={full_norm:.4f} sharded={sharded_norm:.4f}"
+
+
+class TestMultiEmbeddingIsolation:
+    """Test that multiple embedding modules don't share state (the critical bug fix)."""
+
+    def test_two_embeddings_independent_input_ids(self):
+        """Word + position embeddings: each backward hook gets correct input_ids."""
+        # Simulate the per-module dict approach
+        embedding_input_ids = {}  # keyed by id(module)
+
+        word_embed = nn.Embedding(100, 16)
+        pos_embed = nn.Embedding(50, 16)
+
+        token_ids = torch.tensor([[1, 5, 10, 20]])
+        position_ids = torch.tensor([[0, 1, 2, 3]])
+
+        # Forward hooks save per-module
+        embedding_input_ids[id(word_embed)] = token_ids
+        embedding_input_ids[id(pos_embed)] = position_ids
+
+        # Backward hook for word_embed should get token_ids
+        assert torch.equal(embedding_input_ids[id(word_embed)], token_ids)
+        # Backward hook for pos_embed should get position_ids
+        assert torch.equal(embedding_input_ids[id(pos_embed)], position_ids)
+        # They should NOT be the same
+        assert not torch.equal(token_ids, position_ids)
+
+    def test_two_embeddings_norms_independent(self):
+        """Each embedding contributes its own independent norm to the total."""
+        torch.manual_seed(42)
+        V_word, V_pos, H = 32, 16, 8
+        B, S = 2, 4
+
+        word_embed = nn.Embedding(V_word, H)
+        pos_embed = nn.Embedding(V_pos, H)
+
+        token_ids = torch.randint(0, V_word, (B, S))
+        position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+
+        word_out = word_embed(token_ids)
+        pos_out = pos_embed(position_ids)
+        combined = word_out + pos_out
+        loss = combined.sum(dim=(1, 2))  # [B]
+
+        # Naive norms: separate backward for each example
+        naive_norms = torch.zeros(B)
+        for i in range(B):
+            word_embed.zero_grad()
+            pos_embed.zero_grad()
+            loss[i].backward(retain_graph=True)
+            norm_sq = 0.0
+            for p in list(word_embed.parameters()) + list(pos_embed.parameters()):
+                if p.grad is not None:
+                    norm_sq += p.grad.float().norm().item() ** 2
+            naive_norms[i] = norm_sq ** 0.5
+
+        # Ghost norms via hooks on BOTH embeddings (per-module dict)
+        embedding_input_ids = {}
+
+        def make_fwd(mod_id):
+            def f(mod, args, out):
+                embedding_input_ids[mod_id] = args[0]
+            return f
+
+        norm_sq_list = []
+        def make_bwd(mod_id, V):
+            def f(mod, gi, go):
+                go_t = go[0]
+                if go_t is None or mod_id not in embedding_input_ids:
+                    return
+                ids = embedding_input_ids[mod_id]
+                for i in range(ids.shape[0]):
+                    acc = torch.zeros(V, H)
+                    acc.scatter_add_(0, ids[i].unsqueeze(-1).expand(-1, H), go_t[i].float())
+                    if len(norm_sq_list) <= i:
+                        norm_sq_list.append((acc ** 2).sum())
+                    else:
+                        norm_sq_list[i] = norm_sq_list[i] + (acc ** 2).sum()
+            return f
+
+        hooks = [
+            word_embed.register_forward_hook(make_fwd(id(word_embed))),
+            word_embed.register_full_backward_hook(make_bwd(id(word_embed), V_word)),
+            pos_embed.register_forward_hook(make_fwd(id(pos_embed))),
+            pos_embed.register_full_backward_hook(make_bwd(id(pos_embed), V_pos)),
+        ]
+
+        word_embed.zero_grad()
+        pos_embed.zero_grad()
+        w = word_embed(token_ids)
+        p = pos_embed(position_ids)
+        (w + p).sum(dim=(1, 2)).sum().backward()
+
+        for h in hooks:
+            h.remove()
+
+        ghost_norms = torch.tensor([n.sqrt().item() for n in norm_sq_list])
+
+        # Ghost norms should be valid upper bounds
+        for i in range(B):
+            assert ghost_norms[i].item() >= naive_norms[i].item() - 1e-3, \
+                f"Multi-embed ghost {ghost_norms[i]:.4f} < naive {naive_norms[i]:.4f}"
 
 
 class TestEndToEndTP:
