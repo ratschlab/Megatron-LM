@@ -274,12 +274,16 @@ def validate_args(args, defaults={}):
             '--dp-num-dataset-examples must be set when --dp-sgd is enabled'
         assert args.pipeline_model_parallel_size == 1, \
             'DP-SGD requires PP=1 (pipeline parallelism not supported)'
-        assert args.tensor_model_parallel_size == 1, \
-            'DP-SGD Phase 2 requires TP=1 (TP support deferred to Phase 3)'
         assert args.context_parallel_size == 1, \
             'DP-SGD requires context_parallel_size=1'
         assert not getattr(args, 'num_experts', None), \
             'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
+        # Phase 3: force calculate_per_token_loss=True to prevent DDP 1/DP gradient pre-scaling
+        if hasattr(args, 'calculate_per_token_loss'):
+            args.calculate_per_token_loss = True
+        # Phase 3: distributed optimizer requires single instance
+        if getattr(args, 'num_distributed_optimizer_instances', 1) != 1:
+            raise ValueError('DP-SGD requires num_distributed_optimizer_instances=1')
         # Require local transformer impl (TE linear modules not covered by ghost clipping hooks)
         if hasattr(args, 'transformer_impl') and args.transformer_impl != 'local':
             if args.rank == 0:

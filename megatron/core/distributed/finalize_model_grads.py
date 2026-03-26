@@ -238,12 +238,17 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
 def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig):
     """Inject Gaussian noise into gradients for DP-SGD.
 
-    Called after finish_grad_sync() (all-reduce across DP ranks), before normalization.
-    After all-reduce, all DP ranks hold identical gradients. We add identical noise
-    on all ranks using a synchronized RNG seed derived from the training step.
+    Uses two torch.Generator objects for correct TP noise synchronization:
+    - gen_replicated: same seed on all TP ranks (replicated params stay in sync)
+    - gen_sharded: different seed per TP rank (sharded params get independent noise)
 
-    With distributed optimizer (Phase 3+), each rank holds a different gradient shard
-    and adds independent noise. That path will use per-shard seeds.
+    With distributed optimizer: each DP rank adds independent noise by including
+    dp_rank in the seed. Without: all DP ranks add identical noise.
+
+    Sequential torch.normal() calls advance each generator's state, ensuring
+    cross-parameter independence (no seed collisions between parameters).
+
+    Prerequisite: model.named_parameters() must have identical order across TP ranks.
     """
     sigma = getattr(config, 'dp_noise_multiplier', 0.0)
     C = getattr(config, 'dp_clipping_norm', 1.0)
@@ -253,32 +258,44 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
 
     noise_std = sigma * C
 
-    # Synchronized noise: all DP ranks must add identical noise so parameters stay in sync.
-    # Use a step-derived seed. The step counter is read from args.
     from megatron.training import get_args
     args = get_args()
     step = getattr(args, 'curr_iteration', 0)
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    # Seed includes tp_rank so different TP shards get different noise (correct for sharded params).
-    # All DP ranks with the same tp_rank get the same seed → identical noise.
-    noise_seed = hash((step, tp_rank, 'dp_noise')) % (2**31)
+    dp_rank = parallel_state.get_data_parallel_rank()
+    use_dist_opt = getattr(args, 'use_distributed_optimizer', False)
 
-    rng_state = torch.cuda.get_rng_state()
-    torch.cuda.manual_seed(noise_seed)
+    # Deterministic seeds using arithmetic (NOT Python hash() — non-deterministic across processes)
+    if use_dist_opt:
+        # Distributed optimizer: each DP rank generates independent noise
+        replicated_seed = (step * 1000003 + dp_rank * 1000011 + 7) % (2**31 - 1)
+        sharded_seed = (step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + 13) % (2**31 - 1)
+    else:
+        # Standard: all DP ranks get identical noise (no dp_rank in seed)
+        replicated_seed = (step * 1000003 + 7) % (2**31 - 1)
+        sharded_seed = (step * 1000003 + tp_rank * 1000007 + 13) % (2**31 - 1)
+
+    device = next(model[0].parameters()).device
+    gen_replicated = torch.Generator(device=device)
+    gen_replicated.manual_seed(replicated_seed)
+    gen_sharded = torch.Generator(device=device)
+    gen_sharded.manual_seed(sharded_seed)
 
     for model_chunk in model:
-        for param in model_chunk.parameters():
-            if param.requires_grad and hasattr(param, 'main_grad') and param.main_grad is not None:
-                noise = torch.normal(
-                    mean=0.0,
-                    std=noise_std,
-                    size=param.main_grad.shape,
-                    device=param.main_grad.device,
-                    dtype=torch.float32,
-                )
-                param.main_grad.add_(noise)
-
-    torch.cuda.set_rng_state(rng_state)
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad or not hasattr(param, 'main_grad') or param.main_grad is None:
+                continue
+            is_sharded = getattr(param, 'tensor_model_parallel', False)
+            gen = gen_sharded if is_sharded else gen_replicated
+            noise = torch.normal(
+                mean=0.0,
+                std=noise_std,
+                size=param.main_grad.shape,
+                device=param.main_grad.device,
+                dtype=torch.float32,
+                generator=gen,
+            )
+            param.main_grad.add_(noise)
 
 
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
