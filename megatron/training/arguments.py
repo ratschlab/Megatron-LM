@@ -270,8 +270,10 @@ def validate_args(args, defaults={}):
 
     # DP-SGD validation and auto-configuration.
     if args.dp_sgd:
-        assert args.dp_num_dataset_examples > 0, \
-            '--dp-num-dataset-examples must be set when --dp-sgd is enabled'
+        if not getattr(args, 'dp_data_path', None):
+            assert args.dp_num_dataset_examples > 0, \
+                '--dp-num-dataset-examples must be set when --dp-sgd is enabled ' \
+                '(or use --dp-data-path to auto-detect from dataloader)'
         # PP>1 is supported (Phase 3c) but requires uniform recompute (not block).
         if args.pipeline_model_parallel_size > 1 and \
                 getattr(args, 'recompute_method', None) == 'block':
