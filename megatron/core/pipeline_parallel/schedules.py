@@ -724,7 +724,7 @@ def _dp_sgd_pipeline_forward_backward(
 
     # Evaluation mode: no ghost clipping, just forward
     if forward_only:
-        return pipeline_schedule_func(
+        forward_data_store = pipeline_schedule_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
@@ -736,6 +736,13 @@ def _dp_sgd_pipeline_forward_backward(
             collect_non_loss_data=collect_non_loss_data,
             first_val_step=first_val_step,
         )
+        # Strip dp_per_example_losses from loss dicts — the DP loss_func
+        # adds a [B] tensor that Megatron's eval reducer can't accumulate
+        # into a scalar slot (would cause shape mismatch RuntimeError).
+        for entry in forward_data_store:
+            if isinstance(entry, dict):
+                entry.pop('dp_per_example_losses', None)
+        return forward_data_store
 
     import os
     _diagnostic = os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1'

@@ -467,12 +467,18 @@ class GhostClippingContext:
 
         # Gamma: Cauchy-Schwarz upper bound (replicated param)
         if hasattr(module, 'weight') and module.weight is not None:
-            dq = self._ln_xhat_dim_sq.get(id(module))
-            if dq is not None and len(dq) > 0:
-                xhat_dim_sq = dq.popleft()
-                go_sq_per_dim = (go_f ** 2).sum(dim=0)  # [B, H]
-                gamma_norm_sq = (go_sq_per_dim * xhat_dim_sq).sum(dim=-1)  # [B]
-                self._per_mb_norm_sq_replicated[mb_id].append(gamma_norm_sq)
+            mid = id(module)
+            dq = self._ln_xhat_dim_sq.get(mid)
+            assert dq is not None and len(dq) > 0, (
+                f"DP-SGD ghost clipping: LayerNorm backward for gamma but no "
+                f"forward state in _ln_xhat_dim_sq (module {mid}). "
+                f"Forward hook may have been skipped — norm will be undercounted, "
+                f"breaking the DP guarantee."
+            )
+            xhat_dim_sq = dq.popleft()
+            go_sq_per_dim = (go_f ** 2).sum(dim=0)  # [B, H]
+            gamma_norm_sq = (go_sq_per_dim * xhat_dim_sq).sum(dim=-1)  # [B]
+            self._per_mb_norm_sq_replicated[mb_id].append(gamma_norm_sq)
 
     # ---- Embedding hooks ----
 
@@ -496,9 +502,13 @@ class GhostClippingContext:
         go = grad_output[0]  # shape varies — may be [B, S, H] or [S, B, H]
         if go is None:
             return
-        dq = self._embedding_input_ids.get(id(module))
-        if dq is None or len(dq) == 0:
-            return
+        mid = id(module)
+        dq = self._embedding_input_ids.get(mid)
+        assert dq is not None and len(dq) > 0, (
+            f"DP-SGD ghost clipping: Embedding backward but no input_ids in "
+            f"_embedding_input_ids (module {mid}). Forward hook may have been "
+            f"skipped — embedding norm will be missing, breaking the DP guarantee."
+        )
 
         input_ids = dq.popleft()
         mb_id = self._get_current_microbatch(module)
