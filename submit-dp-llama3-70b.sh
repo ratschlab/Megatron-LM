@@ -124,7 +124,7 @@ DATA_ARGS="
     --mock-data
     --dataloader-type single
     --tokenizer-type NullTokenizer
-    --vocab-size 128256
+    --vocab-size 131072
 "
 # TODO: Replace with real data:
 # DATA_ARGS="
