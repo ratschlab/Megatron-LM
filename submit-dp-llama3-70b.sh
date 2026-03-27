@@ -25,7 +25,7 @@ echo "START TIME: $(date)"
 
 MBS=1                    # Micro batch size (per GPU)
 GBS=256                  # Global batch size (MBS * num_microbatches * DP)
-SEQ_LEN=4096             # Sequence length
+SEQ_LEN=16384            # Sequence length (with packing: ~2 patients/seq, <1% truncation)
 TRAINING_STEPS=50000     # Max steps (may stop earlier due to epsilon budget)
 
 # DP-SGD hyperparameters (from 8B sweep)
