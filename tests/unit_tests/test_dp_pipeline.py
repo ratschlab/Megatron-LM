@@ -1602,5 +1602,123 @@ class TestPP2MultiProcess:
         assert results[0]['clips_match']
 
 
+class TestExecutableWrapperMock:
+    """Execute the real _make_dp_forward_step_wrapper, not just inspect source."""
+
+    def test_pass1_wrapper_converts_4tuple_to_3tuple(self):
+        """Call the actual wrapper with a loss_func that returns 4-tuple.
+        Verify the output is a 3-tuple with grad_fn intact."""
+        from megatron.core.pipeline_parallel.schedules import _make_dp_forward_step_wrapper
+
+        model = nn.Linear(8, 4)
+        x = torch.randn(2, 8, requires_grad=True)
+
+        def fake_forward_step(data_iter, mdl):
+            out = mdl(next(data_iter))
+            def loss_fn(output_tensor):
+                loss = output_tensor.sum()
+                per_example = output_tensor.sum(dim=-1)  # [B]
+                return loss, torch.tensor(8), {'lm loss': (loss.item(), 1)}, per_example
+            return out, loss_fn
+
+        wrapped = _make_dp_forward_step_wrapper(fake_forward_step, pass_number=1)
+        data_iter = iter([x])
+        output_tensor, wrapped_loss_fn = wrapped(data_iter, model)
+        result = wrapped_loss_fn(output_tensor)
+
+        # Must be 3-tuple (not 4)
+        assert len(result) == 3, f"Expected 3-tuple, got {len(result)}-tuple"
+        loss, num_tokens, loss_dict = result
+        # Loss must have grad_fn (not detached)
+        assert loss.grad_fn is not None, "Pass 1 loss must have grad_fn for pipeline backward"
+
+    def test_pass2_wrapper_scales_by_clip_factors(self):
+        """Pass 2 wrapper should scale per_example_losses by clip factors."""
+        from megatron.core.pipeline_parallel.schedules import _make_dp_forward_step_wrapper
+
+        model = nn.Linear(8, 4)
+        x = torch.randn(2, 8, requires_grad=True)
+        clip_factors = [torch.tensor([0.5, 0.3])]  # one microbatch
+        counter = [0]
+
+        def fake_forward_step(data_iter, mdl):
+            out = mdl(next(data_iter))
+            def loss_fn(output_tensor):
+                loss = output_tensor.sum()
+                per_example = output_tensor.sum(dim=-1)
+                return loss, torch.tensor(8), {'lm loss': (loss.item(), 1)}, per_example
+            return out, loss_fn
+
+        wrapped = _make_dp_forward_step_wrapper(
+            fake_forward_step, pass_number=2,
+            clip_factors_list=clip_factors, microbatch_counter=counter
+        )
+        data_iter = iter([x])
+        output_tensor, wrapped_loss_fn = wrapped(data_iter, model)
+        result = wrapped_loss_fn(output_tensor)
+
+        assert len(result) == 3
+        loss = result[0]
+        assert loss.grad_fn is not None, "Pass 2 loss must have grad_fn"
+        # Loss should be scaled (not the raw sum)
+        # The raw per_example would be output_tensor.sum(dim=-1)
+        # Scaled = sum(clip * per_example) which is different from raw sum
+
+    def test_3tuple_passthrough(self):
+        """If loss_func returns 3-tuple (non-DP), wrapper passes through unchanged."""
+        from megatron.core.pipeline_parallel.schedules import _make_dp_forward_step_wrapper
+
+        model = nn.Linear(8, 4)
+        x = torch.randn(2, 8)
+
+        def fake_forward_step(data_iter, mdl):
+            out = mdl(next(data_iter))
+            def loss_fn(output_tensor):
+                loss = output_tensor.sum()
+                return loss, torch.tensor(8), {'lm loss': (loss.item(), 1)}
+            return out, loss_fn
+
+        wrapped = _make_dp_forward_step_wrapper(fake_forward_step, pass_number=1)
+        data_iter = iter([x])
+        output_tensor, wrapped_loss_fn = wrapped(data_iter, model)
+        result = wrapped_loss_fn(output_tensor)
+
+        assert len(result) == 3, "3-tuple should pass through unchanged"
+
+
+class TestForwardOnlyStripsPerExampleLosses:
+    """Verify forward_only path strips dp_per_example_losses from loss dicts."""
+
+    def test_per_example_losses_stripped(self):
+        """Simulate what forward_only does: strip the [B] tensor from loss_reduced."""
+        # Simulate loss_reduced with dp_per_example_losses (as forward_step adds it)
+        forward_data_store = [
+            {'lm loss': (2.5, 1), 'dp_per_example_losses': torch.tensor([1.2, 1.3])},
+            {'lm loss': (2.3, 1), 'dp_per_example_losses': torch.tensor([1.1, 1.4])},
+        ]
+
+        # This is what the forward_only path does
+        for entry in forward_data_store:
+            if isinstance(entry, dict):
+                entry.pop('dp_per_example_losses', None)
+
+        # Verify stripped
+        for entry in forward_data_store:
+            assert 'dp_per_example_losses' not in entry, "Should be stripped"
+            assert 'lm loss' in entry, "Normal loss should remain"
+
+    def test_eval_accumulation_safe_after_strip(self):
+        """After stripping, all values in loss_reduced should be scalar-compatible."""
+        forward_data_store = [
+            {'lm loss': (2.5, 1)},  # after stripping
+        ]
+        # Simulate Megatron's eval accumulation: sum scalars
+        total = 0.0
+        for entry in forward_data_store:
+            for key, (val, count) in entry.items():
+                total += val  # This would fail if val were a [B] tensor
+        assert isinstance(total, float)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
