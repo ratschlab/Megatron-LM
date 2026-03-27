@@ -1,15 +1,16 @@
 #!/bin/bash
 # DP-SGD training of Llama3-70B on Alps (CSCS).
-# Ghost clipping with TP=8, distributed optimizer, constant LR.
+# Ghost clipping with TP=4, PP=8, distributed optimizer, constant LR.
+# Alps GH200 nodes: 4 GPUs per node, 96 GB HBM3 each.
 
 #SBATCH --account=a-a06
 #SBATCH --time=23:59:59
 #SBATCH --job-name=dp-llama-70b
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=8
-#SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=8
+#SBATCH --nodes=32
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=460000
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml
@@ -84,11 +85,17 @@ DP_ARGS="
 "
 
 ################ Distributed ################
+# Alps GH200: 4 GPUs/node → TP=4 (intra-node). PP=8 required for 70B memory.
+# DP = 32*4 / (4*8) = 4. GBS = MBS * num_microbatches * DP = 1 * 64 * 4 = 256.
 DISTRIBUTED_ARGS="
-    --tensor-model-parallel-size 8
-    --pipeline-model-parallel-size 1
+    --tensor-model-parallel-size 4
+    --pipeline-model-parallel-size 8
+    --num-layers-per-virtual-pipeline-stage 5
     --use-distributed-optimizer
     --transformer-impl local
+    --recompute-granularity full
+    --recompute-method uniform
+    --recompute-num-layers 1
 "
 
 ################ Mixed Precision ################
