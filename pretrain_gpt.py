@@ -340,17 +340,22 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             num_microbatches=num_microbatches,
         )
 
-        # Auto-populate N if not set
+        # N for privacy accounting: can be larger than the dataloader size.
+        # E.g., 250K total patients in the hospital, but only 5K tokenized so far.
+        # Epsilon is computed with the POOL size, not the training set size.
         if args.dp_num_dataset_examples == 0:
             args.dp_num_dataset_examples = train_ds.N
             print_rank_0(f"  Auto-detected N={train_ds.N} from dataloader")
-        else:
-            assert train_ds.N == args.dp_num_dataset_examples, (
-                f"Dataloader has {train_ds.N} examples but "
-                f"--dp-num-dataset-examples={args.dp_num_dataset_examples}"
-            )
+        elif args.dp_num_dataset_examples > train_ds.N:
+            print_rank_0(f"  NOTE: N for epsilon accounting ({args.dp_num_dataset_examples}) > "
+                         f"dataloader size ({train_ds.N}). This is valid when the total "
+                         f"patient pool is larger than the tokenized training set.")
+        elif args.dp_num_dataset_examples < train_ds.N:
+            print_rank_0(f"  WARNING: N for accounting ({args.dp_num_dataset_examples}) < "
+                         f"dataloader size ({train_ds.N}). Epsilon may be overstated.")
 
-        print_rank_0(f"  {train_ds.N} privacy units, sampling={train_ds.sampling_method}")
+        print_rank_0(f"  {train_ds.N} training records, N={args.dp_num_dataset_examples} for accounting, "
+                     f"sampling={train_ds.sampling_method}")
         return train_ds, None, None
 
     config = core_gpt_dataset_config_from_args(args)
