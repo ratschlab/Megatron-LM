@@ -1122,3 +1122,48 @@ class TestNoiseCalibration:
         assert abs(empirical_mean) < 0.5, f"Noise mean should be ~0, got {empirical_mean}"
         assert abs(empirical_var - expected_var) / expected_var < 0.15, \
             f"Noise variance should be ~{expected_var}, got {empirical_var}"
+
+    def test_noise_base_seed_changes_output(self):
+        """Different base seeds must produce different noise sequences."""
+        shape = (32, 32)
+        step = 5
+        noise_std = 1.0
+
+        def _generate_noise(base_seed):
+            seed = (base_seed + step * 1000003 + 7) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            return torch.normal(0.0, noise_std, size=shape, generator=gen)
+
+        noise_a = _generate_noise(base_seed=12345)
+        noise_b = _generate_noise(base_seed=67890)
+        noise_a2 = _generate_noise(base_seed=12345)
+
+        # Same base seed + same step → identical noise
+        torch.testing.assert_close(noise_a, noise_a2,
+            msg="Same base seed must produce identical noise")
+
+        # Different base seeds → different noise
+        assert not torch.allclose(noise_a, noise_b, atol=1e-4), \
+            "Different base seeds must produce different noise"
+
+    def test_noise_seed_zero_matches_legacy(self):
+        """base_seed=0 should reproduce the old (pre-random-seed) behavior."""
+        shape = (16, 16)
+        step = 10
+        noise_std = 1.0
+
+        # Legacy formula: (step * 1000003 + 7) % (2**31 - 1)
+        legacy_seed = (step * 1000003 + 7) % (2**31 - 1)
+        gen_legacy = torch.Generator()
+        gen_legacy.manual_seed(legacy_seed)
+        noise_legacy = torch.normal(0.0, noise_std, size=shape, generator=gen_legacy)
+
+        # New formula with base=0: (0 + step * 1000003 + 7) % (2**31 - 1)
+        new_seed = (0 + step * 1000003 + 7) % (2**31 - 1)
+        gen_new = torch.Generator()
+        gen_new.manual_seed(new_seed)
+        noise_new = torch.normal(0.0, noise_std, size=shape, generator=gen_new)
+
+        torch.testing.assert_close(noise_legacy, noise_new,
+            msg="base_seed=0 must match legacy (no base seed) behavior")

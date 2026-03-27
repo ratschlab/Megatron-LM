@@ -268,7 +268,11 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     # Base seed: random (generated once at training start) or user-specified for
     # reproducibility.  Stored in args.dp_noise_seed and serialized in checkpoints.
     # Without this, seeds would be predictable from the step number alone.
-    base = getattr(args, 'dp_noise_seed', None) or 0
+    base = getattr(args, 'dp_noise_seed', None)
+    assert base is not None, (
+        "dp_noise_seed must be set before noise injection. "
+        "This is normally done in train() or restored from checkpoint."
+    )
 
     # Per-step seeds derived from base seed + step + rank.
     # arithmetic mixing (NOT Python hash() — non-deterministic across processes)
