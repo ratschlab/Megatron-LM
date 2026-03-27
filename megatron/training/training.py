@@ -1533,9 +1533,22 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
-    # DP-SGD: Initialize privacy accountant.
+    # DP-SGD: Initialize privacy accountant and noise seed.
     global _dp_accountant, _dp_current_epsilon, _dp_epsilon_at_resume
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
+        # Generate random base seed for DP noise if not specified or restored.
+        # This seed is serialized in checkpoints for resume correctness.
+        if args.dp_noise_seed is None:
+            args.dp_noise_seed = torch.randint(0, 2**31 - 1, (1,)).item()
+            # Broadcast from rank 0 to ensure all ranks use the same base seed.
+            seed_tensor = torch.tensor([args.dp_noise_seed], dtype=torch.long,
+                                       device='cuda' if torch.cuda.is_available() else 'cpu')
+            torch.distributed.broadcast(seed_tensor, src=0)
+            args.dp_noise_seed = seed_tensor.item()
+        if args.rank == 0:
+            print(f'DP-SGD: Noise base seed = {args.dp_noise_seed}'
+                  f'{" (user-specified)" if "--dp-noise-seed" in sys.argv else " (random)"}')
+
         # If epsilon was restored from a checkpoint, record it as the baseline.
         _dp_epsilon_at_resume = _dp_current_epsilon
         try:

@@ -265,15 +265,21 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     dp_rank = parallel_state.get_data_parallel_rank()
     use_dist_opt = getattr(args, 'use_distributed_optimizer', False)
 
-    # Deterministic seeds using arithmetic (NOT Python hash() — non-deterministic across processes)
+    # Base seed: random (generated once at training start) or user-specified for
+    # reproducibility.  Stored in args.dp_noise_seed and serialized in checkpoints.
+    # Without this, seeds would be predictable from the step number alone.
+    base = getattr(args, 'dp_noise_seed', None) or 0
+
+    # Per-step seeds derived from base seed + step + rank.
+    # arithmetic mixing (NOT Python hash() — non-deterministic across processes)
     if use_dist_opt:
         # Distributed optimizer: each DP rank generates independent noise
-        replicated_seed = (step * 1000003 + dp_rank * 1000011 + 7) % (2**31 - 1)
-        sharded_seed = (step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + 13) % (2**31 - 1)
+        replicated_seed = (base + step * 1000003 + dp_rank * 1000011 + 7) % (2**31 - 1)
+        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + 13) % (2**31 - 1)
     else:
         # Standard: all DP ranks get identical noise (no dp_rank in seed)
-        replicated_seed = (step * 1000003 + 7) % (2**31 - 1)
-        sharded_seed = (step * 1000003 + tp_rank * 1000007 + 13) % (2**31 - 1)
+        replicated_seed = (base + step * 1000003 + 7) % (2**31 - 1)
+        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + 13) % (2**31 - 1)
 
     device = next(model[0].parameters()).device
     gen_replicated = torch.Generator(device=device)

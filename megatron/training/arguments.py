@@ -2474,6 +2474,10 @@ def _add_dp_sgd_args(parser):
     group.add_argument('--dp-num-literature-examples', type=int, default=0,
                        help='Number of literature privacy units (documents). '
                        'For dual accountant. If 0, uses dp-num-dataset-examples.')
+    group.add_argument('--dp-noise-seed', type=int, default=None,
+                       help='Base seed for DP noise generators. If not set, a '
+                       'random seed is generated at training start and serialized '
+                       'in checkpoints. Set explicitly for reproducible runs.')
     group.add_argument('--dp-log-clip-stats', action='store_true', default=False,
                        help='Log per-step clip fraction, norm stats, and epsilon.')
     return parser

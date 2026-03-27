@@ -674,11 +674,13 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     if not args.no_save_rng:
         state_dict["rng_state"] = rng_state
 
-    # DP-SGD privacy accountant state.
+    # DP-SGD privacy accountant state and noise seed.
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
         from megatron.training.training import _dp_accountant, _dp_current_epsilon
         if _dp_accountant is not None:
             state_dict['dp_sgd_epsilon'] = _dp_current_epsilon
+        if getattr(args, 'dp_noise_seed', None) is not None:
+            state_dict['dp_sgd_noise_seed'] = args.dp_noise_seed
 
     return state_dict
 
@@ -1283,11 +1285,18 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
     tokens_so_far = state_dict.get('tokens_so_far', 0)
 
-    # Restore DP-SGD privacy accountant state.
+    # Restore DP-SGD privacy accountant state and noise seed.
     if 'dp_sgd_epsilon' in state_dict:
         import megatron.training.training as training_module
         training_module._dp_current_epsilon = state_dict['dp_sgd_epsilon']
         print_rank_0(f'DP-SGD: Restored epsilon = {state_dict["dp_sgd_epsilon"]:.4f} from checkpoint')
+    if 'dp_sgd_noise_seed' in state_dict:
+        # Restore the noise base seed so resumed training continues with the
+        # same seed (deterministic per-step noise derivation from base + step).
+        # A user-specified --dp-noise-seed on the command line takes precedence.
+        if getattr(args, 'dp_noise_seed', None) is None:
+            args.dp_noise_seed = state_dict['dp_sgd_noise_seed']
+            print_rank_0(f'DP-SGD: Restored noise seed = {args.dp_noise_seed} from checkpoint')
 
     # Check arguments.
     assert args.consumed_train_samples == 0
