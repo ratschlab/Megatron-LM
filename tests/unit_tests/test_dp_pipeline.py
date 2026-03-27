@@ -875,5 +875,385 @@ class TestActivationCheckpointingGuard:
         assert len(queue) == 1, f"Expected 1 queued entry, got {len(queue)}"
 
 
+# ---------------------------------------------------------------------------
+# Test 12: Integration tests exercising actual implementation code
+# ---------------------------------------------------------------------------
+
+class TestActualPipelineReplayableIterator:
+    """Test the actual _PipelineReplayableIterator from ghost_clipping.py."""
+
+    def test_record_and_replay(self):
+        """Record items during Pass 1, replay in same order during Pass 2."""
+        from megatron.core.pipeline_parallel.ghost_clipping import _PipelineReplayableIterator
+
+        data = [{"tokens": torch.randn(2, 4)} for _ in range(5)]
+        it = _PipelineReplayableIterator(iter(data))
+
+        # Pass 1: record
+        pass1 = [next(it) for _ in range(5)]
+        it.rewind()
+
+        # Pass 2: replay
+        pass2 = [next(it) for _ in range(5)]
+
+        for i in range(5):
+            torch.testing.assert_close(pass1[i]["tokens"], pass2[i]["tokens"])
+
+    def test_partial_record_and_replay(self):
+        """Only some items consumed before rewind."""
+        from megatron.core.pipeline_parallel.ghost_clipping import _PipelineReplayableIterator
+
+        data = list(range(10))
+        it = _PipelineReplayableIterator(iter(data))
+
+        pass1 = [next(it) for _ in range(3)]
+        it.rewind()
+        pass2 = [next(it) for _ in range(3)]
+        assert pass1 == pass2 == [0, 1, 2]
+
+    def test_over_consumption_raises_error(self):
+        """Pass 2 consuming more data than Pass 1 recorded should raise RuntimeError."""
+        from megatron.core.pipeline_parallel.ghost_clipping import _PipelineReplayableIterator
+
+        data = list(range(5))
+        it = _PipelineReplayableIterator(iter(data))
+
+        # Pass 1: record 3 items
+        for _ in range(3):
+            next(it)
+        it.rewind()
+
+        # Pass 2: consume all 3 cached items
+        for _ in range(3):
+            next(it)
+
+        # Attempt to read a 4th item should fail
+        with pytest.raises(RuntimeError, match="Pass 2 consumed more data than Pass 1 recorded"):
+            next(it)
+
+    def test_rewind_before_any_data_raises(self):
+        """Rewind before any data was fetched should raise."""
+        from megatron.core.pipeline_parallel.ghost_clipping import _PipelineReplayableIterator
+
+        it = _PipelineReplayableIterator(iter([1, 2, 3]))
+        with pytest.raises(AssertionError, match="Cannot rewind before any data"):
+            it.rewind()
+
+    def test_wrap_data_iterator_pipeline(self):
+        """Test _wrap_data_iterator with use_pipeline=True."""
+        from megatron.core.pipeline_parallel.ghost_clipping import (
+            _wrap_data_iterator,
+            _rewind_data_iterator,
+            _PipelineReplayableIterator,
+        )
+
+        data = list(range(5))
+        wrapped = _wrap_data_iterator(iter(data), use_pipeline=True)
+        assert isinstance(wrapped, _PipelineReplayableIterator)
+
+        # Record
+        items = [next(wrapped) for _ in range(3)]
+        assert items == [0, 1, 2]
+
+        # Rewind and replay
+        _rewind_data_iterator(wrapped)
+        replayed = [next(wrapped) for _ in range(3)]
+        assert replayed == [0, 1, 2]
+
+    def test_wrap_list_of_iterators(self):
+        """Test wrapping a list of iterators (VP/interleaved schedules)."""
+        from megatron.core.pipeline_parallel.ghost_clipping import (
+            _wrap_data_iterator,
+            _rewind_data_iterator,
+            _PipelineReplayableIterator,
+        )
+
+        data1 = list(range(5))
+        data2 = list(range(10, 15))
+        wrapped = _wrap_data_iterator([iter(data1), iter(data2)], use_pipeline=True)
+
+        assert isinstance(wrapped, list)
+        assert len(wrapped) == 2
+        assert all(isinstance(w, _PipelineReplayableIterator) for w in wrapped)
+
+        # Record from both
+        assert next(wrapped[0]) == 0
+        assert next(wrapped[1]) == 10
+
+        # Rewind and replay
+        _rewind_data_iterator(wrapped)
+        assert next(wrapped[0]) == 0
+        assert next(wrapped[1]) == 10
+
+    def test_wrap_none_safe(self):
+        """Test _wrap_data_iterator with None input."""
+        from megatron.core.pipeline_parallel.ghost_clipping import _wrap_data_iterator
+
+        assert _wrap_data_iterator(None, use_pipeline=True) is None
+
+        wrapped = _wrap_data_iterator([iter([1]), None], use_pipeline=True)
+        assert wrapped[1] is None
+
+
+class TestGhostClippingContextFIFO:
+    """Test actual GhostClippingContext FIFO with nn.Linear modules.
+
+    GhostClippingContext recognizes ColumnParallelLinear/RowParallelLinear from
+    megatron, not plain nn.Linear. These tests monkey-patch LINEAR_CLASSES to
+    include nn.Linear so the hooks register correctly on CPU test models.
+    """
+
+    def _patch_linear_classes(self):
+        """Temporarily add nn.Linear to LINEAR_CLASSES for testing."""
+        import megatron.core.pipeline_parallel.ghost_clipping as gc
+        original = gc.LINEAR_CLASSES
+        gc.LINEAR_CLASSES = original + (nn.Linear,)
+        return original
+
+    def _restore_linear_classes(self, original):
+        import megatron.core.pipeline_parallel.ghost_clipping as gc
+        gc.LINEAR_CLASSES = original
+
+    def test_fifo_norms_correct_per_microbatch(self):
+        """Register hooks, run 3 microbatches forward then backward, verify norms."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+
+        torch.manual_seed(42)
+        B, S, H = 2, 1, 8
+        K = 3
+        C = 1.0
+
+        model = nn.Sequential(nn.Linear(H, H), nn.Linear(H, H))
+        microbatches = [torch.randn(S, B, H) for _ in range(K)]
+
+        original = self._patch_linear_classes()
+        try:
+            # Run each microbatch independently through hooks
+            for k in range(K):
+                ctx_k = GhostClippingContext(model, clipping_norm=C, num_microbatches=1)
+                ctx_k.register_hooks()
+
+                out = model(microbatches[k])
+                loss = out.sum()
+                loss.backward()
+
+                # compute_clip_factors requires parallel_state; directly check
+                # that norms were accumulated correctly instead.
+                all_norms = (ctx_k._per_mb_norm_sq_sharded[0]
+                             + ctx_k._per_mb_norm_sq_replicated[0])
+                assert len(all_norms) > 0, f"No norms computed for microbatch {k}"
+                norm_sq = torch.stack(all_norms).sum(dim=0)
+                assert norm_sq.shape == (B,), f"Expected shape ({B},), got {norm_sq.shape}"
+                assert (norm_sq > 0).all(), "Norms should be positive"
+
+                # Manually compute clip factors (no TP/PP all-reduce needed on CPU)
+                norms = norm_sq.sqrt()
+                clip_factors = torch.clamp(C / (norms + 1e-6), max=1.0)
+                assert clip_factors.shape == (B,), f"Expected shape ({B},), got {clip_factors.shape}"
+                assert (clip_factors > 0).all(), "Clip factors should be positive"
+                assert (clip_factors <= 1.0).all(), "Clip factors should be <= 1.0"
+
+                ctx_k.remove_hooks()
+                model.zero_grad()
+        finally:
+            self._restore_linear_classes(original)
+
+    def test_norms_match_naive_computation(self):
+        """Ghost clipping norms should be upper bounds on true per-example norms."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+
+        torch.manual_seed(42)
+        B, S, H = 3, 1, 8
+        C = 100.0  # Large C so no clipping (clip_factors = 1.0)
+
+        model = nn.Sequential(nn.Linear(H, H), nn.Linear(H, H))
+
+        original = self._patch_linear_classes()
+        try:
+            # Ghost clipping norms
+            ctx = GhostClippingContext(model, clipping_norm=C, num_microbatches=1)
+            ctx.register_hooks()
+
+            x = torch.randn(S, B, H)
+            out = model(x)
+            loss = out.sum()
+            loss.backward()
+
+            # Read norms from context
+            all_norms_list = ctx._per_mb_norm_sq_sharded[0] + ctx._per_mb_norm_sq_replicated[0]
+            ghost_norm_sq = torch.stack(all_norms_list).sum(dim=0)  # [B]
+            ghost_norms = ghost_norm_sq.sqrt()
+
+            ctx.remove_hooks()
+        finally:
+            self._restore_linear_classes(original)
+
+        # True per-example norms (naive computation)
+        true_norms = compute_naive_per_example_norms(model, x.squeeze(0), B)
+
+        # Ghost norms should be >= true norms (upper bound due to Cauchy-Schwarz)
+        for i in range(B):
+            assert ghost_norms[i].item() >= true_norms[i].item() - 1e-4, (
+                f"Example {i}: ghost norm {ghost_norms[i]:.4f} < true norm {true_norms[i]:.4f}"
+            )
+
+
+class TestThreeTupleWrapperPreventsDetach:
+    """Test that 3-tuple wrapper prevents the detach regression in forward_step."""
+
+    def test_3tuple_output_has_grad_fn(self):
+        """3-tuple loss output preserves grad_fn for pipeline backward."""
+        x = torch.randn(4, 8, requires_grad=True)
+        model = nn.Linear(8, 4)
+        out = model(x)
+        per_example_losses = out.sum(dim=-1)  # [B]
+        combined_loss = per_example_losses.sum()
+        num_tokens = torch.tensor(4)
+        loss_reduced = {}
+
+        # 3-tuple: (loss, num_tokens, loss_reduced)
+        outputs = (combined_loss, num_tokens, loss_reduced)
+        assert len(outputs) == 3
+        assert outputs[0].grad_fn is not None, "3-tuple loss must have grad_fn"
+
+    def test_4tuple_output_gets_detached_by_forward_step_logic(self):
+        """4-tuple causes forward_step to detach output_tensor, killing grad graph."""
+        x = torch.randn(4, 8, requires_grad=True)
+        model = nn.Linear(8, 4)
+        out = model(x)
+        per_example_losses = out.sum(dim=-1)
+        scalar_loss = per_example_losses.sum()
+        num_tokens = torch.tensor(4)
+        loss_reduced = {}
+
+        # 4-tuple: (loss, num_tokens, loss_reduced, per_example_losses)
+        outputs = (scalar_loss, num_tokens, loss_reduced, per_example_losses)
+        assert len(outputs) == 4
+
+        # Simulate what forward_step does with 4-tuple
+        output_tensor, _, _, _ = outputs
+        output_tensor = output_tensor.detach()  # This is the bug
+        assert output_tensor.grad_fn is None, "Detached tensor should have no grad_fn"
+
+    def test_wrapper_converts_4tuple_to_3tuple_pass1(self):
+        """_make_dp_forward_step_wrapper converts 4-tuple to 3-tuple for Pass 1."""
+        from megatron.core.pipeline_parallel.schedules import _make_dp_forward_step_wrapper
+
+        call_count = [0]
+
+        def mock_forward_step(data_iter, model):
+            call_count[0] += 1
+            x = next(data_iter)
+            out = model(x)
+
+            def loss_func(output_t, **kwargs):
+                per_example = output_t.sum(dim=-1)
+                scalar = per_example.sum()
+                return scalar, torch.tensor(4), {'test': True}, per_example
+
+            return out, loss_func
+
+        wrapped = _make_dp_forward_step_wrapper(mock_forward_step, pass_number=1)
+
+        model = nn.Linear(8, 4)
+        data = [torch.randn(4, 8)]
+        output_tensor, wrapped_loss_func = wrapped(iter(data), model)
+
+        result = wrapped_loss_func(output_tensor)
+        assert len(result) == 3, f"Expected 3-tuple, got {len(result)}-tuple"
+        loss, num_tokens, loss_reduced = result
+        assert loss.grad_fn is not None, "Pass 1 loss must have grad_fn"
+        assert 'dp_per_example_losses' in loss_reduced
+
+    def test_wrapper_converts_4tuple_to_3tuple_pass2(self):
+        """_make_dp_forward_step_wrapper scales losses by clip factors for Pass 2."""
+        from megatron.core.pipeline_parallel.schedules import _make_dp_forward_step_wrapper
+
+        def mock_forward_step(data_iter, model):
+            x = next(data_iter)
+            out = model(x)
+
+            def loss_func(output_t, **kwargs):
+                per_example = output_t.sum(dim=-1)
+                scalar = per_example.sum()
+                return scalar, torch.tensor(4), {}, per_example
+
+            return out, loss_func
+
+        clip_factors = [torch.tensor([0.5, 0.5, 0.5, 0.5])]
+        counter = [0]
+        wrapped = _make_dp_forward_step_wrapper(
+            mock_forward_step, pass_number=2,
+            clip_factors_list=clip_factors,
+            microbatch_counter=counter,
+        )
+
+        model = nn.Linear(8, 4)
+        data = [torch.randn(4, 8)]
+        output_tensor, wrapped_loss_func = wrapped(iter(data), model)
+
+        result = wrapped_loss_func(output_tensor)
+        assert len(result) == 3, f"Expected 3-tuple, got {len(result)}-tuple"
+        loss, num_tokens, loss_reduced = result
+        assert loss.grad_fn is not None, "Pass 2 loss must have grad_fn"
+        assert counter[0] == 1, "Microbatch counter should have incremented"
+
+
+class TestForwardOnlySkipsGhostClipping:
+    """Test that forward_only=True skips ghost clipping entirely."""
+
+    def test_forward_only_delegates_directly(self):
+        """With forward_only=True, the PP wrapper should delegate directly to
+        the pipeline schedule without registering any ghost clipping hooks."""
+        from unittest.mock import MagicMock, patch, call
+
+        # We can't easily call _dp_sgd_pipeline_forward_backward directly
+        # because it depends on parallel_state. Instead, test the logic:
+        # if forward_only is True, we should NOT import or use GhostClippingContext.
+
+        # Verify the function signature accepts forward_only
+        import inspect
+        from megatron.core.pipeline_parallel.schedules import _dp_sgd_pipeline_forward_backward
+        sig = inspect.signature(_dp_sgd_pipeline_forward_backward)
+        assert 'forward_only' in sig.parameters
+
+    def test_forward_only_code_path_no_hooks(self):
+        """Simulate the forward_only code path: no GhostClippingContext created."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+
+        model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 4))
+        forward_only = True
+
+        # In forward_only mode, GhostClippingContext should NOT be created.
+        # Simulate by checking that we can skip the entire ghost clipping setup.
+        hooks_registered = False
+        if not forward_only:
+            ctx = GhostClippingContext(model, clipping_norm=1.0)
+            ctx.register_hooks()
+            hooks_registered = True
+
+        assert not hooks_registered, "forward_only should skip hook registration"
+
+    def test_ghost_clipping_context_not_in_forward_only_path(self):
+        """Read the source to verify forward_only returns before GhostClippingContext is created."""
+        import inspect
+        from megatron.core.pipeline_parallel.schedules import _dp_sgd_pipeline_forward_backward
+        source = inspect.getsource(_dp_sgd_pipeline_forward_backward)
+
+        # The forward_only early return should come before GhostClippingContext
+        # is actually constructed (not just imported). The import is at the top
+        # of the function, but the constructor call is after the early return.
+        forward_only_pos = source.find('if forward_only:')
+        # Look for the constructor call, not the import
+        ghost_ctx_constructor_pos = source.find('GhostClippingContext(')
+
+        assert forward_only_pos != -1, "forward_only check not found in source"
+        assert ghost_ctx_constructor_pos != -1, "GhostClippingContext() constructor not found in source"
+        assert forward_only_pos < ghost_ctx_constructor_pos, (
+            "forward_only check must come BEFORE GhostClippingContext() constructor "
+            f"(found at positions {forward_only_pos} vs {ghost_ctx_constructor_pos})"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

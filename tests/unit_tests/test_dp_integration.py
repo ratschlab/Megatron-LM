@@ -58,7 +58,7 @@ class TestArgumentValidation:
         # Simulate the validation logic from arguments.py
         if args.dp_sgd:
             assert args.dp_num_dataset_examples > 0
-            assert args.pipeline_model_parallel_size == 1
+            # PP>1 is allowed since Phase 3c
             assert args.tensor_model_parallel_size == 1
             assert args.context_parallel_size == 1
             assert not getattr(args, 'num_experts', None)
@@ -92,10 +92,11 @@ class TestArgumentValidation:
         with pytest.raises(AssertionError):
             assert args.dp_num_dataset_examples > 0
 
-    def test_dp_sgd_rejects_pp_gt_1(self):
+    def test_dp_sgd_allows_pp_gt_1(self):
+        """PP>1 is allowed since Phase 3c (ghost clipping supports pipeline parallelism)."""
         args = self._make_args(dp_sgd=True, pipeline_model_parallel_size=2)
-        with pytest.raises(AssertionError):
-            assert args.pipeline_model_parallel_size == 1
+        # No assertion should fire for PP>1
+        assert args.pipeline_model_parallel_size == 2
 
     def test_dp_sgd_rejects_tp_gt_1(self):
         args = self._make_args(dp_sgd=True, tensor_model_parallel_size=2)

@@ -115,41 +115,80 @@ class GhostClippingContext:
         # Track expected norm contributions for verification
         self._expected_norm_contributions: int = 0
 
-        # Cached reference to decoder module for reading current_microbatch
-        self._decoder_ref: Optional[nn.Module] = None
+        # Map from module id -> the model chunk that contains it.
+        # Used by backward hooks to find the correct decoder for reading
+        # current_microbatch (VP has multiple model chunks per rank).
+        self._module_to_chunk: Dict[int, nn.Module] = {}
 
-    def _get_current_microbatch(self) -> int:
+        # Cache decoder references per model chunk (populated lazily)
+        self._chunk_decoders: Dict[int, nn.Module] = {}
+
+    def _get_current_microbatch(self, module: Optional[nn.Module] = None) -> int:
         """Read the current microbatch index from decoder.current_microbatch.
 
         The pipeline schedule calls set_current_microbatch(model, k) before each
         backward, which sets decoder.current_microbatch = k. We read this to know
         which per-microbatch norm accumulator to write to.
 
+        For VP (multiple model chunks per rank), the correct decoder is found by
+        looking up which model chunk contains the module that triggered the hook.
+
         For PP=1 (no pipeline), returns 0 (single-microbatch path).
+
+        Args:
+            module: The module whose backward hook triggered this call. Used to
+                    find the correct model chunk in VP mode.
         """
         if self.num_microbatches <= 1:
             return 0
 
-        # Use cached decoder reference if available
-        if self._decoder_ref is not None:
-            mb = getattr(self._decoder_ref, 'current_microbatch', None)
-            if mb is not None:
-                return mb
-
-        # Walk model chunks to find decoder with current_microbatch set
         from megatron.core.utils import get_attr_wrapped_model
-        for chunk in self._model_chunks:
-            try:
-                decoder = get_attr_wrapped_model(chunk, "decoder")
+
+        # If module is provided, look up which model chunk it belongs to
+        # and read current_microbatch from THAT chunk's decoder.
+        if module is not None:
+            chunk = self._module_to_chunk.get(id(module))
+            if chunk is not None:
+                chunk_id = id(chunk)
+                if chunk_id not in self._chunk_decoders:
+                    try:
+                        decoder = get_attr_wrapped_model(chunk, "decoder")
+                        if decoder is not None:
+                            self._chunk_decoders[chunk_id] = decoder
+                    except (RuntimeError, AttributeError):
+                        pass
+                decoder = self._chunk_decoders.get(chunk_id)
                 if decoder is not None:
-                    self._decoder_ref = decoder
                     mb = getattr(decoder, 'current_microbatch', None)
                     if mb is not None:
                         return mb
-            except (RuntimeError, AttributeError):
-                continue
+
+        # Fallback: walk all model chunks to find any decoder with current_microbatch
+        for chunk in self._model_chunks:
+            chunk_id = id(chunk)
+            if chunk_id not in self._chunk_decoders:
+                try:
+                    decoder = get_attr_wrapped_model(chunk, "decoder")
+                    if decoder is not None:
+                        self._chunk_decoders[chunk_id] = decoder
+                except (RuntimeError, AttributeError):
+                    continue
+            decoder = self._chunk_decoders.get(chunk_id)
+            if decoder is not None:
+                mb = getattr(decoder, 'current_microbatch', None)
+                if mb is not None:
+                    return mb
 
         # Fallback: microbatch 0 (PP=1 or decoder not found)
+        if self.num_microbatches > 1:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "DP-SGD ghost clipping: num_microbatches=%d but no decoder with "
+                "current_microbatch found. Falling back to microbatch 0. "
+                "This may produce incorrect per-microbatch norms.",
+                self.num_microbatches,
+            )
         return 0
 
     def register_hooks(self):
@@ -189,6 +228,10 @@ class GhostClippingContext:
 
     def _register_hooks_on_module(self, module: nn.Module):
         """Register hooks on a single model chunk (called per VP stage)."""
+        # Map all submodules to this model chunk for VP decoder lookup
+        for _, mod in module.named_modules():
+            self._module_to_chunk[id(mod)] = module
+
         # Step 1: Hook linear and embedding modules
         for name, mod in module.named_modules():
             if isinstance(mod, LINEAR_CLASSES):
@@ -317,7 +360,8 @@ class GhostClippingContext:
         self._per_example_norm_sq_replicated = self._per_mb_norm_sq_replicated[0]
         self._hooked_params.clear()
         self._expected_norm_contributions = 0
-        self._decoder_ref = None
+        self._module_to_chunk.clear()
+        self._chunk_decoders.clear()
 
     # ---- Linear layer hooks ----
 
@@ -337,7 +381,8 @@ class GhostClippingContext:
             return
         x = args[0]  # [S, B, H_in]
         # Per-example norm²: sum over seq (dim 0) and hidden (dim 2)
-        self._input_norms_sq[id(module)].append((x.float() ** 2).sum(dim=(0, 2)))  # [B]
+        # .detach() prevents retaining autograd graphs from recompute forwards
+        self._input_norms_sq[id(module)].append((x.float() ** 2).sum(dim=(0, 2)).detach())  # [B]
 
     def _linear_backward_hook(self, module, grad_input, grad_output):
         """Compute per-example weight and bias gradient norm upper bounds."""
@@ -345,11 +390,17 @@ class GhostClippingContext:
         if go is None:
             return
         go_f = go.float()
-        mb_id = self._get_current_microbatch()
+        mb_id = self._get_current_microbatch(module)
 
         # Weight: ||∇W L_i||² ≤ ||go_i||² · ||x_i||²
         go_norm_sq = (go_f ** 2).sum(dim=(0, 2))  # [B]
-        dq = self._input_norms_sq.get(id(module))
+        mid = id(module)
+        dq = self._input_norms_sq.get(mid)
+        assert dq is not None and len(dq) > 0, (
+            f"DP-SGD ghost clipping: linear backward hook for {type(module).__name__} "
+            f"found empty input_norms_sq deque. Forward hook may not have fired "
+            f"or activation checkpointing guard dropped the entry."
+        )
         if dq is not None and len(dq) > 0:
             x_norm_sq = dq.popleft()
             weight_norm = go_norm_sq * x_norm_sq
@@ -398,7 +449,8 @@ class GhostClippingContext:
             x_hat = (x_float - mean) / torch.sqrt(var + eps)
 
         # Per-dim squared norms: Σ_t x̂_{i,t,j}² — shape [B, H]
-        self._ln_xhat_dim_sq[id(module)].append((x_hat ** 2).sum(dim=0))
+        # .detach() prevents retaining autograd graphs from recompute forwards
+        self._ln_xhat_dim_sq[id(module)].append((x_hat ** 2).sum(dim=0).detach())
 
     def _layernorm_backward_hook(self, module, grad_input, grad_output):
         """Compute per-example norms for beta (exact) and gamma (Cauchy-Schwarz)."""
@@ -406,7 +458,7 @@ class GhostClippingContext:
         if go is None:
             return
         go_f = go.float()
-        mb_id = self._get_current_microbatch()
+        mb_id = self._get_current_microbatch(module)
 
         # Beta: ||∇β L_i||² = ||Σ_t go_{i,t}||²  (replicated param)
         if hasattr(module, 'bias') and module.bias is not None:
@@ -433,7 +485,8 @@ class GhostClippingContext:
         """Save token ids for scatter-add in backward, keyed by module id."""
         if not torch.is_grad_enabled():
             return
-        self._embedding_input_ids[id(module)].append(args[0])  # [B, S]
+        # .detach() prevents retaining autograd graphs from recompute forwards
+        self._embedding_input_ids[id(module)].append(args[0].detach())  # [B, S]
         # Check for TP-sharded embedding (VocabParallelEmbedding has vocab_start_index)
         assert not getattr(module, 'reduce_scatter_embeddings', False), \
             "DP-SGD embedding hooks assume reduce_scatter_embeddings=False (SP disabled)"
@@ -448,7 +501,7 @@ class GhostClippingContext:
             return
 
         input_ids = dq.popleft()
-        mb_id = self._get_current_microbatch()
+        mb_id = self._get_current_microbatch(module)
 
         # Handle vocab-sharded embedding (VocabParallelEmbedding with TP > 1)
         vocab_start = getattr(module, 'vocab_start_index', 0)
@@ -557,9 +610,11 @@ class _PipelineReplayableIterator:
                 self._replay_idx += 1
                 return batch
             else:
-                # Exhausted replay cache — fall through to real iterator
-                # (shouldn't happen if schedule is deterministic)
-                self._replaying = False
+                raise RuntimeError(
+                    f"Pass 2 consumed more data than Pass 1 recorded "
+                    f"(replay_idx={self._replay_idx}, cache_size={len(self._cache)}). "
+                    f"The pipeline schedule must be deterministic across passes."
+                )
 
         batch = next(self._real)
         self._cache.append(batch)

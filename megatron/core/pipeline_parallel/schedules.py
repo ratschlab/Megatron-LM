@@ -619,6 +619,64 @@ def _dp_sgd_ghost_forward_backward(
     return forward_data_store
 
 
+def _make_dp_forward_step_wrapper(forward_step_func, pass_number, clip_factors_list=None,
+                                   microbatch_counter=None):
+    """Wrap forward_step_func to convert loss_func's 4-tuple return to 3-tuple.
+
+    The problem: when loss_func returns 4 elements (scalar_loss, num_tokens,
+    loss_reduced, per_example_losses), forward_step() unconditionally detaches
+    output_tensor, killing the autograd graph needed for pipeline backward.
+
+    The fix: intercept the loss_func return and convert to a 3-tuple, which
+    takes the len(outputs) == 3 path in forward_step() — no detach.
+
+    Args:
+        forward_step_func: The original user forward_step function.
+        pass_number: 1 for norm computation pass, 2 for clipped gradient pass.
+        clip_factors_list: List of per-microbatch clip factor tensors (Pass 2 only).
+        microbatch_counter: Mutable list [int] tracking current microbatch index (Pass 2 only).
+
+    Returns:
+        Wrapped forward_step function that returns 3-tuple from loss_func.
+    """
+    def wrapped_forward_step(data_iterator_inner, model_inner, *extra_args):
+        output_tensor, loss_func_orig = forward_step_func(
+            data_iterator_inner, model_inner, *extra_args
+        )
+
+        def wrapped_loss_func(output_t, **kwargs):
+            result = loss_func_orig(output_t, **kwargs)
+
+            if len(result) != 4:
+                # Not a DP-SGD loss_func — pass through unchanged
+                return result
+
+            scalar_loss, num_tokens, loss_reduced, per_example_losses = result
+
+            if pass_number == 1:
+                # Pass 1: return sum of per-example losses with grad_fn intact.
+                # Ghost clipping hooks capture norms from the backward flow.
+                combined_loss = per_example_losses.sum()
+                # Store per_example_losses in loss_reduced for downstream access
+                loss_reduced['dp_per_example_losses'] = per_example_losses
+                return combined_loss, num_tokens, loss_reduced
+            else:
+                # Pass 2: scale per-example losses by clip factors.
+                mb_idx = microbatch_counter[0]
+                if clip_factors_list is not None and mb_idx < len(clip_factors_list):
+                    cf = clip_factors_list[mb_idx].detach()
+                    combined_loss = (cf * per_example_losses).sum()
+                else:
+                    combined_loss = per_example_losses.sum()
+                microbatch_counter[0] += 1
+                loss_reduced['dp_per_example_losses'] = per_example_losses
+                return combined_loss, num_tokens, loss_reduced
+
+        return output_tensor, wrapped_loss_func
+
+    return wrapped_forward_step
+
+
 def _dp_sgd_pipeline_forward_backward(
     *,
     forward_step_func,
@@ -658,17 +716,31 @@ def _dp_sgd_pipeline_forward_backward(
     )
     from megatron.training import get_args
 
-    import os
-    _diagnostic = os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1'
-
-    args = get_args()
-
     # Determine which pipeline schedule to delegate to
-    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         pipeline_schedule_func = forward_backward_pipelining_with_interleaving
     else:
         pipeline_schedule_func = forward_backward_pipelining_without_interleaving
+
+    # Evaluation mode: no ghost clipping, just forward
+    if forward_only:
+        return pipeline_schedule_func(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            forward_only=True,
+            collect_non_loss_data=collect_non_loss_data,
+            first_val_step=first_val_step,
+        )
+
+    import os
+    _diagnostic = os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1'
+
+    args = get_args()
 
     # Normalize model to list for uniform handling
     if not isinstance(model, list):
@@ -719,9 +791,15 @@ def _dp_sgd_pipeline_forward_backward(
         config.grad_sync_func = None
         config.param_sync_func = None
 
+        # Wrap forward_step_func for Pass 1: convert 4-tuple to 3-tuple
+        # so forward_step() does NOT detach output_tensor (preserving autograd graph)
+        pass1_forward_step = _make_dp_forward_step_wrapper(
+            forward_step_func, pass_number=1
+        )
+
         # Run the full pipeline schedule for Pass 1 (forward_only=False to get backward)
         forward_data_store_p1 = pipeline_schedule_func(
-            forward_step_func=forward_step_func,
+            forward_step_func=pass1_forward_step,
             data_iterator=replay_data_iterator,
             model=model,
             num_microbatches=num_microbatches,
@@ -770,12 +848,6 @@ def _dp_sgd_pipeline_forward_backward(
         config.grad_sync_func = saved_grad_sync
         config.param_sync_func = saved_param_sync
 
-    # ===== BETWEEN PASSES: store clip factors for use in Pass 2 =====
-    # The forward_step reads clip factors from a context variable on the config.
-    # We store them so the loss_func wrapper can scale per-example losses.
-    config._dp_sgd_clip_factors = clip_factors_list
-    config._dp_sgd_pass2 = True
-
     # ===== PASS 2: Clipped gradient computation (writes to main_grad) =====
 
     # Restore RNG for identical dropout masks
@@ -787,38 +859,21 @@ def _dp_sgd_pipeline_forward_backward(
     # Rewind data iterator for replay
     _rewind_data_iterator(replay_data_iterator)
 
-    # Wrap forward_step_func to apply clip factors to per-example losses
+    # Wrap forward_step_func for Pass 2: convert 4-tuple to 3-tuple with
+    # clip-factor-scaled loss, keeping grad_fn intact for pipeline backward.
     _microbatch_counter = [0]
-
-    def _clipped_forward_step_func(data_iterator_inner, model_inner, *extra_args):
-        """Wrapper that scales per-example losses by clip factors in Pass 2."""
-        output_tensor, loss_func_orig = forward_step_func(data_iterator_inner, model_inner, *extra_args)
-
-        def clipped_loss_func(output_t, **kwargs):
-            result = loss_func_orig(output_t, **kwargs)
-
-            # Only modify if we have per-example losses (4-element return)
-            if len(result) == 4:
-                scalar_loss, num_tokens, loss_reduced, per_example_losses = result
-                mb_idx = _microbatch_counter[0]
-                if mb_idx < len(clip_factors_list):
-                    cf = clip_factors_list[mb_idx].detach()
-                    # Scale per-example losses by clip factors
-                    clipped_per_example = cf * per_example_losses
-                    # Recompute scalar loss as mean of clipped per-example losses
-                    scalar_loss = clipped_per_example.sum()
-                _microbatch_counter[0] += 1
-                return scalar_loss, num_tokens, loss_reduced, per_example_losses
-            return result
-
-        return output_tensor, clipped_loss_func
+    pass2_forward_step = _make_dp_forward_step_wrapper(
+        forward_step_func, pass_number=2,
+        clip_factors_list=clip_factors_list,
+        microbatch_counter=_microbatch_counter,
+    )
 
     # Run the full pipeline schedule for Pass 2
     # Suppress finalize_model_grads in the schedule — we call it manually after
     config.finalize_model_grads_func = None
     try:
         forward_data_store = pipeline_schedule_func(
-            forward_step_func=_clipped_forward_step_func,
+            forward_step_func=pass2_forward_step,
             data_iterator=replay_data_iterator,
             model=model,
             num_microbatches=num_microbatches,
@@ -831,11 +886,6 @@ def _dp_sgd_pipeline_forward_backward(
         )
     finally:
         config.finalize_model_grads_func = saved_finalize
-        # Clean up context variables
-        if hasattr(config, '_dp_sgd_clip_factors'):
-            del config._dp_sgd_clip_factors
-        if hasattr(config, '_dp_sgd_pass2'):
-            del config._dp_sgd_pass2
 
     # ===== AFTER BOTH PASSES: finalize =====
 
