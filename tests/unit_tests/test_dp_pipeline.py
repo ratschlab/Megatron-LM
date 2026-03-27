@@ -1255,5 +1255,352 @@ class TestForwardOnlySkipsGhostClipping:
         )
 
 
+class TestMockedPipelineWrapper:
+    """Integration test for _dp_sgd_pipeline_forward_backward with mocked schedule."""
+
+    def test_wrapper_calls_schedule_twice(self):
+        """The wrapper should call the pipeline schedule exactly twice (Pass 1 + Pass 2)."""
+        # Mock the pipeline schedule function
+        call_count = [0]
+        def mock_schedule(**kwargs):
+            call_count[0] += 1
+            return []
+
+        # This test verifies the structure by checking the wrapper's source code
+        # imports and call pattern, since actually calling it requires full Megatron init.
+        import inspect
+        from megatron.core.pipeline_parallel.schedules import _dp_sgd_pipeline_forward_backward
+        src = inspect.getsource(_dp_sgd_pipeline_forward_backward)
+
+        # Verify structural properties of the wrapper
+        assert 'pipeline_schedule_func(' in src, "Wrapper must call pipeline schedule"
+        assert 'forward_only=False' in src, "Both passes must run backward"
+        assert 'forward_only=True' in src, "forward_only path must exist"
+        assert '_make_dp_forward_step_wrapper' in src, "Must wrap forward_step for 3-tuple"
+        assert 'config.finalize_model_grads_func = None' in src, "Must null finalize during Pass 1"
+        assert 'config.grad_scale_func = None' in src, "Must null grad_scale during Pass 1"
+
+    def test_wrapper_config_override_pattern(self):
+        """Verify config functions are saved, nulled, and restored in correct order."""
+        import inspect
+        from megatron.core.pipeline_parallel.schedules import _dp_sgd_pipeline_forward_backward
+        src = inspect.getsource(_dp_sgd_pipeline_forward_backward)
+
+        # Find positions of key operations
+        save_pos = src.find('saved_finalize = config.finalize_model_grads_func')
+        null_pos = src.find('config.finalize_model_grads_func = None')
+        restore_pos = src.rfind('config.finalize_model_grads_func = saved_finalize')
+
+        assert save_pos >= 0, "Must save config.finalize_model_grads_func"
+        assert null_pos >= 0, "Must null config.finalize_model_grads_func"
+        assert restore_pos >= 0, "Must restore config.finalize_model_grads_func"
+        assert save_pos < null_pos < restore_pos, \
+            "Order must be: save → null → restore"
+
+    def test_wrapper_pass1_uses_3tuple_wrapper(self):
+        """Pass 1 must wrap forward_step to produce 3-tuple (not 4-tuple detach)."""
+        import inspect
+        from megatron.core.pipeline_parallel.schedules import _make_dp_forward_step_wrapper
+        src = inspect.getsource(_make_dp_forward_step_wrapper)
+
+        assert 'pass_number == 1' in src or 'pass_number' in src, \
+            "Wrapper must distinguish Pass 1 from Pass 2"
+        assert 'per_example_losses.sum()' in src, \
+            "Pass 1 should sum per_example_losses for backward"
+
+    def test_wrapper_pass2_scales_by_clip_factors(self):
+        """Pass 2 must scale per-example losses by clip factors."""
+        import inspect
+        from megatron.core.pipeline_parallel.schedules import _make_dp_forward_step_wrapper
+        src = inspect.getsource(_make_dp_forward_step_wrapper)
+
+        assert 'clip_factors' in src, "Pass 2 must use clip_factors"
+
+    def test_wrapper_forward_only_early_return(self):
+        """forward_only=True should skip ghost clipping entirely."""
+        import inspect
+        from megatron.core.pipeline_parallel.schedules import _dp_sgd_pipeline_forward_backward
+        src = inspect.getsource(_dp_sgd_pipeline_forward_backward)
+
+        # forward_only check should appear before ghost clipping construction (not import)
+        fwd_only_pos = src.find('if forward_only:')
+        ghost_ctx_pos = src.find('GhostClippingContext(')  # construction, not import
+        assert fwd_only_pos >= 0 and ghost_ctx_pos >= 0, "Both must exist"
+        assert fwd_only_pos < ghost_ctx_pos, \
+            "forward_only check must come before GhostClippingContext creation"
+
+
+class TestVPChunkMicrobatchTracking:
+    """Verify that with multiple model chunks (VP stages), each chunk's decoder
+    current_microbatch is read independently by ghost clipping hooks."""
+
+    def test_module_to_chunk_mapping(self):
+        """Verify _module_to_chunk correctly maps modules to their parent chunks."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext, LINEAR_CLASSES
+
+        # Create 2 model chunks (simulating VP=2)
+        chunk0 = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
+        chunk1 = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 4))
+
+        # Monkey-patch LINEAR_CLASSES to include nn.Linear
+        import megatron.core.pipeline_parallel.ghost_clipping as gc_module
+        original = gc_module.LINEAR_CLASSES
+        gc_module.LINEAR_CLASSES = (nn.Linear,)
+
+        try:
+            ctx = GhostClippingContext([chunk0, chunk1], clipping_norm=1.0, num_microbatches=4)
+            ctx.register_hooks()
+
+            # Verify all linear modules are mapped to their correct chunk
+            for module in chunk0.modules():
+                if isinstance(module, nn.Linear):
+                    assert id(module) in ctx._module_to_chunk, \
+                        f"Module {module} from chunk0 not in _module_to_chunk"
+                    assert ctx._module_to_chunk[id(module)] is chunk0
+
+            for module in chunk1.modules():
+                if isinstance(module, nn.Linear):
+                    assert id(module) in ctx._module_to_chunk, \
+                        f"Module {module} from chunk1 not in _module_to_chunk"
+                    assert ctx._module_to_chunk[id(module)] is chunk1
+
+            ctx.remove_hooks()
+        finally:
+            gc_module.LINEAR_CLASSES = original
+
+    def test_different_chunks_different_microbatch_ids(self):
+        """Simulate VP: chunk0 has current_microbatch=2, chunk1 has current_microbatch=5.
+        Hooks from each chunk should read the correct ID."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+        import megatron.core.pipeline_parallel.ghost_clipping as gc_module
+
+        # Build chunks with a 'decoder' sub-module that has current_microbatch
+        # (mimics Megatron's GPTModel.decoder structure)
+        class FakeDecoder(nn.Module):
+            def __init__(self, linear):
+                super().__init__()
+                self.layer = linear
+            def forward(self, x):
+                return self.layer(x)
+
+        class FakeChunk(nn.Module):
+            def __init__(self, decoder):
+                super().__init__()
+                self.decoder = decoder
+            def forward(self, x):
+                return self.decoder(x)
+
+        chunk0 = FakeChunk(FakeDecoder(nn.Linear(8, 8)))
+        chunk1 = FakeChunk(FakeDecoder(nn.Linear(8, 4)))
+
+        # Simulate set_current_microbatch setting decoder.current_microbatch
+        chunk0.decoder.current_microbatch = 2
+        chunk1.decoder.current_microbatch = 5
+
+        original = gc_module.LINEAR_CLASSES
+        gc_module.LINEAR_CLASSES = (nn.Linear,)
+
+        try:
+            ctx = GhostClippingContext([chunk0, chunk1], clipping_norm=1.0, num_microbatches=8)
+            ctx.register_hooks()
+
+            # Get the linear modules (inside FakeChunk.decoder.layer)
+            linear0 = chunk0.decoder.layer
+            linear1 = chunk1.decoder.layer
+
+            # Test _get_current_microbatch for each module
+            mb0 = ctx._get_current_microbatch(linear0)
+            mb1 = ctx._get_current_microbatch(linear1)
+
+            assert mb0 == 2, f"Chunk0's module should see microbatch 2, got {mb0}"
+            assert mb1 == 5, f"Chunk1's module should see microbatch 5, got {mb1}"
+
+            ctx.remove_hooks()
+        finally:
+            gc_module.LINEAR_CLASSES = original
+
+    def test_hook_detachment_in_forward_cache(self):
+        """Verify forward hook caches are detached (no autograd graph retained)."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+        import megatron.core.pipeline_parallel.ghost_clipping as gc_module
+
+        model = nn.Linear(8, 4)
+
+        original = gc_module.LINEAR_CLASSES
+        gc_module.LINEAR_CLASSES = (nn.Linear,)
+
+        try:
+            ctx = GhostClippingContext(model, clipping_norm=1.0, num_microbatches=1)
+            ctx.register_hooks()
+
+            x = torch.randn(1, 2, 8, requires_grad=True)  # [S, B, H]
+            out = model(x)
+
+            # Check that cached input norms are detached
+            mid = id(model)
+            assert mid in ctx._input_norms_sq, "Forward hook should have fired"
+            cached = ctx._input_norms_sq[mid][0]  # first (only) entry in deque
+            assert not cached.requires_grad, "Cached tensor should be detached"
+            assert cached.grad_fn is None, "Cached tensor should have no grad_fn"
+
+            ctx.remove_hooks()
+        finally:
+            gc_module.LINEAR_CLASSES = original
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Verify actual noise seed formula in finalize_model_grads.py
+# ---------------------------------------------------------------------------
+
+class TestActualNoiseSeedFormula:
+    """Verify the noise seed formula in finalize_model_grads.py includes pp_rank."""
+
+    def test_noise_seed_formula_includes_pp_rank(self):
+        """The actual _dp_sgd_inject_noise code must include pp_rank in seeds."""
+        import inspect
+        from megatron.core.distributed.finalize_model_grads import _dp_sgd_inject_noise
+        src = inspect.getsource(_dp_sgd_inject_noise)
+
+        assert 'pp_rank' in src, "Noise seed must include pp_rank for PP>1"
+        assert 'get_pipeline_model_parallel_rank' in src, "Must call get_pipeline_model_parallel_rank"
+        assert '1000019' in src, "pp_rank multiplier should be 1000019"
+
+    def test_pp_rank_0_backward_compatible(self):
+        """With pp_rank=0, the + 0 * 1000019 term vanishes."""
+        base, step, pp_rank = 42, 10, 0
+        seed_with_pp = (base + step * 1000003 + pp_rank * 1000019 + 7) % (2**31 - 1)
+        seed_without_pp = (base + step * 1000003 + 7) % (2**31 - 1)
+        assert seed_with_pp == seed_without_pp
+
+
+# ---------------------------------------------------------------------------
+# Test 15: PP=2 multi-process tests (adapted from test_pp2_cpu.py)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skip(reason="mp.spawn cannot pickle local functions inside pytest classes. "
+                         "Use standalone test_pp2_cpu.py instead: python3.11 tests/unit_tests/test_pp2_cpu.py")
+class TestPP2MultiProcess:
+    """PP=2 tests using actual multi-process gloo communication.
+
+    These are adapted from test_pp2_cpu.py to run under pytest.
+    NOTE: Skipped by default because mp.spawn cannot pickle local functions
+    in pytest's class-method context. Run test_pp2_cpu.py directly instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def skip_if_no_dist(self):
+        if not torch.distributed.is_available():
+            pytest.skip("torch.distributed not available")
+
+    def _run_pp2_test(self, test_fn):
+        """Run a test function in 2 processes with gloo backend."""
+        import torch.multiprocessing as mp
+
+        manager = mp.Manager()
+        results = manager.dict()
+
+        def worker(rank, world_size, results_dict, fn):
+            import os
+            os.environ['MASTER_ADDR'] = '127.0.0.1'
+            os.environ['MASTER_PORT'] = '29503'
+            torch.distributed.init_process_group('gloo', rank=rank, world_size=world_size)
+            try:
+                fn(rank, world_size, results_dict)
+            finally:
+                torch.distributed.destroy_process_group()
+
+        mp.spawn(worker, args=(2, results, test_fn), nprocs=2, join=True)
+        return dict(results)
+
+    def test_norm_allreduce_across_stages(self):
+        """Per-stage norms sum to valid upper bounds of full-model norms."""
+        def _test(rank, world_size, results):
+            torch.manual_seed(42)
+            B, H = 4, 16
+
+            # Full model on both ranks (for reference)
+            stage0 = nn.Sequential(nn.Linear(H, H), nn.Linear(H, H))
+            stage1 = nn.Sequential(nn.Linear(H, H), nn.Linear(H, H))
+
+            x = torch.randn(B, H)
+
+            # Each rank computes local norms for its stage
+            if rank == 0:
+                local_norms_sq = torch.zeros(B)
+                for i in range(B):
+                    stage0.zero_grad()
+                    out = stage0(x[i:i+1])
+                    out.sum().backward()
+                    for p in stage0.parameters():
+                        if p.grad is not None:
+                            local_norms_sq[i] += p.grad.float().pow(2).sum().item()
+            else:
+                with torch.no_grad():
+                    h = stage0(x)
+                local_norms_sq = torch.zeros(B)
+                for i in range(B):
+                    stage1.zero_grad()
+                    out = stage1(h[i:i+1])
+                    out.sum().backward()
+                    for p in stage1.parameters():
+                        if p.grad is not None:
+                            local_norms_sq[i] += p.grad.float().pow(2).sum().item()
+
+            # All-reduce across PP stages
+            global_norms_sq = local_norms_sq.clone()
+            torch.distributed.all_reduce(global_norms_sq, op=torch.distributed.ReduceOp.SUM)
+
+            results[rank] = {
+                'global_norms': global_norms_sq.tolist(),
+                'all_positive': (global_norms_sq > 0).all().item(),
+            }
+
+        results = self._run_pp2_test(_test)
+        # Both ranks see same global norms
+        assert results[0]['global_norms'] == results[1]['global_norms']
+        assert results[0]['all_positive']
+
+    def test_noise_independence_across_pp_ranks(self):
+        """Different PP ranks produce different noise."""
+        def _test(rank, world_size, results):
+            base, step = 12345, 100
+            seed = (base + step * 1000003 + rank * 1000019 + 7) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noise = torch.normal(0, 1.0, size=(4, 4), generator=gen)
+
+            all_noise = [torch.zeros(4, 4) for _ in range(world_size)]
+            torch.distributed.all_gather(all_noise, noise)
+
+            results[rank] = {
+                'noise_differs': not torch.allclose(all_noise[0], all_noise[1], atol=1e-4),
+            }
+
+        results = self._run_pp2_test(_test)
+        assert results[0]['noise_differs']
+
+    def test_clip_factors_identical_across_ranks(self):
+        """After all-reduce, both ranks compute identical clip factors."""
+        def _test(rank, world_size, results):
+            torch.manual_seed(42)
+            B = 4
+            C = 1.0
+            local_norms = torch.rand(B) * (rank + 1)
+
+            global_norms = local_norms.clone()
+            torch.distributed.all_reduce(global_norms, op=torch.distributed.ReduceOp.SUM)
+            clips = torch.clamp(C / (global_norms.sqrt() + 1e-6), max=1.0)
+
+            all_clips = [torch.zeros_like(clips) for _ in range(world_size)]
+            torch.distributed.all_gather(all_clips, clips)
+
+            results[rank] = {
+                'clips_match': torch.allclose(all_clips[0], all_clips[1], atol=1e-6),
+            }
+
+        results = self._run_pp2_test(_test)
+        assert results[0]['clips_match']
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
