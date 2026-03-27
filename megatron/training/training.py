@@ -51,6 +51,32 @@ from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
 _dp_accountant = None
 _dp_current_epsilon = 0.0
 _dp_epsilon_at_resume = 0.0  # epsilon restored from checkpoint (pre-resume expenditure)
+# Dual privacy analysis: track epsilon separately for clinical and literature data.
+# Same mechanism (noise + clipping), different N → different sampling rate → different epsilon.
+_dp_clinical_steps = 0
+_dp_literature_steps = 0
+_dp_epsilon_clinical = 0.0
+_dp_epsilon_literature = 0.0
+
+
+def _compute_epsilon_for_steps(num_steps, q, sigma, delta):
+    """Compute epsilon for a given number of steps with sampling rate q."""
+    from dp_accounting.rdp import rdp_privacy_accountant
+    from dp_accounting import dp_event as dp_evt
+    acc = rdp_privacy_accountant.RdpAccountant(
+        orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
+        neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
+    )
+    acc.compose(
+        dp_evt.SelfComposedDpEvent(
+            event=dp_evt.PoissonSampledDpEvent(
+                sampling_probability=q,
+                event=dp_evt.GaussianDpEvent(sigma),
+            ),
+            count=num_steps,
+        )
+    )
+    return acc.get_epsilon(delta)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1598,12 +1624,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
         # DP-SGD: Check epsilon budget BEFORE the step.
+        # With dual analysis, use max(eps_clinical, eps_literature) if both are tracked.
         if (_dp_accountant is not None
                 and args.dp_noise_multiplier > 0
                 and _dp_current_epsilon >= args.dp_epsilon_budget):
             if args.rank == 0:
-                print(f'DP-SGD: Epsilon budget exhausted (current={_dp_current_epsilon:.4f}, '
-                      f'budget={args.dp_epsilon_budget}). Stopping training.')
+                msg = f'DP-SGD: Epsilon budget exhausted (current={_dp_current_epsilon:.4f}'
+                if _dp_epsilon_clinical > 0:
+                    msg += f', clinical={_dp_epsilon_clinical:.4f}'
+                if _dp_epsilon_literature > 0:
+                    msg += f', literature={_dp_epsilon_literature:.4f}'
+                msg += f', budget={args.dp_epsilon_budget}). Stopping training.'
+                print(msg)
             should_exit = True
             break
 
@@ -1622,6 +1654,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # DP-SGD: Update privacy accountant after each step.
         # Skip when sigma=0 (no noise = infinite privacy cost, nothing to track).
         if _dp_accountant is not None and skipped_iter == 0 and args.dp_noise_multiplier > 0:
+            global _dp_clinical_steps, _dp_literature_steps
+            global _dp_epsilon_clinical, _dp_epsilon_literature
             from dp_accounting import dp_event as dp_evt
             global_batch_size = (mpu.get_data_parallel_world_size()
                                  * args.micro_batch_size
@@ -1635,9 +1669,30 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             )
             # Add pre-resume epsilon (from checkpoint) to post-resume epsilon (from accountant).
             _dp_current_epsilon = _dp_epsilon_at_resume + _dp_accountant.get_epsilon(args.dp_delta)
+
+            # Dual privacy analysis: compute epsilon separately for clinical and literature.
+            # Same noisy mechanism, different N → different q → different epsilon.
+            N_clinical = getattr(args, 'dp_num_clinical_examples', 0)
+            N_literature = getattr(args, 'dp_num_literature_examples', 0)
+            if N_clinical > 0:
+                _dp_clinical_steps += 1
+                q_clin = global_batch_size / N_clinical
+                _dp_epsilon_clinical = _compute_epsilon_for_steps(
+                    _dp_clinical_steps, q_clin, args.dp_noise_multiplier, args.dp_delta)
+            if N_literature > 0:
+                _dp_literature_steps += 1
+                q_lit = global_batch_size / N_literature
+                _dp_epsilon_literature = _compute_epsilon_for_steps(
+                    _dp_literature_steps, q_lit, args.dp_noise_multiplier, args.dp_delta)
+
             if args.rank == 0 and iteration % args.log_interval == 0:
-                print(f'DP-SGD: step={iteration}, epsilon={_dp_current_epsilon:.4f}, '
-                      f'delta={args.dp_delta}')
+                eps_str = f'DP-SGD: step={iteration}, epsilon={_dp_current_epsilon:.4f}'
+                if N_clinical > 0:
+                    eps_str += f', eps_clinical={_dp_epsilon_clinical:.4f}'
+                if N_literature > 0:
+                    eps_str += f', eps_literature={_dp_epsilon_literature:.4f}'
+                eps_str += f', delta={args.dp_delta}'
+                print(eps_str)
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,

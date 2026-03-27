@@ -676,9 +676,17 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
 
     # DP-SGD privacy accountant state and noise seed.
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
-        from megatron.training.training import _dp_accountant, _dp_current_epsilon
+        from megatron.training.training import (
+            _dp_accountant, _dp_current_epsilon,
+            _dp_clinical_steps, _dp_literature_steps,
+            _dp_epsilon_clinical, _dp_epsilon_literature,
+        )
         if _dp_accountant is not None:
             state_dict['dp_sgd_epsilon'] = _dp_current_epsilon
+            state_dict['dp_sgd_clinical_steps'] = _dp_clinical_steps
+            state_dict['dp_sgd_literature_steps'] = _dp_literature_steps
+            state_dict['dp_sgd_epsilon_clinical'] = _dp_epsilon_clinical
+            state_dict['dp_sgd_epsilon_literature'] = _dp_epsilon_literature
         if getattr(args, 'dp_noise_seed', None) is not None:
             state_dict['dp_sgd_noise_seed'] = args.dp_noise_seed
 
@@ -1290,6 +1298,16 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         import megatron.training.training as training_module
         training_module._dp_current_epsilon = state_dict['dp_sgd_epsilon']
         print_rank_0(f'DP-SGD: Restored epsilon = {state_dict["dp_sgd_epsilon"]:.4f} from checkpoint')
+        # Restore dual analysis state
+        if 'dp_sgd_clinical_steps' in state_dict:
+            training_module._dp_clinical_steps = state_dict['dp_sgd_clinical_steps']
+            training_module._dp_literature_steps = state_dict['dp_sgd_literature_steps']
+            training_module._dp_epsilon_clinical = state_dict['dp_sgd_epsilon_clinical']
+            training_module._dp_epsilon_literature = state_dict['dp_sgd_epsilon_literature']
+            print_rank_0(f'  clinical: ε={state_dict["dp_sgd_epsilon_clinical"]:.4f} '
+                         f'({state_dict["dp_sgd_clinical_steps"]} steps), '
+                         f'literature: ε={state_dict["dp_sgd_epsilon_literature"]:.4f} '
+                         f'({state_dict["dp_sgd_literature_steps"]} steps)')
     if 'dp_sgd_noise_seed' in state_dict:
         # Restore the noise base seed so resumed training continues with the
         # same seed (deterministic per-step noise derivation from base + step).
