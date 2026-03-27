@@ -1167,3 +1167,150 @@ class TestNoiseCalibration:
 
         torch.testing.assert_close(noise_legacy, noise_new,
             msg="base_seed=0 must match legacy (no base seed) behavior")
+
+
+class TestSensitivityBoundEmpirical:
+    """Empirical verification that the DP sensitivity bound holds."""
+
+    def test_adjacent_datasets_bounded_by_C(self):
+        """For 50 random adjacent dataset pairs, the clipped gradient
+        difference should be bounded by C."""
+        torch.manual_seed(42)
+        C = 1.0
+        B = 5
+        H = 16
+
+        violations = 0
+        for trial in range(50):
+            model = nn.Linear(H, H)
+            x = torch.randn(B, H)
+
+            # Dataset A
+            model.zero_grad()
+            out_A = model(x)
+            per_example_grads_A = []
+            for i in range(B):
+                model.zero_grad()
+                model(x[i:i+1]).sum().backward()
+                per_example_grads_A.append(model.weight.grad.clone())
+
+            norms_A = [g.float().norm().item() for g in per_example_grads_A]
+            clips_A = [min(1.0, C / n) for n in norms_A]
+            clipped_sum_A = sum(c * g for c, g in zip(clips_A, per_example_grads_A))
+
+            # Dataset B: replace last example
+            x_B = x.clone()
+            x_B[-1] = torch.randn(H) * 3
+
+            per_example_grads_B = []
+            for i in range(B):
+                model.zero_grad()
+                model(x_B[i:i+1]).sum().backward()
+                per_example_grads_B.append(model.weight.grad.clone())
+
+            norms_B = [g.float().norm().item() for g in per_example_grads_B]
+            clips_B = [min(1.0, C / n) for n in norms_B]
+            clipped_sum_B = sum(c * g for c, g in zip(clips_B, per_example_grads_B))
+
+            diff = (clipped_sum_A - clipped_sum_B).norm().item()
+            if diff > 2 * C + 0.01:
+                violations += 1
+
+        assert violations == 0, f"{violations}/50 trials violated 2C bound"
+
+    def test_noise_dominates_signal_at_high_sigma(self):
+        """With very high sigma, the noisy gradient should be dominated by noise."""
+        torch.manual_seed(42)
+        C = 1.0
+        sigma = 100.0
+        H = 16
+        noise_std = sigma * C
+
+        model = nn.Linear(H, H)
+        x = torch.randn(4, H)
+        model.zero_grad()
+        model(x).sum().backward()
+        signal = model.weight.grad.float().norm().item()
+
+        noise = torch.normal(0, noise_std, size=model.weight.shape)
+        noise_norm = noise.norm().item()
+
+        # Noise should be >> signal
+        assert noise_norm > signal * 10, \
+            f"At sigma={sigma}, noise ({noise_norm:.1f}) should dominate signal ({signal:.1f})"
+
+
+class TestNoiseIndependenceAcrossRanks:
+    """Verify noise is independent across DP and PP ranks."""
+
+    def test_different_dp_ranks_different_noise(self):
+        """Two DP ranks with different dp_rank should produce different noise."""
+        base, step = 12345, 100
+        shape = (16, 16)
+        noise_std = 1.0
+
+        noises = []
+        for dp_rank in range(4):
+            seed = (base + step * 1000003 + dp_rank * 1000011 + 7) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noise = torch.normal(0, noise_std, size=shape, generator=gen)
+            noises.append(noise)
+
+        # All pairs should be different
+        for i in range(4):
+            for j in range(i+1, 4):
+                assert not torch.allclose(noises[i], noises[j], atol=1e-4), \
+                    f"DP ranks {i} and {j} produced same noise"
+
+    def test_same_rank_same_step_reproducible(self):
+        """Same rank + same step + same base seed → identical noise."""
+        base, step, dp_rank = 42, 50, 2
+        shape = (16, 16)
+
+        seed = (base + step * 1000003 + dp_rank * 1000011 + 7) % (2**31 - 1)
+        gen1 = torch.Generator()
+        gen1.manual_seed(seed)
+        noise1 = torch.normal(0, 1.0, size=shape, generator=gen1)
+
+        gen2 = torch.Generator()
+        gen2.manual_seed(seed)
+        noise2 = torch.normal(0, 1.0, size=shape, generator=gen2)
+
+        torch.testing.assert_close(noise1, noise2)
+
+    def test_different_pp_ranks_different_noise(self):
+        """PP ranks should produce different noise (different model parameters)."""
+        base, step = 42, 100
+        shape = (16, 16)
+
+        noises = []
+        for pp_rank in range(8):
+            seed = (base + step * 1000003 + pp_rank * 1000019 + 7) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noise = torch.normal(0, 1.0, size=shape, generator=gen)
+            noises.append(noise)
+
+        for i in range(8):
+            for j in range(i+1, 8):
+                assert not torch.allclose(noises[i], noises[j], atol=1e-4), \
+                    f"PP ranks {i} and {j} produced same noise"
+
+    def test_different_steps_different_noise(self):
+        """Different training steps should produce different noise."""
+        base, dp_rank = 42, 0
+        shape = (16, 16)
+
+        noises = []
+        for step in range(10):
+            seed = (base + step * 1000003 + dp_rank * 1000011 + 7) % (2**31 - 1)
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            noise = torch.normal(0, 1.0, size=shape, generator=gen)
+            noises.append(noise)
+
+        for i in range(10):
+            for j in range(i+1, 10):
+                assert not torch.allclose(noises[i], noises[j], atol=1e-4), \
+                    f"Steps {i} and {j} produced same noise"

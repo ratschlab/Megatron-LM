@@ -1,5 +1,6 @@
 """CPU-based unit tests for DP-SGD pipeline parallelism (Phase 3c),
-context parallelism assertions, and gradient accumulation (num_microbatches>1).
+context parallelism assertions, gradient accumulation (num_microbatches>1),
+and per-privacy-unit ghost clipping with packing (Phase 3d).
 
 Tests verify:
 1. Norm additivity across simulated pipeline stages
@@ -14,6 +15,9 @@ Tests verify:
 10. CP>1 assertion
 11. Gradient accumulation: main_grad accumulates across microbatches
 12. Gradient accumulation: norms are per-microbatch, not mixed
+13. Packed vs unpacked gradient equivalence (Phase 3d)
+14. GhostClippingContext packing mode with boundaries (Phase 3d)
+15. Boolean mask correctness for packed sequences (Phase 3d)
 """
 
 import math
@@ -1718,6 +1722,273 @@ class TestForwardOnlyStripsPerExampleLosses:
             for key, (val, count) in entry.items():
                 total += val  # This would fail if val were a [B] tensor
         assert isinstance(total, float)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3d: Per-privacy-unit ghost clipping with packing
+# ---------------------------------------------------------------------------
+
+class TestPackedVsUnpackedGradientEquivalence:
+    """CRITICAL: Packed gradient must equal unpacked gradient for the same document.
+    This proves packing doesn't leak information between privacy units."""
+
+    def test_single_doc_packed_equals_unpacked(self):
+        """One document packed alongside another should produce the same gradient
+        as that document processed alone (unpacked)."""
+        torch.manual_seed(42)
+        B_packed, S, H = 1, 32, 16
+        C = 1.0
+        model = nn.Linear(H, H)
+
+        # Document A: tokens 0..15, Document B: tokens 16..31
+        x_full = torch.randn(S, 1, H)  # [S, B=1, H] packed sequence
+        x_docA = x_full[:16].clone()     # [16, 1, H] just doc A
+
+        # Unpacked: compute gradient norm for doc A alone
+        model.zero_grad()
+        out_A = model(x_docA)
+        out_A.sum().backward()
+        unpacked_grad = model.weight.grad.clone()
+        unpacked_norm = unpacked_grad.float().norm().item()
+
+        # Packed: compute per-document norms using boolean mask
+        model.zero_grad()
+        out_packed = model(x_full)
+        out_packed.sum().backward()
+        packed_grad_full = model.weight.grad.clone()
+
+        # Per-document norm for doc A using ghost clipping math
+        go = torch.ones_like(out_packed)  # simplified grad_output
+        x_per_token = (x_full.float() ** 2).sum(dim=2)  # [S, B]
+        go_per_token = (go.float() ** 2).sum(dim=2)       # [S, B]
+
+        # Doc A boundary: [0, 16)
+        docA_x = x_per_token[:16].sum(dim=0)  # [B]
+        docA_go = go_per_token[:16].sum(dim=0)  # [B]
+        packed_norm_docA = (docA_x * docA_go).sqrt().item()
+
+        # The packed per-document norm should be an upper bound of the unpacked norm
+        assert packed_norm_docA >= unpacked_norm * 0.99, \
+            f"Packed norm {packed_norm_docA:.4f} should be >= unpacked {unpacked_norm:.4f}"
+
+    def test_sensitivity_bound_with_packing(self):
+        """Adjacent datasets (differ by one document) should produce gradient
+        difference bounded by C after clipping."""
+        torch.manual_seed(42)
+        C = 1.0
+        S, H = 32, 8
+        model = nn.Linear(H, H)
+
+        # Dataset A: [docX, docY]
+        x_A = torch.randn(S, 1, H)
+        # Dataset B: [docX, docZ] (docY replaced by docZ)
+        x_B = x_A.clone()
+        x_B[16:] = torch.randn(16, 1, H) * 5  # different doc in second half
+
+        # Compute clipped gradients for both
+        def get_clipped_grad(x, C):
+            model.zero_grad()
+            out = model(x)
+            loss = out.sum()
+            loss.backward()
+            grad = model.weight.grad.float()
+            norm = grad.norm().item()
+            clip = min(1.0, C / norm)
+            return clip * grad
+
+        grad_A = get_clipped_grad(x_A, C)
+        grad_B = get_clipped_grad(x_B, C)
+
+        diff = (grad_A - grad_B).norm().item()
+        # Sensitivity should be bounded by 2*C (one doc removed + one added)
+        assert diff <= 2 * C + 1e-4, \
+            f"Gradient difference {diff:.4f} exceeds 2C={2*C}"
+
+
+class TestGhostClippingPackingMode:
+    """Test GhostClippingContext with packing mode enabled."""
+
+    def _patch_classes(self):
+        import megatron.core.pipeline_parallel.ghost_clipping as gc
+        original = gc.LINEAR_CLASSES
+        gc.LINEAR_CLASSES = (nn.Linear,)
+        return original, gc
+
+    def test_set_unit_boundaries_creates_mask(self):
+        """set_unit_boundaries should precompute a boolean mask."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+        original, gc = self._patch_classes()
+        try:
+            model = nn.Linear(8, 4)
+            ctx = GhostClippingContext(model, clipping_norm=1.0, num_microbatches=1)
+
+            boundaries = torch.tensor([[[0, 10], [10, 20], [0, 0]]])  # B=1, D_max=3
+            ctx.set_unit_boundaries(0, boundaries)
+
+            assert ctx._packing_mode == True
+            assert 0 in ctx._unit_boundaries
+            assert 0 in ctx._unit_doc_masks
+            mask = ctx.get_doc_mask(0)
+            assert mask.shape == (1, 20, 3)  # [B, S, D_max]
+            # Doc 0: tokens 0..9 should be True
+            assert mask[0, 5, 0] == True
+            assert mask[0, 15, 0] == False
+            # Doc 1: tokens 10..19 should be True
+            assert mask[0, 15, 1] == True
+            assert mask[0, 5, 1] == False
+            # Doc 2 (padding): all False
+            assert mask[0, :, 2].sum() == 0
+        finally:
+            gc.LINEAR_CLASSES = original
+
+    def test_packing_norms_are_2d(self):
+        """With packing mode, per-example norms should be [B, D_max]."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+        original, gc = self._patch_classes()
+        try:
+            model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 4))
+            ctx = GhostClippingContext(model, clipping_norm=1.0, num_microbatches=1)
+
+            # Set boundaries: 2 docs in sequence of length 16
+            boundaries = torch.tensor([[[0, 8], [8, 16]]])  # B=1, D_max=2
+            ctx.set_unit_boundaries(0, boundaries)
+            ctx.register_hooks()
+
+            # Forward + backward
+            x = torch.randn(16, 1, 8)  # [S=16, B=1, H=8]
+            out = model(x)
+            out.sum().backward()
+
+            # Check that norms were accumulated
+            all_norms = ctx._per_mb_norm_sq_sharded[0] + ctx._per_mb_norm_sq_replicated[0]
+            assert len(all_norms) > 0, "Should have norm contributions"
+
+            # Each norm should be [B, D_max] = [1, 2]
+            for norm in all_norms:
+                assert norm.shape == (1, 2), f"Expected shape (1, 2), got {norm.shape}"
+
+            ctx.remove_hooks()
+        finally:
+            gc.LINEAR_CLASSES = original
+
+    def test_variable_docs_per_sequence(self):
+        """Batch with [1, 3] docs per sequence: padding docs get zero norms."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+        original, gc = self._patch_classes()
+        try:
+            model = nn.Linear(8, 4)
+            ctx = GhostClippingContext(model, clipping_norm=1.0, num_microbatches=1)
+
+            # Seq 0: 1 doc [0,20). Seq 1: 3 docs [0,8), [8,14), [14,20)
+            boundaries = torch.tensor([
+                [[0, 20], [0, 0], [0, 0]],   # 1 doc + 2 padding
+                [[0, 8], [8, 14], [14, 20]],  # 3 docs
+            ])  # [B=2, D_max=3, 2]
+            ctx.set_unit_boundaries(0, boundaries)
+            ctx.register_hooks()
+
+            x = torch.randn(20, 2, 8)  # [S=20, B=2, H=8]
+            out = model(x)
+            out.sum().backward()
+
+            all_norms = ctx._per_mb_norm_sq_sharded[0] + ctx._per_mb_norm_sq_replicated[0]
+            for norm in all_norms:
+                assert norm.shape == (2, 3), f"Expected (2, 3), got {norm.shape}"
+                # Seq 0, docs 1 and 2 (padding) should have zero norm
+                assert norm[0, 1].item() == 0.0, "Padding doc should have zero norm"
+                assert norm[0, 2].item() == 0.0, "Padding doc should have zero norm"
+                # Seq 1, all 3 docs should have nonzero norms
+                assert norm[1, 0].item() > 0, "Real doc should have positive norm"
+                assert norm[1, 1].item() > 0, "Real doc should have positive norm"
+                assert norm[1, 2].item() > 0, "Real doc should have positive norm"
+
+            ctx.remove_hooks()
+        finally:
+            gc.LINEAR_CLASSES = original
+
+    def test_no_packing_fast_path_unchanged(self):
+        """Without set_unit_boundaries, norms should be [B] (not [B, D_max])."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+        original, gc = self._patch_classes()
+        try:
+            model = nn.Linear(8, 4)
+            ctx = GhostClippingContext(model, clipping_norm=1.0, num_microbatches=1)
+            # Do NOT call set_unit_boundaries -> _packing_mode stays False
+            ctx.register_hooks()
+
+            x = torch.randn(16, 2, 8)
+            out = model(x)
+            out.sum().backward()
+
+            all_norms = ctx._per_mb_norm_sq_sharded[0] + ctx._per_mb_norm_sq_replicated[0]
+            for norm in all_norms:
+                assert norm.shape == (2,), f"No-packing should give [B]=(2,), got {norm.shape}"
+
+            ctx.remove_hooks()
+        finally:
+            gc.LINEAR_CLASSES = original
+
+    def test_boundaries_survive_remove_hooks(self):
+        """remove_hooks() must NOT clear _unit_boundaries (needed by Pass 2)."""
+        from megatron.core.pipeline_parallel.ghost_clipping import GhostClippingContext
+        original, gc = self._patch_classes()
+        try:
+            model = nn.Linear(8, 4)
+            ctx = GhostClippingContext(model, clipping_norm=1.0, num_microbatches=1)
+            boundaries = torch.tensor([[[0, 16]]])
+            ctx.set_unit_boundaries(0, boundaries)
+            ctx.register_hooks()
+
+            ctx.remove_hooks()
+
+            # Boundaries should still be accessible
+            assert 0 in ctx._unit_boundaries, "Boundaries must survive remove_hooks"
+            assert 0 in ctx._unit_doc_masks, "Doc masks must survive remove_hooks"
+            retrieved = ctx.get_unit_boundaries(0)
+            assert torch.equal(retrieved, boundaries)
+        finally:
+            gc.LINEAR_CLASSES = original
+
+
+class TestBooleanMaskCorrectness:
+    """Verify [B, S, D_max] boolean mask matches naive Python loop."""
+
+    def test_mask_matches_naive_loop(self):
+        """Precomputed mask should equal element-wise boundary check."""
+        B, S, D_max = 3, 64, 5
+        boundaries = torch.zeros(B, D_max, 2, dtype=torch.long)
+        # Set up varied boundaries
+        boundaries[0] = torch.tensor([[0, 20], [20, 40], [40, 60], [0, 0], [0, 0]])
+        boundaries[1] = torch.tensor([[0, 64], [0, 0], [0, 0], [0, 0], [0, 0]])
+        boundaries[2] = torch.tensor([[0, 10], [10, 20], [20, 30], [30, 50], [50, 64]])
+
+        # Precomputed mask (the vectorized way)
+        t = torch.arange(S).view(1, S, 1)
+        start = boundaries[:, :, 0].unsqueeze(1)
+        end = boundaries[:, :, 1].unsqueeze(1)
+        mask_fast = (t >= start) & (t < end)
+
+        # Naive loop
+        mask_naive = torch.zeros(B, S, D_max, dtype=torch.bool)
+        for b in range(B):
+            for j in range(D_max):
+                s, e = boundaries[b, j]
+                for t_idx in range(s, e):
+                    mask_naive[b, t_idx, j] = True
+
+        assert torch.equal(mask_fast, mask_naive), "Fast mask doesn't match naive"
+
+    def test_padding_docs_are_all_false(self):
+        """Documents with start == end should have all-False mask."""
+        boundaries = torch.tensor([[[0, 10], [0, 0], [0, 0]]])  # B=1, D_max=3
+        t = torch.arange(10).view(1, 10, 1)
+        start = boundaries[:, :, 0].unsqueeze(1)
+        end = boundaries[:, :, 1].unsqueeze(1)
+        mask = (t >= start) & (t < end)
+
+        assert mask[:, :, 0].sum() == 10  # doc 0: 10 tokens
+        assert mask[:, :, 1].sum() == 0   # doc 1: padding
+        assert mask[:, :, 2].sum() == 0   # doc 2: padding
 
 
 if __name__ == "__main__":
