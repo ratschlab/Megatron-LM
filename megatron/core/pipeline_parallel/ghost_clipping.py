@@ -123,6 +123,75 @@ class GhostClippingContext:
         # Cache decoder references per model chunk (populated lazily)
         self._chunk_decoders: Dict[int, nn.Module] = {}
 
+        # Phase 3d: Per-privacy-unit packing mode.
+        # When enabled, hooks compute [B, D_max] norms (per-unit) instead of [B] (per-example).
+        self._packing_mode: bool = False
+        # Per-microbatch boundary storage: {microbatch_id: Tensor[B, D_max, 2]}
+        # Boundaries are (start, end) token indices for each privacy unit.
+        self._unit_boundaries: Dict[int, torch.Tensor] = {}
+        # Precomputed boolean masks: {microbatch_id: Tensor[B, S, D_max]}
+        # Avoids recomputing the mask in every backward hook (80+ modules).
+        self._unit_doc_masks: Dict[int, torch.Tensor] = {}
+
+    def set_unit_boundaries(self, microbatch_id: int, boundaries: torch.Tensor):
+        """Store per-privacy-unit boundaries for a microbatch and precompute boolean mask.
+
+        Called by the pipeline wrapper (schedules.py) before the pipeline schedule starts,
+        once per microbatch. The precomputed mask is used by all 80+ backward hooks.
+
+        Args:
+            microbatch_id: Microbatch index (0..K-1).
+            boundaries: Tensor of shape [B, D_max, 2] with (start, end) token indices
+                        for each privacy unit. Padding units have start == end.
+        """
+        self._unit_boundaries[microbatch_id] = boundaries.detach()
+        self._packing_mode = True
+
+        # Precompute boolean mask [B, S, D_max] once (not 80 times in backward hooks).
+        # t[b, s, j] = True iff token s belongs to privacy unit j in example b.
+        B, D_max, _ = boundaries.shape
+        start = boundaries[:, :, 0]  # [B, D_max]
+        end = boundaries[:, :, 1]    # [B, D_max]
+        # Infer S from the maximum end index (boundaries are token indices into [0, S))
+        S = int(end.max().item()) if end.max().item() > 0 else 1
+        t = torch.arange(S, device=boundaries.device).view(1, S, 1)  # [1, S, 1]
+        start_exp = start.unsqueeze(1)  # [B, 1, D_max]
+        end_exp = end.unsqueeze(1)      # [B, 1, D_max]
+        self._unit_doc_masks[microbatch_id] = ((t >= start_exp) & (t < end_exp))  # [B, S, D_max]
+
+    def get_unit_boundaries(self, microbatch_id: int) -> torch.Tensor:
+        """Read per-privacy-unit boundaries for a microbatch (no consumption).
+
+        All backward hooks for the same microbatch read the same boundaries.
+
+        Args:
+            microbatch_id: Microbatch index.
+
+        Returns:
+            Tensor of shape [B, D_max, 2].
+        """
+        assert microbatch_id in self._unit_boundaries, (
+            f"No boundaries stored for microbatch {microbatch_id}. "
+            f"set_unit_boundaries() must be called before the pipeline schedule."
+        )
+        return self._unit_boundaries[microbatch_id]
+
+    def get_doc_mask(self, microbatch_id: int) -> torch.Tensor:
+        """Get precomputed [B, S, D_max] boolean mask for a microbatch.
+
+        Args:
+            microbatch_id: Microbatch index.
+
+        Returns:
+            Tensor of shape [B, S, D_max] where entry [b, s, j] is True iff
+            token s belongs to privacy unit j in example b.
+        """
+        assert microbatch_id in self._unit_doc_masks, (
+            f"No doc mask stored for microbatch {microbatch_id}. "
+            f"set_unit_boundaries() must be called before the pipeline schedule."
+        )
+        return self._unit_doc_masks[microbatch_id]
+
     def _get_current_microbatch(self, module: Optional[nn.Module] = None) -> int:
         """Read the current microbatch index from decoder.current_microbatch.
 
@@ -268,17 +337,22 @@ class GhostClippingContext:
                         self._hooked_params.add(id(p))
 
     def compute_clip_factors(self, microbatch_id: int = 0) -> torch.Tensor:
-        """Aggregate per-example norms across all layers for a single microbatch.
+        """Aggregate per-example (or per-unit) norms across all layers for a single microbatch.
 
         For PP>1, includes an all-reduce across pipeline stages so that each
         stage gets the total per-example gradient norm (needed for correct
         clip factor computation).
 
+        In packing mode (Phase 3d), norms are [B, D_max] (per-privacy-unit).
+        The all-reduce works on any shape, so no special handling needed.
+        Returns [B, D_max] clip factors when packing, [B] otherwise.
+
         Args:
             microbatch_id: Which microbatch's norms to aggregate. Default 0 for PP=1.
 
         Returns:
-            Tensor of shape [B] with clip factors in (0, 1].
+            Tensor of shape [B] (no packing) or [B, D_max] (packing) with clip
+            factors in (0, 1].
         """
         sharded_list = self._per_mb_norm_sq_sharded[microbatch_id]
         replicated_list = self._per_mb_norm_sq_replicated[microbatch_id]
@@ -297,6 +371,7 @@ class GhostClippingContext:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         # Sum sharded norms (partial on each TP rank -> all-reduce gives total)
+        # In packing mode, each tensor is [B, D_max]; stack+sum preserves shape.
         if sharded_list:
             total_sharded = torch.stack(sharded_list).sum(dim=0)
         elif replicated_list:
@@ -315,7 +390,8 @@ class GhostClippingContext:
 
         total_sq = total_sharded + total_replicated
 
-        # TP all-reduce: sums partial sharded norms + deduped replicated norms
+        # TP all-reduce: sums partial sharded norms + deduped replicated norms.
+        # Works on any shape ([B] or [B, D_max]).
         if tp_world_size > 1:
             torch.distributed.all_reduce(
                 total_sq, group=parallel_state.get_tensor_model_parallel_group()
@@ -323,6 +399,7 @@ class GhostClippingContext:
 
         # PP all-reduce: each pipeline stage only sees its own layers' norms.
         # Sum across all PP stages to get the total per-example gradient norm.
+        # Works on any shape ([B] or [B, D_max]).
         pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
         if pp_world_size > 1:
             torch.distributed.all_reduce(
@@ -330,13 +407,15 @@ class GhostClippingContext:
             )
 
         norms = total_sq.sqrt()
+        # clip_factor = min(1, C / ||g||). Shape: [B] or [B, D_max].
         return torch.clamp(self.C / (norms + 1e-6), max=1.0)
 
     def compute_clip_factors_all_microbatches(self) -> List[torch.Tensor]:
         """Compute clip factors for all microbatches (PP>1 path).
 
         Returns:
-            List of num_microbatches tensors, each of shape [B].
+            List of num_microbatches tensors, each of shape [B] (no packing)
+            or [B, D_max] (packing mode).
         """
         return [
             self.compute_clip_factors(microbatch_id=k)
@@ -380,20 +459,32 @@ class GhostClippingContext:
         if not torch.is_grad_enabled():
             return
         x = args[0]  # [S, B, H_in]
-        # Per-example norm²: sum over seq (dim 0) and hidden (dim 2)
-        # .detach() prevents retaining autograd graphs from recompute forwards
-        self._input_norms_sq[id(module)].append((x.float() ** 2).sum(dim=(0, 2)).detach())  # [B]
+        if self._packing_mode:
+            # Phase 3d: Save per-token norms [S, B] for per-unit aggregation in backward.
+            # .detach() prevents retaining autograd graphs from recompute forwards.
+            self._input_norms_sq[id(module)].append(
+                (x.float() ** 2).sum(dim=2).detach()  # [S, B]
+            )
+        else:
+            # No-packing fast path: sum over seq (dim 0) and hidden (dim 2) -> [B]
+            # .detach() prevents retaining autograd graphs from recompute forwards
+            self._input_norms_sq[id(module)].append(
+                (x.float() ** 2).sum(dim=(0, 2)).detach()  # [B]
+            )
 
     def _linear_backward_hook(self, module, grad_input, grad_output):
-        """Compute per-example weight and bias gradient norm upper bounds."""
+        """Compute per-example weight and bias gradient norm upper bounds.
+
+        In packing mode (Phase 3d), computes per-privacy-unit norms [B, D_max]
+        using precomputed boolean doc_mask. In no-packing mode, computes
+        per-example norms [B] (Phase 3c behavior, unchanged).
+        """
         go = grad_output[0]  # [S, B, H_out]
         if go is None:
             return
         go_f = go.float()
         mb_id = self._get_current_microbatch(module)
 
-        # Weight: ||∇W L_i||² ≤ ||go_i||² · ||x_i||²
-        go_norm_sq = (go_f ** 2).sum(dim=(0, 2))  # [B]
         mid = id(module)
         dq = self._input_norms_sq.get(mid)
         assert dq is not None and len(dq) > 0, (
@@ -401,26 +492,85 @@ class GhostClippingContext:
             f"found empty input_norms_sq deque. Forward hook may not have fired "
             f"or activation checkpointing guard dropped the entry."
         )
-        if dq is not None and len(dq) > 0:
-            x_norm_sq = dq.popleft()
-            weight_norm = go_norm_sq * x_norm_sq
-            # Append to correct accumulator based on TP sharding
-            is_sharded = getattr(module.weight, 'tensor_model_parallel', False) \
-                         if hasattr(module, 'weight') else False
-            if is_sharded:
+        x_norm_sq = dq.popleft()
+
+        # Determine TP sharding for weight and bias
+        is_weight_sharded = getattr(module.weight, 'tensor_model_parallel', False) \
+                            if hasattr(module, 'weight') else False
+
+        if self._packing_mode:
+            # Phase 3d: Per-privacy-unit norms via masked sum with precomputed doc_mask.
+            # x_norm_sq is [S, B] (per-token), go_f is [S, B, H_out].
+            doc_mask = self.get_doc_mask(mb_id)  # [B, S, D_max]
+            doc_mask_f = doc_mask.float()
+
+            # Per-token grad_output norms: sum over hidden dim -> [S, B]
+            go_per_token = (go_f ** 2).sum(dim=2)  # [S, B]
+
+            # Reshape to [B, S, 1] for broadcasting with doc_mask [B, S, D_max]
+            go_flat = go_per_token.permute(1, 0).unsqueeze(2)  # [B, S, 1]
+            x_flat = x_norm_sq.permute(1, 0).unsqueeze(2)      # [B, S, 1]
+
+            # Per-unit aggregation: sum over S dimension
+            go_per_unit = (go_flat * doc_mask_f).sum(dim=1)  # [B, D_max]
+            x_per_unit = (x_flat * doc_mask_f).sum(dim=1)    # [B, D_max]
+
+            # Ghost clipping bound: ||nabla_W L_{i,j}||^2 <= go_per_unit * x_per_unit
+            weight_norm = go_per_unit * x_per_unit  # [B, D_max]
+
+            if is_weight_sharded:
                 self._per_mb_norm_sq_sharded[mb_id].append(weight_norm)
             else:
                 self._per_mb_norm_sq_replicated[mb_id].append(weight_norm)
 
-        # Bias: ||∇b L_i||² = ||Σ_t go_{i,t}||²
-        if hasattr(module, 'bias') and module.bias is not None:
-            bias_grad = go_f.sum(dim=0)  # [B, H_out]
-            bias_norm = (bias_grad ** 2).sum(dim=-1)
-            bias_sharded = getattr(module.bias, 'tensor_model_parallel', False)
-            if bias_sharded:
-                self._per_mb_norm_sq_sharded[mb_id].append(bias_norm)
+            # Bias: per-unit ||sum_t go_{i,t}||^2 via masked sum
+            if hasattr(module, 'bias') and module.bias is not None:
+                # go_f is [S, B, H_out]. Per-token sum over hidden: [S, B]
+                # But for bias we need the vector sum within each unit, then its norm.
+                # bias_grad_{i,j} = sum_{t in unit_j} go_{i,t} (vector in R^H)
+                # ||bias_grad_{i,j}||^2 = sum_h (sum_{t in unit_j} go_{i,t,h})^2
+                # Use Cauchy-Schwarz upper bound: n_tokens * sum_t ||go_t||^2
+                # OR compute exactly via mask. For correctness, compute the per-dim sum.
+                # go_f: [S, B, H] -> permute to [B, S, H]
+                go_bsh = go_f.permute(1, 0, 2)  # [B, S, H]
+                # Expand mask: [B, S, D_max, 1] * [B, S, 1, H] -> too large.
+                # Instead, loop over D_max (small, typically 16) for exact bias norms.
+                B_size, S_size, D_max = doc_mask.shape
+                H = go_bsh.shape[2]
+                bias_norms = torch.zeros(B_size, D_max, device=go.device, dtype=torch.float32)
+                for j in range(D_max):
+                    mask_j = doc_mask_f[:, :, j].unsqueeze(2)  # [B, S, 1]
+                    # Sum grad_output over masked tokens -> [B, H]
+                    bias_sum_j = (go_bsh * mask_j).sum(dim=1)  # [B, H]
+                    bias_norms[:, j] = (bias_sum_j ** 2).sum(dim=-1)  # [B]
+
+                bias_sharded = getattr(module.bias, 'tensor_model_parallel', False)
+                if bias_sharded:
+                    self._per_mb_norm_sq_sharded[mb_id].append(bias_norms)
+                else:
+                    self._per_mb_norm_sq_replicated[mb_id].append(bias_norms)
+        else:
+            # No-packing fast path (Phase 3c behavior, unchanged).
+            # x_norm_sq is [B], go_f is [S, B, H_out].
+
+            # Weight: ||nabla_W L_i||^2 <= ||go_i||^2 * ||x_i||^2
+            go_norm_sq = (go_f ** 2).sum(dim=(0, 2))  # [B]
+            weight_norm = go_norm_sq * x_norm_sq
+
+            if is_weight_sharded:
+                self._per_mb_norm_sq_sharded[mb_id].append(weight_norm)
             else:
-                self._per_mb_norm_sq_replicated[mb_id].append(bias_norm)
+                self._per_mb_norm_sq_replicated[mb_id].append(weight_norm)
+
+            # Bias: ||nabla_b L_i||^2 = ||sum_t go_{i,t}||^2
+            if hasattr(module, 'bias') and module.bias is not None:
+                bias_grad = go_f.sum(dim=0)  # [B, H_out]
+                bias_norm = (bias_grad ** 2).sum(dim=-1)
+                bias_sharded = getattr(module.bias, 'tensor_model_parallel', False)
+                if bias_sharded:
+                    self._per_mb_norm_sq_sharded[mb_id].append(bias_norm)
+                else:
+                    self._per_mb_norm_sq_replicated[mb_id].append(bias_norm)
 
     # ---- LayerNorm / RMSNorm hooks ----
 
@@ -430,7 +580,14 @@ class GhostClippingContext:
         self._hooks.extend([h1, h2])
 
     def _layernorm_forward_hook(self, module, args, output):
-        """Recompute normalized input and save per-dim squared norms [B, H]."""
+        """Recompute normalized input and save squared norms.
+
+        In packing mode: saves per-token x_hat norm^2 summed over H -> [S, B].
+        Uses the looser Cauchy-Schwarz bound (plan Section 6.3). Memory: same
+        as linear hooks, and actually LESS than the no-packing [B, H] path when H > S.
+
+        In no-packing mode: saves per-dim squared norms [B, H] (Phase 3c behavior).
+        """
         if not torch.is_grad_enabled():
             return
         x = args[0]  # [S, B, H]
@@ -439,46 +596,107 @@ class GhostClippingContext:
         has_bias = hasattr(module, 'bias') and module.bias is not None
 
         if not has_bias:
-            # RMSNorm: x̂ = x / rms(x)
+            # RMSNorm: x_hat = x / rms(x)
             rms = torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + eps)
             x_hat = x_float * rms
         else:
-            # LayerNorm: x̂ = (x - μ) / σ
+            # LayerNorm: x_hat = (x - mu) / sigma
             mean = x_float.mean(dim=-1, keepdim=True)
             var = x_float.var(dim=-1, keepdim=True, unbiased=False)
             x_hat = (x_float - mean) / torch.sqrt(var + eps)
 
-        # Per-dim squared norms: Σ_t x̂_{i,t,j}² — shape [B, H]
-        # .detach() prevents retaining autograd graphs from recompute forwards
-        self._ln_xhat_dim_sq[id(module)].append((x_hat ** 2).sum(dim=0).detach())
+        if self._packing_mode:
+            # Phase 3d: Save per-token x_hat norm^2 summed over H -> [S, B].
+            # .detach() prevents retaining autograd graphs from recompute forwards.
+            self._ln_xhat_dim_sq[id(module)].append(
+                (x_hat ** 2).sum(dim=-1).detach()  # [S, B]
+            )
+        else:
+            # No-packing: Per-dim squared norms: sum_t x_hat_{i,t,j}^2 -> [B, H]
+            # .detach() prevents retaining autograd graphs from recompute forwards
+            self._ln_xhat_dim_sq[id(module)].append(
+                (x_hat ** 2).sum(dim=0).detach()  # [B, H]
+            )
 
     def _layernorm_backward_hook(self, module, grad_input, grad_output):
-        """Compute per-example norms for beta (exact) and gamma (Cauchy-Schwarz)."""
+        """Compute per-example norms for beta (exact) and gamma (Cauchy-Schwarz).
+
+        In packing mode (Phase 3d), computes per-privacy-unit norms [B, D_max]
+        using a looser Cauchy-Schwarz bound with per-token [S, B] data.
+        In no-packing mode, computes per-example norms [B] (Phase 3c behavior).
+        """
         go = grad_output[0]  # [S, B, H]
         if go is None:
             return
         go_f = go.float()
         mb_id = self._get_current_microbatch(module)
 
-        # Beta: ||∇β L_i||² = ||Σ_t go_{i,t}||²  (replicated param)
-        if hasattr(module, 'bias') and module.bias is not None:
-            beta_grad = go_f.sum(dim=0)  # [B, H]
-            self._per_mb_norm_sq_replicated[mb_id].append((beta_grad ** 2).sum(dim=-1))
+        if self._packing_mode:
+            # Phase 3d: Per-unit norms using precomputed doc_mask.
+            doc_mask = self.get_doc_mask(mb_id)  # [B, S, D_max]
+            doc_mask_f = doc_mask.float()
 
-        # Gamma: Cauchy-Schwarz upper bound (replicated param)
-        if hasattr(module, 'weight') and module.weight is not None:
-            mid = id(module)
-            dq = self._ln_xhat_dim_sq.get(mid)
-            assert dq is not None and len(dq) > 0, (
-                f"DP-SGD ghost clipping: LayerNorm backward for gamma but no "
-                f"forward state in _ln_xhat_dim_sq (module {mid}). "
-                f"Forward hook may have been skipped — norm will be undercounted, "
-                f"breaking the DP guarantee."
-            )
-            xhat_dim_sq = dq.popleft()
-            go_sq_per_dim = (go_f ** 2).sum(dim=0)  # [B, H]
-            gamma_norm_sq = (go_sq_per_dim * xhat_dim_sq).sum(dim=-1)  # [B]
-            self._per_mb_norm_sq_replicated[mb_id].append(gamma_norm_sq)
+            # Beta: per-unit ||sum_{t in unit_j} go_{i,t}||^2  (replicated param)
+            if hasattr(module, 'bias') and module.bias is not None:
+                # go_f: [S, B, H] -> [B, S, H]
+                go_bsh = go_f.permute(1, 0, 2)
+                B_size, S_size, D_max = doc_mask.shape
+                beta_norms = torch.zeros(B_size, D_max, device=go.device, dtype=torch.float32)
+                for j in range(D_max):
+                    mask_j = doc_mask_f[:, :, j].unsqueeze(2)  # [B, S, 1]
+                    beta_sum_j = (go_bsh * mask_j).sum(dim=1)  # [B, H]
+                    beta_norms[:, j] = (beta_sum_j ** 2).sum(dim=-1)  # [B]
+                self._per_mb_norm_sq_replicated[mb_id].append(beta_norms)
+
+            # Gamma: Looser Cauchy-Schwarz with per-token data (plan Section 6.3).
+            # gamma_norm_{i,j}^2 <= (sum_{t in j} ||go_t||^2) * (sum_{t in j} ||x_hat_t||^2)
+            # where norms are summed over H (done in forward hook -> [S, B]).
+            if hasattr(module, 'weight') and module.weight is not None:
+                mid = id(module)
+                dq = self._ln_xhat_dim_sq.get(mid)
+                assert dq is not None and len(dq) > 0, (
+                    f"DP-SGD ghost clipping: LayerNorm backward for gamma but no "
+                    f"forward state in _ln_xhat_dim_sq (module {mid}). "
+                    f"Forward hook may have been skipped — norm will be undercounted, "
+                    f"breaking the DP guarantee."
+                )
+                xhat_sq = dq.popleft()  # [S, B] (per-token, summed over H)
+
+                # Per-token go norms summed over H: [S, B]
+                go_per_token = (go_f ** 2).sum(dim=2)  # [S, B]
+
+                # Reshape to [B, S, 1] for broadcasting with doc_mask [B, S, D_max]
+                go_flat = go_per_token.permute(1, 0).unsqueeze(2)    # [B, S, 1]
+                xhat_flat = xhat_sq.permute(1, 0).unsqueeze(2)      # [B, S, 1]
+
+                # Per-unit aggregation via masked sum
+                go_per_unit = (go_flat * doc_mask_f).sum(dim=1)      # [B, D_max]
+                xhat_per_unit = (xhat_flat * doc_mask_f).sum(dim=1)  # [B, D_max]
+
+                gamma_norm_sq = go_per_unit * xhat_per_unit  # [B, D_max]
+                self._per_mb_norm_sq_replicated[mb_id].append(gamma_norm_sq)
+        else:
+            # No-packing fast path (Phase 3c behavior, unchanged).
+
+            # Beta: ||nabla_beta L_i||^2 = ||sum_t go_{i,t}||^2  (replicated param)
+            if hasattr(module, 'bias') and module.bias is not None:
+                beta_grad = go_f.sum(dim=0)  # [B, H]
+                self._per_mb_norm_sq_replicated[mb_id].append((beta_grad ** 2).sum(dim=-1))
+
+            # Gamma: Cauchy-Schwarz upper bound (replicated param)
+            if hasattr(module, 'weight') and module.weight is not None:
+                mid = id(module)
+                dq = self._ln_xhat_dim_sq.get(mid)
+                assert dq is not None and len(dq) > 0, (
+                    f"DP-SGD ghost clipping: LayerNorm backward for gamma but no "
+                    f"forward state in _ln_xhat_dim_sq (module {mid}). "
+                    f"Forward hook may have been skipped — norm will be undercounted, "
+                    f"breaking the DP guarantee."
+                )
+                xhat_dim_sq = dq.popleft()
+                go_sq_per_dim = (go_f ** 2).sum(dim=0)  # [B, H]
+                gamma_norm_sq = (go_sq_per_dim * xhat_dim_sq).sum(dim=-1)  # [B]
+                self._per_mb_norm_sq_replicated[mb_id].append(gamma_norm_sq)
 
     # ---- Embedding hooks ----
 
@@ -498,7 +716,12 @@ class GhostClippingContext:
             "DP-SGD embedding hooks assume reduce_scatter_embeddings=False (SP disabled)"
 
     def _embedding_backward_hook(self, module, grad_input, grad_output):
-        """Exact per-example embedding gradient norm via scatter-add."""
+        """Exact per-example embedding gradient norm via scatter-add.
+
+        In packing mode (Phase 3d), computes per-privacy-unit norms [B, D_max]
+        using torch.unique compression per unit (plan Section 6.4).
+        In no-packing mode, computes per-example norms [B] (Phase 3c behavior).
+        """
         go = grad_output[0]  # shape varies — may be [B, S, H] or [S, B, H]
         if go is None:
             return
@@ -527,31 +750,76 @@ class GhostClippingContext:
 
         B, S, H = go.shape
         go_f = go.float()
-
-        per_example_norm_sq = torch.zeros(B, device=go.device, dtype=torch.float32)
-        for i in range(B):
-            # For TP-sharded embedding: mask out-of-shard tokens, remap to local indices
-            ids = input_ids[i]
-            is_vocab_sharded = hasattr(module, 'vocab_start_index')  # VocabParallelEmbedding
-            if is_vocab_sharded:
-                mask = (ids >= vocab_start) & (ids < vocab_end)
-                local_ids = (ids - vocab_start).clamp(0, V_local - 1)
-                go_masked = go_f[i] * mask.unsqueeze(-1).float()
-            else:
-                local_ids = ids.clamp(0, V_local - 1)
-                go_masked = go_f[i]
-
-            accumulated = torch.zeros(V_local, H, device=go.device, dtype=torch.float32)
-            accumulated.scatter_add_(0, local_ids.unsqueeze(-1).expand(-1, H), go_masked)
-            per_example_norm_sq[i] = (accumulated ** 2).sum()
+        is_vocab_sharded = hasattr(module, 'vocab_start_index')
 
         # Embedding weight is TP-sharded (VocabParallel) or replicated (nn.Embedding)
         is_sharded = getattr(module, 'tensor_model_parallel', False) or \
                      hasattr(module, 'vocab_start_index')
-        if is_sharded:
-            self._per_mb_norm_sq_sharded[mb_id].append(per_example_norm_sq)
+
+        if self._packing_mode:
+            # Phase 3d: Per-privacy-unit norms using torch.unique compression.
+            # Loop over B and D_max. Embedding is only 1-2 modules, so the loop
+            # is acceptable (plan Section 6.4).
+            boundaries = self.get_unit_boundaries(mb_id)  # [B, D_max, 2]
+            D_max = boundaries.shape[1]
+            per_unit_norm_sq = torch.zeros(B, D_max, device=go.device, dtype=torch.float32)
+
+            for i in range(B):
+                for j in range(D_max):
+                    start_idx = boundaries[i, j, 0].item()
+                    end_idx = boundaries[i, j, 1].item()
+                    if start_idx >= end_idx:
+                        continue  # padding unit — contributes zero
+
+                    doc_ids = input_ids[i, start_idx:end_idx]
+                    doc_go = go_f[i, start_idx:end_idx, :]  # [num_tokens, H]
+
+                    # Remap to local vocab indices
+                    if is_vocab_sharded:
+                        valid = (doc_ids >= vocab_start) & (doc_ids < vocab_end)
+                        local_ids = (doc_ids - vocab_start).clamp(0, V_local - 1)
+                        local_ids = local_ids[valid]
+                        local_go = doc_go[valid]
+                    else:
+                        local_ids = doc_ids.clamp(0, V_local - 1)
+                        local_go = doc_go
+
+                    if len(local_ids) == 0:
+                        continue
+
+                    # torch.unique compression: accumulate only for unique token IDs.
+                    # Memory: [U, H] where U = unique tokens in this unit (typically
+                    # ~100-500), not [V_local, H] (which is 525 MB). ~67x improvement.
+                    unique_ids, inverse = torch.unique(local_ids, return_inverse=True)
+                    acc = torch.zeros(len(unique_ids), H, device=go.device, dtype=torch.float32)
+                    acc.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, H), local_go)
+                    per_unit_norm_sq[i, j] = (acc ** 2).sum()
+
+            if is_sharded:
+                self._per_mb_norm_sq_sharded[mb_id].append(per_unit_norm_sq)
+            else:
+                self._per_mb_norm_sq_replicated[mb_id].append(per_unit_norm_sq)
         else:
-            self._per_mb_norm_sq_replicated[mb_id].append(per_example_norm_sq)
+            # No-packing fast path (Phase 3c behavior, unchanged).
+            per_example_norm_sq = torch.zeros(B, device=go.device, dtype=torch.float32)
+            for i in range(B):
+                ids = input_ids[i]
+                if is_vocab_sharded:
+                    mask = (ids >= vocab_start) & (ids < vocab_end)
+                    local_ids = (ids - vocab_start).clamp(0, V_local - 1)
+                    go_masked = go_f[i] * mask.unsqueeze(-1).float()
+                else:
+                    local_ids = ids.clamp(0, V_local - 1)
+                    go_masked = go_f[i]
+
+                accumulated = torch.zeros(V_local, H, device=go.device, dtype=torch.float32)
+                accumulated.scatter_add_(0, local_ids.unsqueeze(-1).expand(-1, H), go_masked)
+                per_example_norm_sq[i] = (accumulated ** 2).sum()
+
+            if is_sharded:
+                self._per_mb_norm_sq_sharded[mb_id].append(per_example_norm_sq)
+            else:
+                self._per_mb_norm_sq_replicated[mb_id].append(per_example_norm_sq)
 
 
 class _ReplayableIterator:

@@ -665,7 +665,17 @@ def _make_dp_forward_step_wrapper(forward_step_func, pass_number, clip_factors_l
                 mb_idx = microbatch_counter[0]
                 if clip_factors_list is not None and mb_idx < len(clip_factors_list):
                     cf = clip_factors_list[mb_idx].detach()
-                    combined_loss = (cf * per_example_losses).sum()
+                    if cf.ndim == 2:
+                        # Phase 3d packing mode: cf is [B, D_max], per_example_losses is [B].
+                        # Need per-unit losses. For now, use per-example losses as proxy
+                        # (each packed sequence = one training example, packing loss
+                        # decomposition happens when Phase 3d + 4b v2 are integrated).
+                        # When per-unit losses are available from loss_func, use:
+                        # combined_loss = (cf * per_unit_losses).sum()
+                        combined_loss = (cf.sum(dim=1) * per_example_losses).sum()
+                    else:
+                        # No packing: cf is [B], per_example_losses is [B]
+                        combined_loss = (cf * per_example_losses).sum()
                 else:
                     combined_loss = per_example_losses.sum()
                 microbatch_counter[0] += 1
@@ -763,6 +773,45 @@ def _dp_sgd_pipeline_forward_backward(
 
     # Create ghost clipping context covering all model chunks (VP stages)
     ghost_ctx = GhostClippingContext(model_list, C, num_microbatches=num_microbatches)
+
+    # Phase 3d: Pre-schedule boundary broadcast for packing mode.
+    # Boundaries must be broadcast BEFORE the pipeline schedule starts (sync point).
+    # Broadcasting inside forward_step would deadlock with staggered 1F1B.
+    _packing_mode = False
+    if parallel_state.is_pipeline_first_stage():
+        # First stage pre-reads boundaries from the data iterator
+        src_iter = replay_data_iterator[0] if isinstance(replay_data_iterator, list) \
+                   else replay_data_iterator
+        # Peek at first microbatch to check for unit_boundaries
+        try:
+            first_batch = next(src_iter)
+            if 'unit_boundaries' in first_batch:
+                _packing_mode = True
+                ghost_ctx.set_unit_boundaries(0, first_batch['unit_boundaries'])
+                # Pre-read remaining microbatches
+                for k in range(1, num_microbatches):
+                    batch = next(src_iter)
+                    ghost_ctx.set_unit_boundaries(k, batch['unit_boundaries'])
+            src_iter.rewind()
+        except (StopIteration, KeyError):
+            pass
+
+    # Broadcast packing mode flag + boundaries to all PP stages
+    if parallel_state.get_pipeline_model_parallel_world_size() > 1 and _packing_mode:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        for k in range(num_microbatches):
+            boundaries_k = ghost_ctx.get_unit_boundaries(k) if _packing_mode else None
+            if not parallel_state.is_pipeline_first_stage():
+                # Non-first stages allocate empty tensors for the broadcast
+                B = args.micro_batch_size
+                D_max = 16  # TODO: make configurable
+                boundaries_k = torch.zeros(B, D_max, 2, dtype=torch.long,
+                                           device=torch.cuda.current_device())
+            torch.distributed.broadcast(boundaries_k,
+                                        src=parallel_state.get_pipeline_model_parallel_first_rank(),
+                                        group=pp_group)
+            if not parallel_state.is_pipeline_first_stage():
+                ghost_ctx.set_unit_boundaries(k, boundaries_k)
 
     # Save RNG state before Pass 1 (restore before Pass 2 for identical dropout)
     rng_cpu = torch.random.get_rng_state()
