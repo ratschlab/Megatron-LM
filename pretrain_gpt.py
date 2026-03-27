@@ -312,8 +312,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """
     args = get_args()
 
-    # DP-SGD with external data: use privacy-unit-aware dataloader
-    if getattr(args, 'dp_sgd', False) and getattr(args, 'dp_data_path', None):
+    # External data: use privacy-unit-aware dataloader (works with or without --dp-sgd)
+    if getattr(args, 'dp_data_path', None):
         import sys, os
         from megatron.core import parallel_state
 
