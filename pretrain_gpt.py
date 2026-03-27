@@ -312,6 +312,47 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """
     args = get_args()
 
+    # DP-SGD with external data: use privacy-unit-aware dataloader
+    if getattr(args, 'dp_sgd', False) and getattr(args, 'dp_data_path', None):
+        import sys, os
+        from megatron.core import parallel_state
+
+        # Add dp-megatron-dev to path for dp_external_dataloader import
+        dp_dev_dir = os.path.join(os.path.dirname(__file__), '..', 'dp-megatron-dev')
+        if os.path.isdir(dp_dev_dir) and dp_dev_dir not in sys.path:
+            sys.path.insert(0, dp_dev_dir)
+        from dp_external_dataloader import DPExternalDataloader
+
+        dp_rank = parallel_state.get_data_parallel_rank()
+        dp_world_size = parallel_state.get_data_parallel_world_size()
+        num_microbatches = args.global_batch_size // (args.micro_batch_size * dp_world_size)
+
+        print_rank_0(f"> building DP external dataloader from {args.dp_data_path} ...")
+
+        train_ds = DPExternalDataloader(
+            data_path=args.dp_data_path,
+            micro_batch_size=args.micro_batch_size,
+            seq_length=args.seq_length,
+            sampling_method=getattr(args, 'dp_sampling_method', 'shuffle_wor'),
+            seed=args.seed,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            num_microbatches=num_microbatches,
+        )
+
+        # Auto-populate N if not set
+        if args.dp_num_dataset_examples == 0:
+            args.dp_num_dataset_examples = train_ds.N
+            print_rank_0(f"  Auto-detected N={train_ds.N} from dataloader")
+        else:
+            assert train_ds.N == args.dp_num_dataset_examples, (
+                f"Dataloader has {train_ds.N} examples but "
+                f"--dp-num-dataset-examples={args.dp_num_dataset_examples}"
+            )
+
+        print_rank_0(f"  {train_ds.N} privacy units, sampling={train_ds.sampling_method}")
+        return train_ds, None, None
+
     config = core_gpt_dataset_config_from_args(args)
 
     if args.mock_data:

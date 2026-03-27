@@ -2486,6 +2486,15 @@ def _add_dp_sgd_args(parser):
                        help='Base seed for DP noise generators. If not set, a '
                        'random seed is generated at training start and serialized '
                        'in checkpoints. Set explicitly for reproducible runs.')
+    group.add_argument('--dp-data-path', type=str, default=None,
+                       help='Path to JSONL or pre-tokenized data directory for '
+                       'DP training. When set, uses DPExternalDataloader '
+                       'instead of GPTDataset.')
+    group.add_argument('--dp-sampling-method', type=str, default='shuffle_wor',
+                       choices=['shuffle_wor', 'truncated_poisson'],
+                       help='Batch sampling method for DP accounting. '
+                       'shuffle_wor: fixed-batch WOR with REPLACE_ONE. '
+                       'truncated_poisson: Poisson inclusion with ADD_OR_REMOVE_ONE.')
     group.add_argument('--dp-log-clip-stats', action='store_true', default=False,
                        help='Log per-step clip fraction, norm stats, and epsilon.')
     return parser
