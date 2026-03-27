@@ -263,6 +263,7 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     step = getattr(args, 'curr_iteration', 0)
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     dp_rank = parallel_state.get_data_parallel_rank()
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
     use_dist_opt = getattr(args, 'use_distributed_optimizer', False)
 
     # Base seed: random (generated once at training start) or user-specified for
@@ -277,13 +278,16 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     # Per-step seeds derived from base seed + step + rank.
     # arithmetic mixing (NOT Python hash() — non-deterministic across processes)
     if use_dist_opt:
-        # Distributed optimizer: each DP rank generates independent noise
-        replicated_seed = (base + step * 1000003 + dp_rank * 1000011 + 7) % (2**31 - 1)
-        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + 13) % (2**31 - 1)
+        # Distributed optimizer: each DP rank generates independent noise.
+        # pp_rank ensures each pipeline stage gets independent noise (each stage
+        # holds different model layers with different parameters).
+        replicated_seed = (base + step * 1000003 + dp_rank * 1000011 + pp_rank * 1000019 + 7) % (2**31 - 1)
+        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + pp_rank * 1000019 + 13) % (2**31 - 1)
     else:
-        # Standard: all DP ranks get identical noise (no dp_rank in seed)
-        replicated_seed = (base + step * 1000003 + 7) % (2**31 - 1)
-        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + 13) % (2**31 - 1)
+        # Standard: all DP ranks get identical noise (no dp_rank in seed).
+        # pp_rank still needed for independent noise per pipeline stage.
+        replicated_seed = (base + step * 1000003 + pp_rank * 1000019 + 7) % (2**31 - 1)
+        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + pp_rank * 1000019 + 13) % (2**31 - 1)
 
     device = next(model[0].parameters()).device
     gen_replicated = torch.Generator(device=device)

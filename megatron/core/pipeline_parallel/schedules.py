@@ -103,6 +103,22 @@ def get_forward_backward_func():
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
+        # DP-SGD with PP>1: use the two-pass pipeline wrapper that handles
+        # ghost clipping across all pipeline stages and microbatches.
+        # This delegates to the appropriate pipeline schedule internally.
+        try:
+            from megatron.core.utils import get_model_config as _get_config
+            # Check if dp_sgd is enabled — need to peek at config.
+            # If we can't determine (no model available here), fall through
+            # to standard schedules (the no-pipelining path handles dp_sgd
+            # via _dp_sgd_ghost_forward_backward).
+            from megatron.training import get_args as _get_args
+            _args = _get_args()
+            if getattr(_args, 'dp_sgd', False):
+                return _dp_sgd_pipeline_forward_backward
+        except (ImportError, RuntimeError):
+            pass
+
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
@@ -594,6 +610,244 @@ def _dp_sgd_ghost_forward_backward(
         )
         n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
         config.finalize_model_grads_func([model], n_batch)
+
+    # Remove per-example losses from logging dict
+    for entry in forward_data_store:
+        if isinstance(entry, dict):
+            entry.pop('dp_per_example_losses', None)
+
+    return forward_data_store
+
+
+def _dp_sgd_pipeline_forward_backward(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
+):
+    """DP-SGD with ghost clipping for pipeline parallelism (PP>1).
+
+    Two-pass ghost clipping applied to the entire pipeline schedule:
+    - Pass 1: Run the full pipeline schedule (all microbatches) with ghost
+              clipping hooks active and main_grad isolated. Computes per-example
+              gradient norms for all microbatches across all pipeline stages.
+    - Between passes: PP all-reduce norms, compute clip factors per microbatch.
+    - Pass 2: Run the full pipeline schedule again with per-example loss scaling
+              by clip factors. Clipped gradients flow into main_grad.
+
+    The data iterator is wrapped with _PipelineReplayableIterator so that
+    Pass 2 replays the exact same microbatches as Pass 1.
+
+    RNG state is saved before Pass 1 and restored before Pass 2 to ensure
+    identical dropout masks (required for correct clipped gradients).
+
+    Noise injection happens in finalize_model_grads (called once after Pass 2).
+    """
+    from megatron.core.pipeline_parallel.ghost_clipping import (
+        GhostClippingContext,
+        _PipelineReplayableIterator,
+        _wrap_data_iterator,
+        _rewind_data_iterator,
+    )
+    from megatron.training import get_args
+
+    import os
+    _diagnostic = os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1'
+
+    args = get_args()
+
+    # Determine which pipeline schedule to delegate to
+    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        pipeline_schedule_func = forward_backward_pipelining_with_interleaving
+    else:
+        pipeline_schedule_func = forward_backward_pipelining_without_interleaving
+
+    # Normalize model to list for uniform handling
+    if not isinstance(model, list):
+        model_list = [model]
+    else:
+        model_list = model
+
+    config = get_model_config(model_list[0])
+    C = config.dp_clipping_norm
+
+    # Wrap data iterator for two-pass replay (caches all microbatches)
+    replay_data_iterator = _wrap_data_iterator(data_iterator, use_pipeline=True)
+
+    # Create ghost clipping context covering all model chunks (VP stages)
+    ghost_ctx = GhostClippingContext(model_list, C, num_microbatches=num_microbatches)
+
+    # Save RNG state before Pass 1 (restore before Pass 2 for identical dropout)
+    rng_cpu = torch.random.get_rng_state()
+    rng_cuda = torch.cuda.get_rng_state()
+    try:
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+        tp_rng = {k: v.clone() for k, v in get_cuda_rng_tracker().get_states().items()}
+        _has_tp_rng = True
+    except (ImportError, AttributeError):
+        tp_rng = None
+        _has_tp_rng = False
+
+    # Save config functions that must be suppressed during Pass 1.
+    # Pass 1 must not finalize grads, scale grads, sync grads, or sync params.
+    saved_finalize = config.finalize_model_grads_func
+    saved_grad_scale = config.grad_scale_func
+    saved_grad_sync = config.grad_sync_func
+    saved_param_sync = config.param_sync_func
+
+    # ===== PASS 1: Norm computation (no main_grad writes) =====
+    try:
+        # Isolate main_grad: DDP hook will skip main_grad.add_()
+        for model_chunk in model_list:
+            for p in model_chunk.parameters():
+                if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                    p.grad_added_to_main_grad = True
+
+        ghost_ctx.register_hooks()
+
+        # Suppress finalize/scale/sync during Pass 1 — we only want norms
+        config.finalize_model_grads_func = None
+        config.grad_scale_func = None
+        config.grad_sync_func = None
+        config.param_sync_func = None
+
+        # Run the full pipeline schedule for Pass 1 (forward_only=False to get backward)
+        forward_data_store_p1 = pipeline_schedule_func(
+            forward_step_func=forward_step_func,
+            data_iterator=replay_data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            forward_only=False,
+            collect_non_loss_data=collect_non_loss_data,
+            first_val_step=first_val_step,
+        )
+
+        # Compute clip factors for all microbatches (includes PP all-reduce)
+        clip_factors_list = ghost_ctx.compute_clip_factors_all_microbatches()
+
+        # Sanitize clip factors
+        for k in range(len(clip_factors_list)):
+            clip_factors_list[k] = torch.nan_to_num(
+                clip_factors_list[k], nan=0.0, posinf=0.0, neginf=0.0
+            )
+
+        # Diagnostic: check main_grad isolation
+        if _diagnostic:
+            main_grad_norm = sum(
+                p.main_grad.float().norm().item() ** 2
+                for mc in model_list
+                for p in mc.parameters()
+                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
+            ) ** 0.5
+            status = "OK" if main_grad_norm < 1e-10 else "FAIL"
+            print(f'DIAGNOSTIC {status}: PP Pass 1 isolation verified '
+                  f'(main_grad norm = {main_grad_norm:.2e})')
+
+    finally:
+        # Cleanup Pass 1: reset isolation flag, remove hooks, clear .grad
+        ghost_ctx.remove_hooks()
+        for model_chunk in model_list:
+            for p in model_chunk.parameters():
+                if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                    p.grad_added_to_main_grad = False
+                if p.grad is not None:
+                    p.grad = None
+
+        # Restore config functions for Pass 2
+        config.finalize_model_grads_func = saved_finalize
+        config.grad_scale_func = saved_grad_scale
+        config.grad_sync_func = saved_grad_sync
+        config.param_sync_func = saved_param_sync
+
+    # ===== BETWEEN PASSES: store clip factors for use in Pass 2 =====
+    # The forward_step reads clip factors from a context variable on the config.
+    # We store them so the loss_func wrapper can scale per-example losses.
+    config._dp_sgd_clip_factors = clip_factors_list
+    config._dp_sgd_pass2 = True
+
+    # ===== PASS 2: Clipped gradient computation (writes to main_grad) =====
+
+    # Restore RNG for identical dropout masks
+    torch.random.set_rng_state(rng_cpu)
+    torch.cuda.set_rng_state(rng_cuda)
+    if tp_rng is not None:
+        get_cuda_rng_tracker().set_states(tp_rng)
+
+    # Rewind data iterator for replay
+    _rewind_data_iterator(replay_data_iterator)
+
+    # Wrap forward_step_func to apply clip factors to per-example losses
+    _microbatch_counter = [0]
+
+    def _clipped_forward_step_func(data_iterator_inner, model_inner, *extra_args):
+        """Wrapper that scales per-example losses by clip factors in Pass 2."""
+        output_tensor, loss_func_orig = forward_step_func(data_iterator_inner, model_inner, *extra_args)
+
+        def clipped_loss_func(output_t, **kwargs):
+            result = loss_func_orig(output_t, **kwargs)
+
+            # Only modify if we have per-example losses (4-element return)
+            if len(result) == 4:
+                scalar_loss, num_tokens, loss_reduced, per_example_losses = result
+                mb_idx = _microbatch_counter[0]
+                if mb_idx < len(clip_factors_list):
+                    cf = clip_factors_list[mb_idx].detach()
+                    # Scale per-example losses by clip factors
+                    clipped_per_example = cf * per_example_losses
+                    # Recompute scalar loss as mean of clipped per-example losses
+                    scalar_loss = clipped_per_example.sum()
+                _microbatch_counter[0] += 1
+                return scalar_loss, num_tokens, loss_reduced, per_example_losses
+            return result
+
+        return output_tensor, clipped_loss_func
+
+    # Run the full pipeline schedule for Pass 2
+    # Suppress finalize_model_grads in the schedule — we call it manually after
+    config.finalize_model_grads_func = None
+    try:
+        forward_data_store = pipeline_schedule_func(
+            forward_step_func=_clipped_forward_step_func,
+            data_iterator=replay_data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            forward_only=False,
+            collect_non_loss_data=collect_non_loss_data,
+            first_val_step=first_val_step,
+        )
+    finally:
+        config.finalize_model_grads_func = saved_finalize
+        # Clean up context variables
+        if hasattr(config, '_dp_sgd_clip_factors'):
+            del config._dp_sgd_clip_factors
+        if hasattr(config, '_dp_sgd_pass2'):
+            del config._dp_sgd_pass2
+
+    # ===== AFTER BOTH PASSES: finalize =====
+
+    # Call finalize_model_grads with fixed N_batch (not num_tokens)
+    if saved_finalize is not None:
+        global_batch_size = (
+            args.micro_batch_size
+            * parallel_state.get_data_parallel_world_size()
+            * num_microbatches
+        )
+        n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
+        saved_finalize(model_list, n_batch)
 
     # Remove per-example losses from logging dict
     for entry in forward_data_store:
@@ -1161,6 +1415,15 @@ def forward_backward_pipelining_with_interleaving(
         input_tensor = input_tensors[model_chunk_id].pop(0)
         output_tensor = output_tensors[model_chunk_id].pop(0)
         output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+
+        # DP-SGD: set current microbatch for ghost clipping hook indexing.
+        # In the interleaved schedule, the microbatch_id for this backward step
+        # is derived from the virtual_microbatch_id via the schedule table.
+        if getattr(config, 'dp_sgd', False):
+            bwd_microbatch_id = microbatch_id_table[
+                virtual_microbatch_id % total_num_microbatches
+            ]
+            set_current_microbatch(model[model_chunk_id], bwd_microbatch_id)
 
         input_tensor_grad = backward_step(
             input_tensor, output_tensor, output_tensor_grad, model_type, config
@@ -2037,6 +2300,12 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            # DP-SGD: set current microbatch for ghost clipping hook indexing.
+            # In the 1F1B steady state, backward processes microbatch i while
+            # forward processes microbatch i + num_warmup_microbatches.
+            if getattr(config, 'dp_sgd', False):
+                set_current_microbatch(model, i)
+
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
@@ -2066,6 +2335,12 @@ def forward_backward_pipelining_without_interleaving(
             output_tensor = output_tensors.pop(0)
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+            # DP-SGD: set current microbatch for ghost clipping hook indexing.
+            # Cooldown processes the remaining warmup microbatches in order:
+            # microbatch (num_microbatches - num_warmup_microbatches + i).
+            if getattr(config, 'dp_sgd', False):
+                set_current_microbatch(model, num_microbatches_remaining + i)
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config

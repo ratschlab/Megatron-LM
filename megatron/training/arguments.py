@@ -272,8 +272,14 @@ def validate_args(args, defaults={}):
     if args.dp_sgd:
         assert args.dp_num_dataset_examples > 0, \
             '--dp-num-dataset-examples must be set when --dp-sgd is enabled'
-        assert args.pipeline_model_parallel_size == 1, \
-            'DP-SGD requires PP=1 (pipeline parallelism not supported)'
+        # PP>1 is supported (Phase 3c) but requires uniform recompute (not block).
+        if args.pipeline_model_parallel_size > 1 and \
+                getattr(args, 'recompute_method', None) == 'block':
+            raise ValueError(
+                'DP-SGD with PP>1 requires --recompute-method uniform (not block). '
+                'Block recompute breaks ghost clipping hook ordering because it '
+                'replays only a subset of layers.'
+            )
         assert args.context_parallel_size == 1, \
             'DP-SGD requires context_parallel_size=1'
         assert not getattr(args, 'num_experts', None), \
