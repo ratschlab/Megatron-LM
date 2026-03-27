@@ -1561,6 +1561,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # DP-SGD: Initialize privacy accountant and noise seed.
     global _dp_accountant, _dp_current_epsilon, _dp_epsilon_at_resume
+    global _dp_clinical_steps, _dp_literature_steps
+    global _dp_epsilon_clinical, _dp_epsilon_literature
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
         # Generate random base seed for DP noise if not specified or restored.
         # This seed is serialized in checkpoints for resume correctness.
@@ -1654,8 +1656,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # DP-SGD: Update privacy accountant after each step.
         # Skip when sigma=0 (no noise = infinite privacy cost, nothing to track).
         if _dp_accountant is not None and skipped_iter == 0 and args.dp_noise_multiplier > 0:
-            global _dp_clinical_steps, _dp_literature_steps
-            global _dp_epsilon_clinical, _dp_epsilon_literature
             from dp_accounting import dp_event as dp_evt
             global_batch_size = (mpu.get_data_parallel_world_size()
                                  * args.micro_batch_size
