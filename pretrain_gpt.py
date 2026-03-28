@@ -356,7 +356,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
         print_rank_0(f"  {train_ds.N} training records, N={args.dp_num_dataset_examples} for accounting, "
                      f"sampling={train_ds.sampling_method}")
-        return train_ds, None, None
+        # Return train_ds as validation too (for --skip-train eval with same data).
+        # The eval path is forward-only, so reusing train data is fine for loss comparison.
+        return train_ds, train_ds, None
 
     config = core_gpt_dataset_config_from_args(args)
 

@@ -291,12 +291,15 @@ def validate_args(args, defaults={}):
             'DP-SGD requires calculate_per_token_loss support (Megatron version too old?)'
         args.calculate_per_token_loss = True
 
-    # External dataloader: also force calculate_per_token_loss for consistent loss scaling.
+    # External dataloader without DP: force calculate_per_token_loss for consistent loss scaling.
     # Without this, non-DP and DP runs on the same data produce different effective learning
     # rates, making loss comparison impossible.
     if getattr(args, 'dp_data_path', None) and not getattr(args, 'dp_sgd', False):
         if hasattr(args, 'calculate_per_token_loss'):
             args.calculate_per_token_loss = True
+
+    # DP-SGD-specific auto-configuration (only when --dp-sgd is set).
+    if args.dp_sgd:
         # Phase 3: distributed optimizer requires single instance
         if getattr(args, 'num_distributed_optimizer_instances', 1) != 1:
             raise ValueError('DP-SGD requires num_distributed_optimizer_instances=1')
