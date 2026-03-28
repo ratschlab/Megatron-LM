@@ -526,9 +526,8 @@ def _dp_sgd_ghost_forward_backward(
                 current_microbatch=k,
             )
 
-            # Keep first microbatch's logging data
-            if is_first:
-                forward_data_store.extend(forward_data_store_p1)
+            # Store all microbatches' logging data (not just first)
+            forward_data_store.extend(forward_data_store_p1)
 
             per_example_losses = forward_data_store_p1[-1].get('dp_per_example_losses')
             assert per_example_losses is not None, (
@@ -606,19 +605,57 @@ def _dp_sgd_ghost_forward_backward(
             status = "OK" if max_diff < 1e-5 else "FAIL"
             print(f'DIAGNOSTIC {status}: RNG replay verified (max loss diff = {max_diff:.2e})')
 
+        # DEBUG: check main_grad BEFORE Pass 2 backward
+        if is_first:
+            _n_inf_pre = sum(1 for p in model.parameters()
+                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
+                and (torch.isinf(p.main_grad).any() or torch.isnan(p.main_grad).any()))
+            _mg_pre = sum(p.main_grad.float().norm().item()**2
+                for p in model.parameters()
+                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None)**0.5
+            print(f'DEBUG pre-pass2-bwd: main_grad_norm={_mg_pre:.4f}, inf={_n_inf_pre}')
+
         # Scaled loss: backward produces Σ(clip_i · g_i) → accumulates into main_grad
+        # Match standard Megatron scaling: divide by num_tokens and num_microbatches
+        # (same as forward_step lines 310-316 when calculate_per_token_loss=False).
+        # Without this, the backward scalar is ~32768x larger, causing FP16 overflow.
         scaled_loss = (clip_factors.detach() * per_example_losses2).sum()
+        scaled_loss = scaled_loss / num_tokens2.float().clamp(min=1.0) / num_microbatches
         backward_step(input_tensor, scaled_loss, output_tensor_grad, model_type, config)
 
+        # Manually flush non-fused params (bias, embedding) from FP16 param.grad
+        # to FP32 main_grad. The fused kernel handles weight params directly, but
+        # bias/embedding use standard autograd → FP16 param.grad. Without this,
+        # FP16 param.grad accumulates across microbatches and overflows.
+        for p in model.parameters():
+            if not p.requires_grad:
+                continue
+            if p.grad is not None and hasattr(p, 'main_grad') and p.main_grad is not None:
+                if not getattr(p, 'grad_added_to_main_grad', False):
+                    p.main_grad.add_(p.grad.data.float())
+                p.grad = None
+
     # ===== AFTER ALL MICROBATCHES: finalize =====
+
+    # DEBUG: check main_grad for inf/nan before finalize
+    _inf_names = [n for n, p in model.named_parameters()
+                  if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
+                  and (torch.isinf(p.main_grad).any() or torch.isnan(p.main_grad).any())]
+    _n_inf = len(_inf_names)
+    if _n_inf > 0:
+        print(f'DEBUG inf params: {_inf_names}')
+    _mg_norm = sum(p.main_grad.float().norm().item()**2
+                   for p in model.parameters()
+                   if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None)**0.5
+    print(f'DEBUG pre-finalize: total_num_tokens={total_num_tokens.item()}, '
+          f'main_grad_norm={_mg_norm:.4f}, params_with_inf={_n_inf}')
 
     # Finalize (all-reduce + noise + normalization)
     if config.finalize_model_grads_func is not None:
         use_num_tokens = getattr(args, 'dp_use_num_tokens_normalization', False)
         if use_num_tokens:
-            # Pass actual token count for standard num_tokens normalization
-            # (makes DP and non-DP bit-identical when sigma=0, C=inf).
-            config.finalize_model_grads_func([model], total_num_tokens)
+            # Match standard non-DP: pass None (num_tokens already divided in scaled_loss).
+            config.finalize_model_grads_func([model], None)
         else:
             # Production default: pass fixed N_batch for DP-safe normalization.
             global_batch_size = (
