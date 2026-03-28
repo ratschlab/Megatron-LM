@@ -257,23 +257,37 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
         return
 
     # The gradient in main_grad has been pre-normalized by /num_tokens/num_microbatches
-    # in the backward scalar (matching standard Megatron's forward_step). The noise
-    # must be calibrated to the sensitivity of this pre-normalized quantity:
-    #   sensitivity = C_internal / num_tokens / num_microbatches = C_per_token / K
-    # So noise_std = sigma * C_per_token / num_microbatches.
+    # in the backward scalar (matching standard Megatron's forward_step). Additionally,
+    # on FP16, main_grad is amplified by loss_scale (via grad_scale_func in backward_step),
+    # which the optimizer later divides out. The noise must account for BOTH:
+    #
+    #   noise_std = sigma * C_effective / num_tokens / num_microbatches * loss_scale
+    #
+    # After optimizer unscaling (÷ loss_scale), effective noise = sigma * C_eff / T / K
+    # This is the same on FP16 (loss_scale=65536) and BF16 (loss_scale=1).
     from megatron.training import get_args
     _noise_args = get_args()
+
     if getattr(_noise_args, 'dp_clipping_norm_per_token', False):
         # C was auto-scaled by S for clipping. Undo for noise: C_per_token = C / S
         C_for_noise = C / _noise_args.seq_length
-        # Also account for num_microbatches pre-normalization
+        num_tokens = _noise_args.seq_length  # per microbatch (MBS=1 assumption)
         num_microbatches = (
             _noise_args.global_batch_size //
             (_noise_args.micro_batch_size * parallel_state.get_data_parallel_world_size())
         )
-        noise_std = sigma * C_for_noise / num_microbatches
+        noise_std = sigma * C_for_noise / num_tokens / num_microbatches
     else:
         noise_std = sigma * C
+
+    # Scale noise to match loss_scale-amplified main_grad space.
+    # On FP16: loss_scale ~65536, optimizer divides by it → noise survives at natural scale.
+    # On BF16: loss_scale=1 (or grad_scale_func=None), no amplification → noise stays as-is.
+    if config.grad_scale_func is not None:
+        loss_scale = config.grad_scale_func(
+            torch.tensor(1.0, dtype=torch.float32, device='cuda')
+        ).item()
+        noise_std = noise_std * loss_scale
 
     from megatron.training import get_args
     args = get_args()

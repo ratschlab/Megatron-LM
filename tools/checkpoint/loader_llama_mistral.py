@@ -298,6 +298,7 @@ def load_args_from_checkpoint(args, model_size):
     args.norm_epsilon = model_args["rms_norm_eps"]
     args.iteration = 1 # '0', 'release' don't work
     args.position_embedding_type = "rope"
+    args.apply_rope_fusion = False
     args.swiglu = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
@@ -387,7 +388,7 @@ def load_checkpoint_to_model(args):
     from transformers import AutoModelForCausalLM
 
     # Load Huggingface model.
-    hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
+    hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu", trust_remote_code=True)
 
     # Init Megatron model.
     model = model_provider(True, True).to(args.params_dtype)
@@ -515,7 +516,10 @@ def _load_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
-    fused_kernels.load(margs)
+    try:
+        fused_kernels.load(margs)
+    except Exception:
+        print("Warning: fused kernels not available (no CUDA), continuing without them")
 
     # Short aliases.
     tp_size = margs.tensor_model_parallel_size
