@@ -256,7 +256,24 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     if sigma <= 0:
         return
 
-    noise_std = sigma * C
+    # The gradient in main_grad has been pre-normalized by /num_tokens/num_microbatches
+    # in the backward scalar (matching standard Megatron's forward_step). The noise
+    # must be calibrated to the sensitivity of this pre-normalized quantity:
+    #   sensitivity = C_internal / num_tokens / num_microbatches = C_per_token / K
+    # So noise_std = sigma * C_per_token / num_microbatches.
+    from megatron.training import get_args
+    _noise_args = get_args()
+    if getattr(_noise_args, 'dp_clipping_norm_per_token', False):
+        # C was auto-scaled by S for clipping. Undo for noise: C_per_token = C / S
+        C_for_noise = C / _noise_args.seq_length
+        # Also account for num_microbatches pre-normalization
+        num_microbatches = (
+            _noise_args.global_batch_size //
+            (_noise_args.micro_batch_size * parallel_state.get_data_parallel_world_size())
+        )
+        noise_std = sigma * C_for_noise / num_microbatches
+    else:
+        noise_std = sigma * C
 
     from megatron.training import get_args
     args = get_args()

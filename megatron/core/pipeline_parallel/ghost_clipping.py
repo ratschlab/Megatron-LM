@@ -52,6 +52,19 @@ try:
     _NORM_CLASSES = _NORM_CLASSES + (TENorm,)
 except ImportError:
     pass
+try:
+    # TENorm is a factory — it creates TE-native LayerNorm/RMSNorm instances,
+    # not TENorm instances. We need the actual TE classes for isinstance checks.
+    import transformer_engine.pytorch as te_pytorch
+    _te_norm_classes = []
+    for name in ['LayerNorm', 'RMSNorm']:
+        cls = getattr(te_pytorch.module, name, None) or getattr(te_pytorch, name, None)
+        if cls is not None and cls not in _NORM_CLASSES:
+            _te_norm_classes.append(cls)
+    if _te_norm_classes:
+        _NORM_CLASSES = _NORM_CLASSES + tuple(_te_norm_classes)
+except (ImportError, AttributeError):
+    pass
 
 
 class GhostClippingContext:
@@ -847,8 +860,10 @@ class _ReplayableIterator:
         return batch
 
     def rewind(self):
-        """Make the next __next__() return the cached batch."""
-        assert self._cached is not None, "Cannot rewind before first fetch"
+        """Make the next __next__() return the cached batch.
+        No-op for TP ranks that don't fetch data (they never call __next__)."""
+        if self._cached is None:
+            return  # Non-data-fetching rank (e.g., TP rank > 0 with PP=1)
         self._replaying = True
 
 

@@ -42,8 +42,9 @@ def add_arguments(parser):
 
 
 def verify_transformers_version():
-    major, minor, patch = map(int, transformers.__version__.split('.'))
-    assert major >= 4 and minor >= 31
+    major, minor, patch = map(int, transformers.__version__.split('.')[:3])
+    assert major > 4 or (major == 4 and minor >= 31), \
+        f"transformers >= 4.31 required, got {transformers.__version__}"
 
 
 NUM_SHARDS = {

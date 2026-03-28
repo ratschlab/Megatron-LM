@@ -632,7 +632,7 @@ def _dp_sgd_ghost_forward_backward(
                 continue
             if p.grad is not None and hasattr(p, 'main_grad') and p.main_grad is not None:
                 if not getattr(p, 'grad_added_to_main_grad', False):
-                    p.main_grad.add_(p.grad.data.float())
+                    p.main_grad.add_(p.grad.data)  # FP16→FP32 auto-promoted by PyTorch
                 p.grad = None
 
     # ===== AFTER ALL MICROBATCHES: finalize =====
