@@ -286,17 +286,6 @@ def validate_args(args, defaults={}):
             'DP-SGD requires context_parallel_size=1'
         assert not getattr(args, 'num_experts', None), \
             'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
-        # Phase 3: force calculate_per_token_loss=True to prevent DDP 1/DP gradient pre-scaling
-        assert hasattr(args, 'calculate_per_token_loss'), \
-            'DP-SGD requires calculate_per_token_loss support (Megatron version too old?)'
-        args.calculate_per_token_loss = True
-
-    # External dataloader without DP: force calculate_per_token_loss for consistent loss scaling.
-    # Without this, non-DP and DP runs on the same data produce different effective learning
-    # rates, making loss comparison impossible.
-    if getattr(args, 'dp_data_path', None) and not getattr(args, 'dp_sgd', False):
-        if hasattr(args, 'calculate_per_token_loss'):
-            args.calculate_per_token_loss = True
 
     # DP-SGD-specific auto-configuration (only when --dp-sgd is set).
     if args.dp_sgd:
@@ -310,10 +299,9 @@ def validate_args(args, defaults={}):
                       '(TE modules not supported by ghost clipping hooks)')
             args.transformer_impl = 'local'
         # Auto-disable incompatible features.
-        if hasattr(args, 'gradient_accumulation_fusion') and args.gradient_accumulation_fusion:
-            if args.rank == 0:
-                print('WARNING: --dp-sgd auto-disabling --gradient-accumulation-fusion')
-            args.gradient_accumulation_fusion = False
+        # NOTE: gradient_accumulation_fusion is now allowed in DP mode.
+        # The fused kernel writes to main_grad during Pass 1, but this is
+        # cleaned up by saving/restoring main_grad around Pass 1 in schedules.py.
         if hasattr(args, 'overlap_grad_reduce') and args.overlap_grad_reduce:
             if args.rank == 0:
                 print('WARNING: --dp-sgd auto-disabling --overlap-grad-reduce')
@@ -322,19 +310,27 @@ def validate_args(args, defaults={}):
             if args.rank == 0:
                 print('WARNING: --dp-sgd auto-disabling --overlap-param-gather')
             args.overlap_param_gather = False
-        # Disable standard gradient clipping (DP-SGD has its own).
-        args.clip_grad = 0.0
-        # Untie embeddings — avoids VocabParallel ghost clipping complexity.
-        if hasattr(args, 'untie_embeddings_and_output_weights'):
-            if not args.untie_embeddings_and_output_weights:
-                if args.rank == 0:
-                    print('WARNING: --dp-sgd auto-enabling --untie-embeddings-and-output-weights')
-                args.untie_embeddings_and_output_weights = True
+        # NOTE: clip_grad is no longer auto-set to 0.0. Standard gradient clipping
+        # (e.g., clip_grad=1.0) is post-processing of the already-private gradient
+        # and does not affect the DP guarantee. Users can set it explicitly.
+        # NOTE: untied embeddings NOT auto-enabled. Keeps standard Apertus config.
         # Disable sequence parallelism (per-example norms need extra SP all-reduces).
         if hasattr(args, 'sequence_parallel') and args.sequence_parallel:
             if args.rank == 0:
                 print('WARNING: --dp-sgd auto-disabling --sequence-parallel')
             args.sequence_parallel = False
+        # Auto-scale clipping norm by sequence length when --dp-clipping-norm-per-token is set.
+        # With standard CE sum loss, per-example gradient norms are ~S larger than with
+        # per-token loss. So C_sum = C_per_token * S. E.g., C=1.0 with S=2048 gives
+        # internal C=2048. This makes C values portable across sequence lengths.
+        if getattr(args, 'dp_clipping_norm_per_token', False):
+            S = args.seq_length
+            original_C = args.dp_clipping_norm
+            args.dp_clipping_norm = original_C * S
+            if args.rank == 0:
+                print(f'DP-SGD: --dp-clipping-norm-per-token auto-scaled C from '
+                      f'{original_C} to {args.dp_clipping_norm} (S={S})')
+
         if args.rank == 0:
             print(f'DP-SGD enabled: sigma={args.dp_noise_multiplier}, '
                   f'C={args.dp_clipping_norm}, delta={args.dp_delta}, '
@@ -2507,4 +2503,13 @@ def _add_dp_sgd_args(parser):
                        'truncated_poisson: Poisson inclusion with ADD_OR_REMOVE_ONE.')
     group.add_argument('--dp-log-clip-stats', action='store_true', default=False,
                        help='Log per-step clip fraction, norm stats, and epsilon.')
+    group.add_argument('--dp-clipping-norm-per-token', action='store_true', default=False,
+                       help='Interpret --dp-clipping-norm as a per-token value and '
+                       'auto-scale by sequence length S. Internal C = C_per_token * S. '
+                       'Makes C values portable across sequence lengths.')
+    group.add_argument('--dp-use-num-tokens-normalization', action='store_true', default=False,
+                       help='Use standard num_tokens gradient normalization in DP mode '
+                       'instead of fixed N_batch. For experiments proving DP correctness '
+                       '(bit-identical to non-DP when sigma=0, C=inf). Production DP '
+                       'should use the default N_batch to avoid leaking batch composition.')
     return parser

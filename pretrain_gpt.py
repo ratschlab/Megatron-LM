@@ -185,11 +185,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     total_tokens = loss_mask.sum()
     loss_sum = torch.sum(losses.view(-1) * loss_mask)
 
-    # DP-SGD mean aggregation: divide by token count to make gradient norms length-invariant.
-    # This is a per-example operation (deterministic function of the individual example),
-    # NOT the batch-level num_tokens normalization (which is bypassed in DP mode).
-    if getattr(args, 'dp_sgd', False) and getattr(args, 'dp_loss_aggregation', 'mean') == 'mean':
-        loss_sum = loss_sum / torch.clamp(total_tokens, min=1.0)
+    # Standard Megatron CE: raw sum over tokens. Gradient normalization by
+    # num_tokens (or N_batch for production DP) happens in finalize_model_grads.
+    # No per-token division here — both DP and non-DP use the same loss.
 
     loss = torch.cat([loss_sum.view(1), total_tokens.view(1)])
 

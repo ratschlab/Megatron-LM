@@ -363,14 +363,28 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     # This is the correct injection point per the DP-SGD protocol.
     if getattr(config, 'dp_sgd', False):
         _dp_sgd_inject_noise(model, config)
-        # In DP mode, normalize by fixed N_batch (number of sequences in global batch)
-        # instead of num_tokens (which is data-dependent and leaks batch composition).
-        # N_batch is passed via num_tokens when dp_sgd is set (see training.py).
-        if num_tokens is not None and num_tokens > 0:
-            scaling = 1.0 / num_tokens
-            for model_chunk in model:
-                model_chunk.scale_gradients(scaling)
-        return
+
+        # Check if DP mode should use standard num_tokens normalization
+        # (for experiments proving DP correctness) or fixed N_batch
+        # (production default, avoids leaking batch composition).
+        from megatron.training import get_args
+        _dp_args = get_args()
+        use_num_tokens = getattr(_dp_args, 'dp_use_num_tokens_normalization', False)
+
+        if use_num_tokens:
+            # Use standard num_tokens normalization (same as non-DP path below).
+            # This makes DP and non-DP bit-identical when sigma=0 and C=inf.
+            pass  # Fall through to the standard num_tokens normalization below
+        else:
+            # Production default: normalize by fixed N_batch (number of sequences
+            # in global batch) instead of num_tokens (data-dependent, leaks batch
+            # composition). N_batch is passed via num_tokens when dp_sgd is set
+            # (see training.py and schedules.py).
+            if num_tokens is not None and num_tokens > 0:
+                scaling = 1.0 / num_tokens
+                for model_chunk in model:
+                    model_chunk.scale_gradients(scaling)
+            return
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

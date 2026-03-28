@@ -472,6 +472,9 @@ def _dp_sgd_ghost_forward_backward(
     except (ImportError, AttributeError):
         _has_tp_rng = False
 
+    # Track total tokens across microbatches for --dp-use-num-tokens-normalization
+    total_num_tokens = torch.tensor(0, dtype=torch.int, device="cuda")
+
     # ===== MICROBATCH LOOP: interleave Pass 1 + Pass 2 per microbatch =====
     # Each microbatch: Pass 1 (norms → clip factors) → Pass 2 (clipped backward → main_grad)
     # main_grad accumulates across all microbatches. finalize_model_grads called once at end.
@@ -491,6 +494,16 @@ def _dp_sgd_ghost_forward_backward(
                   if _has_tp_rng else None)
 
         # ===== PASS 1: Norm computation (no main_grad writes) =====
+        # Save main_grad state before Pass 1. The fused gradient accumulation
+        # kernel writes directly to main_grad during backward, bypassing the
+        # grad_added_to_main_grad isolation flag. We save and restore main_grad
+        # to undo this contamination while preserving clipped gradients
+        # accumulated from previous microbatches (k>0).
+        _saved_main_grads = {}
+        for p in model.parameters():
+            if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None:
+                _saved_main_grads[p] = p.main_grad.clone()
+
         try:
             # Isolate main_grad: DDP hook will skip main_grad.add_()
             for p in model.parameters():
@@ -538,29 +551,26 @@ def _dp_sgd_ghost_forward_backward(
                           f'max={norms.max():.2f}, '
                           f'clip min={clip_factors.min():.4f} max={clip_factors.max():.4f}')
 
-            # Diagnostic checks (first microbatch only to reduce noise)
+            # Save Pass 1 loss for later diagnostic comparison
             if _diagnostic and is_first:
-                main_grad_norm = sum(
-                    p.main_grad.float().norm().item() ** 2
-                    for p in model.parameters()
-                    if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
-                ) ** 0.5
-                status = "OK" if main_grad_norm < 1e-10 else "FAIL"
-                print(f'DIAGNOSTIC {status}: Pass 1 isolation verified '
-                      f'(main_grad norm = {main_grad_norm:.2e})')
                 _pass1_loss_value = per_example_losses.detach().clone()
 
             clip_factors = torch.nan_to_num(clip_factors, nan=0.0, posinf=0.0, neginf=0.0)
 
         finally:
-            # Cleanup Pass 1: reset flag but do NOT zero main_grad
-            # (main_grad accumulates clipped gradients across microbatches)
+            # Cleanup Pass 1: reset flag and restore main_grad to undo
+            # contamination from the fused gradient accumulation kernel.
             ghost_ctx.remove_hooks()
             for p in model.parameters():
                 if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
                     p.grad_added_to_main_grad = False
                 if p.grad is not None:
                     p.grad = None
+                # Restore main_grad to pre-Pass-1 state, undoing fused kernel
+                # contamination while preserving clipped grads from prior microbatches.
+                if p in _saved_main_grads:
+                    p.main_grad.copy_(_saved_main_grads[p])
+            del _saved_main_grads
 
         # ===== PASS 2: Clipped gradient computation (writes to main_grad) =====
 
@@ -588,6 +598,7 @@ def _dp_sgd_ghost_forward_backward(
 
         per_example_losses2 = forward_data_store_p2[-1].get('dp_per_example_losses')
         assert per_example_losses2 is not None
+        total_num_tokens += num_tokens2
 
         # Diagnostic: RNG replay check (first microbatch only)
         if _diagnostic and is_first and '_pass1_loss_value' in dir():
@@ -601,15 +612,22 @@ def _dp_sgd_ghost_forward_backward(
 
     # ===== AFTER ALL MICROBATCHES: finalize =====
 
-    # Finalize (all-reduce + noise + N_batch normalization)
+    # Finalize (all-reduce + noise + normalization)
     if config.finalize_model_grads_func is not None:
-        global_batch_size = (
-            args.micro_batch_size
-            * parallel_state.get_data_parallel_world_size()
-            * num_microbatches
-        )
-        n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
-        config.finalize_model_grads_func([model], n_batch)
+        use_num_tokens = getattr(args, 'dp_use_num_tokens_normalization', False)
+        if use_num_tokens:
+            # Pass actual token count for standard num_tokens normalization
+            # (makes DP and non-DP bit-identical when sigma=0, C=inf).
+            config.finalize_model_grads_func([model], total_num_tokens)
+        else:
+            # Production default: pass fixed N_batch for DP-safe normalization.
+            global_batch_size = (
+                args.micro_batch_size
+                * parallel_state.get_data_parallel_world_size()
+                * num_microbatches
+            )
+            n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
+            config.finalize_model_grads_func([model], n_batch)
 
     # Remove per-example losses from logging dict
     for entry in forward_data_store:
