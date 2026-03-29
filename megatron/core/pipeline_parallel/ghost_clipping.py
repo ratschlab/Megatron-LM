@@ -610,7 +610,17 @@ class GhostClippingContext:
                     bias_sum_j = (go_bsh * mask_j).sum(dim=1)  # [B, H]
                     bias_norms[:, j] = (bias_sum_j ** 2).sum(dim=-1)  # [B]
 
-                bias_sharded = getattr(module.bias, 'tensor_model_parallel', False)
+                # Bias TP classification: ColumnParallel biases are sharded,
+                # RowParallel biases are replicated. TE CPU-init may skip
+                # setting tensor_model_parallel on bias, so use module type.
+                # RowParallelLinear (and TERowParallelLinear) are the only
+                # linear types with replicated bias.
+                if isinstance(module, RowParallelLinear):
+                    bias_sharded = False
+                elif isinstance(module, LINEAR_CLASSES):
+                    bias_sharded = True  # All other linear types: Column/Fused
+                else:
+                    bias_sharded = getattr(module.bias, 'tensor_model_parallel', False)
                 if bias_sharded:
                     self._per_mb_norm_sq_sharded[mb_id].append(bias_norms)
                 else:
@@ -632,7 +642,17 @@ class GhostClippingContext:
             if hasattr(module, 'bias') and module.bias is not None:
                 bias_grad = go_f.sum(dim=0)  # [B, H_out]
                 bias_norm = (bias_grad ** 2).sum(dim=-1)
-                bias_sharded = getattr(module.bias, 'tensor_model_parallel', False)
+                # Bias TP classification: ColumnParallel biases are sharded,
+                # RowParallel biases are replicated. TE CPU-init may skip
+                # setting tensor_model_parallel on bias, so use module type.
+                # RowParallelLinear (and TERowParallelLinear) are the only
+                # linear types with replicated bias.
+                if isinstance(module, RowParallelLinear):
+                    bias_sharded = False
+                elif isinstance(module, LINEAR_CLASSES):
+                    bias_sharded = True  # All other linear types: Column/Fused
+                else:
+                    bias_sharded = getattr(module.bias, 'tensor_model_parallel', False)
                 if bias_sharded:
                     self._per_mb_norm_sq_sharded[mb_id].append(bias_norm)
                 else:
