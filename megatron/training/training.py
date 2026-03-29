@@ -763,8 +763,35 @@ def setup_model_and_optimizer(model_provider_func,
                         if param is not None and param.requires_grad:
                             param.requires_grad = False
                             frozen_count += 1
+        # Also stamp tensor_model_parallel on TE weights/biases for noise injection.
+        # TE CPU-init uses skip_set_tensor_parallel_attributes=True, so the noise
+        # injection code (finalize_model_grads.py) can't detect TP sharding via
+        # getattr(param, 'tensor_model_parallel'). Without this, ALL TE weights
+        # get replicated noise (same across TP ranks) → correlated noise → DP violation.
+        from megatron.core.pipeline_parallel.ghost_clipping import (
+            LINEAR_CLASSES, TE_LINEAR_CLASSES,
+        )
+        from megatron.core.tensor_parallel.layers import RowParallelLinear
+        stamped_count = 0
+        for model_chunk in model_list:
+            for mod in model_chunk.modules():
+                if isinstance(mod, LINEAR_CLASSES):
+                    # Weight is always TP-sharded for parallel linear layers
+                    if hasattr(mod, 'weight') and mod.weight is not None:
+                        if not hasattr(mod.weight, 'tensor_model_parallel'):
+                            mod.weight.tensor_model_parallel = True
+                            stamped_count += 1
+                    # Bias: ColumnParallel → sharded, RowParallel → replicated
+                    if hasattr(mod, 'bias') and mod.bias is not None:
+                        if not hasattr(mod.bias, 'tensor_model_parallel'):
+                            is_row = isinstance(mod, RowParallelLinear)
+                            if TE_LINEAR_CLASSES:
+                                is_row = is_row or type(mod).__name__ == 'TERowParallelLinear'
+                            mod.bias.tensor_model_parallel = not is_row
+                            stamped_count += 1
         if args.rank == 0:
-            print(f'DP-SGD TE: froze {frozen_count} norm parameters (LN/RMSNorm/qk_norm)')
+            print(f'DP-SGD TE: froze {frozen_count} norm parameters, '
+                  f'stamped {stamped_count} TP attributes for noise injection')
 
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
