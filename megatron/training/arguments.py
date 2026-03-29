@@ -292,6 +292,14 @@ def validate_args(args, defaults={}):
         # Phase 3: distributed optimizer requires single instance
         if getattr(args, 'num_distributed_optimizer_instances', 1) != 1:
             raise ValueError('DP-SGD requires num_distributed_optimizer_instances=1')
+        # BUG-3 fix: deferred embedding wgrad is incompatible with DP-SGD PP>1.
+        # The finalize_model_grads_func suppression during ghost clipping skips
+        # finish_embedding_wgrad_compute, silently dropping embedding gradients.
+        if getattr(args, 'defer_embedding_wgrad_compute', False):
+            raise ValueError(
+                'DP-SGD does not support --defer-embedding-wgrad-compute. '
+                'The deferred embedding wgrad path is skipped when '
+                'finalize_model_grads_func is suppressed during ghost clipping.')
         # TE is supported with frozen norm parameters (ghost clipping uses constant bound).
         # FP8 is incompatible (two-pass causes amax desync). RMSNorm required for constant bound.
         if hasattr(args, 'transformer_impl') and args.transformer_impl == 'transformer_engine':

@@ -894,6 +894,17 @@ def _dp_sgd_pipeline_forward_backward(
 
     # ===== PASS 1: Norm computation (no main_grad writes) =====
     try:
+        # BUG-1 fix: Save main_grad before Pass 1. The gradient_accumulation_fusion
+        # fused kernel writes directly to main_grad during backward, bypassing the
+        # grad_added_to_main_grad flag. Without save/restore, Pass 2's clipped
+        # gradients are added on top of Pass 1's unclipped contamination.
+        # At the start of a training step, main_grad should be zero (optimizer
+        # zeroed it). We zero it explicitly to be safe, then zero again after Pass 1.
+        for model_chunk in model_list:
+            for p in model_chunk.parameters():
+                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None:
+                    p.main_grad.zero_()
+
         # Isolate main_grad: DDP hook will skip main_grad.add_()
         for model_chunk in model_list:
             for p in model_chunk.parameters():
@@ -964,6 +975,14 @@ def _dp_sgd_pipeline_forward_backward(
         config.grad_scale_func = saved_grad_scale
         config.grad_sync_func = saved_grad_sync
         config.param_sync_func = saved_param_sync
+
+    # BUG-1 fix: Zero main_grad after Pass 1 to remove any contamination from
+    # the fused gradient_accumulation_fusion kernel (which bypasses the
+    # grad_added_to_main_grad flag and writes directly to main_grad).
+    for model_chunk in model_list:
+        for p in model_chunk.parameters():
+            if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None:
+                p.main_grad.zero_()
 
     # ===== PASS 2: Clipped gradient computation (writes to main_grad) =====
 
