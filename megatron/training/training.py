@@ -769,9 +769,10 @@ def setup_model_and_optimizer(model_provider_func,
         # getattr(param, 'tensor_model_parallel'). Without this, ALL TE weights
         # get replicated noise (same across TP ranks) → correlated noise → DP violation.
         from megatron.core.pipeline_parallel.ghost_clipping import (
-            LINEAR_CLASSES, TE_LINEAR_CLASSES,
+            LINEAR_CLASSES, TE_ROW_PARALLEL_CLASSES,
         )
         from megatron.core.tensor_parallel.layers import RowParallelLinear
+        _row_classes = (RowParallelLinear,) + TE_ROW_PARALLEL_CLASSES
         stamped_count = 0
         for model_chunk in model_list:
             for mod in model_chunk.modules():
@@ -784,10 +785,7 @@ def setup_model_and_optimizer(model_provider_func,
                     # Bias: ColumnParallel → sharded, RowParallel → replicated
                     if hasattr(mod, 'bias') and mod.bias is not None:
                         if not hasattr(mod.bias, 'tensor_model_parallel'):
-                            is_row = isinstance(mod, RowParallelLinear)
-                            if TE_LINEAR_CLASSES:
-                                is_row = is_row or type(mod).__name__ == 'TERowParallelLinear'
-                            mod.bias.tensor_model_parallel = not is_row
+                            mod.bias.tensor_model_parallel = not isinstance(mod, _row_classes)
                             stamped_count += 1
         if args.rank == 0:
             print(f'DP-SGD TE: froze {frozen_count} norm parameters, '

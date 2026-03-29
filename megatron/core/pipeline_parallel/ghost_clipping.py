@@ -38,6 +38,7 @@ from megatron.core.tensor_parallel.layers import (
 LINEAR_CLASSES = (ColumnParallelLinear, RowParallelLinear)
 TE_LINEAR_CLASSES = ()
 TE_FUSED_LN_LINEAR_CLASSES = ()
+TE_ROW_PARALLEL_CLASSES = ()
 try:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
@@ -50,6 +51,7 @@ try:
         TELayerNormColumnParallelLinear,
     )
     TE_FUSED_LN_LINEAR_CLASSES = (TELayerNormColumnParallelLinear,)
+    TE_ROW_PARALLEL_CLASSES = (TERowParallelLinear,)
     LINEAR_CLASSES = LINEAR_CLASSES + TE_LINEAR_CLASSES
 except ImportError:
     pass
@@ -505,7 +507,11 @@ class GhostClippingContext:
         if TE_FUSED_LN_LINEAR_CLASSES and isinstance(module, TE_FUSED_LN_LINEAR_CLASSES):
             x = args[0]  # [S, B, H] pre-LN
             S, B, H = x.shape
-            max_gamma_sq = self._fused_gamma_max_sq.get(id(module), 1.0)
+            assert id(module) in self._fused_gamma_max_sq, (
+                f"DP-SGD ghost clipping: fused module {type(module).__name__} "
+                f"missing precomputed max_gamma_sq. Was register_hooks() called?"
+            )
+            max_gamma_sq = self._fused_gamma_max_sq[id(module)]
             if self._packing_mode:
                 # Per-token: ||LN(x_{i,t})||^2 <= H * max_gamma_sq
                 self._input_norms_sq[id(module)].append(
@@ -613,10 +619,9 @@ class GhostClippingContext:
                 # Bias TP classification: ColumnParallel biases are sharded,
                 # RowParallel biases are replicated. TE CPU-init may skip
                 # setting tensor_model_parallel on bias, so use module type.
-                # RowParallelLinear (and TERowParallelLinear) are the only
-                # linear types with replicated bias.
-                if isinstance(module, RowParallelLinear):
-                    bias_sharded = False
+                _row_classes = (RowParallelLinear,) + TE_ROW_PARALLEL_CLASSES
+                if isinstance(module, _row_classes):
+                    bias_sharded = False  # RowParallel bias is replicated
                 elif isinstance(module, LINEAR_CLASSES):
                     bias_sharded = True  # All other linear types: Column/Fused
                 else:
@@ -645,10 +650,9 @@ class GhostClippingContext:
                 # Bias TP classification: ColumnParallel biases are sharded,
                 # RowParallel biases are replicated. TE CPU-init may skip
                 # setting tensor_model_parallel on bias, so use module type.
-                # RowParallelLinear (and TERowParallelLinear) are the only
-                # linear types with replicated bias.
-                if isinstance(module, RowParallelLinear):
-                    bias_sharded = False
+                _row_classes = (RowParallelLinear,) + TE_ROW_PARALLEL_CLASSES
+                if isinstance(module, _row_classes):
+                    bias_sharded = False  # RowParallel bias is replicated
                 elif isinstance(module, LINEAR_CLASSES):
                     bias_sharded = True  # All other linear types: Column/Fused
                 else:
