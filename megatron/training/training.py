@@ -737,32 +737,45 @@ def setup_model_and_optimizer(model_provider_func,
     model = get_model(model_provider_func, model_type, wrap_with_ddp=args.ckpt_convert_format is None)
     unwrapped_model = unwrap_model(model)
 
-    # DP-SGD with TE: freeze norm parameters so ghost clipping doesn't need
-    # to compute LN gradient norms for fused TELayerNormColumnParallelLinear.
-    # Only freeze when using transformer_engine — with local impl, separate
-    # LN hooks already compute norm contributions correctly.
-    if getattr(args, 'dp_sgd', False) and getattr(args, 'transformer_impl', 'local') == 'transformer_engine':
-        from megatron.core.pipeline_parallel.ghost_clipping import (
-            _NORM_CLASSES, TE_FUSED_LN_LINEAR_CLASSES,
-        )
+    # DP-SGD: freeze parameters that ghost clipping can't handle.
+    if getattr(args, 'dp_sgd', False):
         frozen_count = 0
         model_list = unwrapped_model if isinstance(unwrapped_model, list) else [unwrapped_model]
-        for model_chunk in model_list:
-            for mod in model_chunk.modules():
-                # Freeze separate norm modules (input_layernorm, pre_mlp_layernorm,
-                # final_layernorm, q_layernorm, k_layernorm)
-                if isinstance(mod, _NORM_CLASSES):
-                    for p in mod.parameters():
-                        if p.requires_grad:
-                            p.requires_grad = False
-                            frozen_count += 1
-                # Freeze fused LN weights inside TE modules
-                if TE_FUSED_LN_LINEAR_CLASSES and isinstance(mod, TE_FUSED_LN_LINEAR_CLASSES):
-                    for attr in ('layer_norm_weight', 'layer_norm_bias'):
-                        param = getattr(mod, attr, None)
-                        if param is not None and param.requires_grad:
-                            param.requires_grad = False
-                            frozen_count += 1
+
+        # Always freeze XIELU activation params (alpha_p, alpha_n — 2 scalars/layer).
+        # Ghost clipping doesn't have hooks for activation functions.
+        # Negligible: 64 scalars for 8B, barely change during continued pretraining.
+        try:
+            from megatron.training.activations import XIELU
+            for model_chunk in model_list:
+                for mod in model_chunk.modules():
+                    if isinstance(mod, XIELU):
+                        for p in mod.parameters():
+                            if p.requires_grad:
+                                p.requires_grad = False
+                                frozen_count += 1
+        except ImportError:
+            pass  # XIELU not available (non-Apertus model)
+
+        # With TE: freeze norm params (LN γ/β, qk_norm, fused LN weights).
+        # With local impl, separate LN hooks already compute norm contributions.
+        if getattr(args, 'transformer_impl', 'local') == 'transformer_engine':
+            from megatron.core.pipeline_parallel.ghost_clipping import (
+                _NORM_CLASSES, TE_FUSED_LN_LINEAR_CLASSES,
+            )
+            for model_chunk in model_list:
+                for mod in model_chunk.modules():
+                    if isinstance(mod, _NORM_CLASSES):
+                        for p in mod.parameters():
+                            if p.requires_grad:
+                                p.requires_grad = False
+                                frozen_count += 1
+                    if TE_FUSED_LN_LINEAR_CLASSES and isinstance(mod, TE_FUSED_LN_LINEAR_CLASSES):
+                        for attr in ('layer_norm_weight', 'layer_norm_bias'):
+                            param = getattr(mod, attr, None)
+                            if param is not None and param.requires_grad:
+                                param.requires_grad = False
+                                frozen_count += 1
         # Also stamp tensor_model_parallel on TE weights/biases for noise injection.
         # TE CPU-init uses skip_set_tensor_parallel_attributes=True, so the noise
         # injection code (finalize_model_grads.py) can't detect TP sharding via
@@ -788,8 +801,12 @@ def setup_model_and_optimizer(model_provider_func,
                             mod.bias.tensor_model_parallel = not isinstance(mod, _row_classes)
                             stamped_count += 1
         if args.rank == 0:
-            print(f'DP-SGD TE: froze {frozen_count} norm parameters, '
-                  f'stamped {stamped_count} TP attributes for noise injection')
+            impl = getattr(args, 'transformer_impl', 'local')
+            msg = f'DP-SGD: froze {frozen_count} parameters (activation'
+            if impl == 'transformer_engine':
+                msg += '+norm'
+            msg += f'), stamped {stamped_count} TP attributes'
+            print(msg)
 
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
