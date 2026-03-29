@@ -540,6 +540,73 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def _dp_sgd_freeze_params(model, args):
+    """Freeze params that ghost clipping can't handle. Must be called BEFORE DDP wrapping
+    so frozen params are excluded from grad buffers (avoids DistributedOptimizer KeyError)."""
+    frozen_count = 0
+
+    # Always freeze XIELU activation params (alpha_p, alpha_n — 2 scalars/layer).
+    try:
+        from megatron.training.activations import XIELU
+        for model_chunk in model:
+            for mod in model_chunk.modules():
+                if isinstance(mod, XIELU):
+                    for p in mod.parameters():
+                        if p.requires_grad:
+                            p.requires_grad = False
+                            frozen_count += 1
+    except ImportError:
+        pass
+
+    # With TE: freeze norm params (LN γ/β, qk_norm, fused LN weights).
+    if getattr(args, 'transformer_impl', 'local') == 'transformer_engine':
+        from megatron.core.pipeline_parallel.ghost_clipping import (
+            _NORM_CLASSES, TE_FUSED_LN_LINEAR_CLASSES,
+        )
+        for model_chunk in model:
+            for mod in model_chunk.modules():
+                if isinstance(mod, _NORM_CLASSES):
+                    for p in mod.parameters():
+                        if p.requires_grad:
+                            p.requires_grad = False
+                            frozen_count += 1
+                if TE_FUSED_LN_LINEAR_CLASSES and isinstance(mod, TE_FUSED_LN_LINEAR_CLASSES):
+                    for attr in ('layer_norm_weight', 'layer_norm_bias'):
+                        param = getattr(mod, attr, None)
+                        if param is not None and param.requires_grad:
+                            param.requires_grad = False
+                            frozen_count += 1
+
+    # Stamp tensor_model_parallel on TE weights/biases for noise injection.
+    from megatron.core.pipeline_parallel.ghost_clipping import (
+        LINEAR_CLASSES, TE_ROW_PARALLEL_CLASSES,
+    )
+    from megatron.core.tensor_parallel.layers import RowParallelLinear
+    _row_classes = (RowParallelLinear,) + TE_ROW_PARALLEL_CLASSES
+    stamped_count = 0
+    for model_chunk in model:
+        for mod in model_chunk.modules():
+            if isinstance(mod, LINEAR_CLASSES):
+                if hasattr(mod, 'weight') and mod.weight is not None:
+                    if not hasattr(mod.weight, 'tensor_model_parallel'):
+                        mod.weight.tensor_model_parallel = True
+                        stamped_count += 1
+                if hasattr(mod, 'bias') and mod.bias is not None:
+                    if not hasattr(mod.bias, 'tensor_model_parallel'):
+                        mod.bias.tensor_model_parallel = not isinstance(mod, _row_classes)
+                        stamped_count += 1
+
+    if args.rank == 0:
+        impl = getattr(args, 'transformer_impl', 'local')
+        msg = f'DP-SGD: froze {frozen_count} parameters (activation'
+        if impl == 'transformer_engine':
+            msg += '+norm'
+        msg += f'), stamped {stamped_count} TP attributes'
+        print(msg)
+
+    return frozen_count
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
@@ -630,6 +697,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     )
                 else:
                     fp8_meta.amax_history[0][fp8_meta_index] = 0
+
+    # DP-SGD: freeze params BEFORE DDP wrapping. DDP only allocates grad
+    # buffers for requires_grad=True params. If we freeze after wrapping,
+    # frozen params are in the buffer but not in optimizer groups → KeyError
+    # in DistributedOptimizer._build_optimizer_group_ranges.
+    if getattr(args, 'dp_sgd', False):
+        _dp_sgd_freeze_params(model, args)
 
     if wrap_with_ddp:
         if getattr(args, "use_torch_fsdp2", False):
@@ -736,77 +810,6 @@ def setup_model_and_optimizer(model_provider_func,
 
     model = get_model(model_provider_func, model_type, wrap_with_ddp=args.ckpt_convert_format is None)
     unwrapped_model = unwrap_model(model)
-
-    # DP-SGD: freeze parameters that ghost clipping can't handle.
-    if getattr(args, 'dp_sgd', False):
-        frozen_count = 0
-        model_list = unwrapped_model if isinstance(unwrapped_model, list) else [unwrapped_model]
-
-        # Always freeze XIELU activation params (alpha_p, alpha_n — 2 scalars/layer).
-        # Ghost clipping doesn't have hooks for activation functions.
-        # Negligible: 64 scalars for 8B, barely change during continued pretraining.
-        try:
-            from megatron.training.activations import XIELU
-            for model_chunk in model_list:
-                for mod in model_chunk.modules():
-                    if isinstance(mod, XIELU):
-                        for p in mod.parameters():
-                            if p.requires_grad:
-                                p.requires_grad = False
-                                frozen_count += 1
-        except ImportError:
-            pass  # XIELU not available (non-Apertus model)
-
-        # With TE: freeze norm params (LN γ/β, qk_norm, fused LN weights).
-        # With local impl, separate LN hooks already compute norm contributions.
-        if getattr(args, 'transformer_impl', 'local') == 'transformer_engine':
-            from megatron.core.pipeline_parallel.ghost_clipping import (
-                _NORM_CLASSES, TE_FUSED_LN_LINEAR_CLASSES,
-            )
-            for model_chunk in model_list:
-                for mod in model_chunk.modules():
-                    if isinstance(mod, _NORM_CLASSES):
-                        for p in mod.parameters():
-                            if p.requires_grad:
-                                p.requires_grad = False
-                                frozen_count += 1
-                    if TE_FUSED_LN_LINEAR_CLASSES and isinstance(mod, TE_FUSED_LN_LINEAR_CLASSES):
-                        for attr in ('layer_norm_weight', 'layer_norm_bias'):
-                            param = getattr(mod, attr, None)
-                            if param is not None and param.requires_grad:
-                                param.requires_grad = False
-                                frozen_count += 1
-        # Also stamp tensor_model_parallel on TE weights/biases for noise injection.
-        # TE CPU-init uses skip_set_tensor_parallel_attributes=True, so the noise
-        # injection code (finalize_model_grads.py) can't detect TP sharding via
-        # getattr(param, 'tensor_model_parallel'). Without this, ALL TE weights
-        # get replicated noise (same across TP ranks) → correlated noise → DP violation.
-        from megatron.core.pipeline_parallel.ghost_clipping import (
-            LINEAR_CLASSES, TE_ROW_PARALLEL_CLASSES,
-        )
-        from megatron.core.tensor_parallel.layers import RowParallelLinear
-        _row_classes = (RowParallelLinear,) + TE_ROW_PARALLEL_CLASSES
-        stamped_count = 0
-        for model_chunk in model_list:
-            for mod in model_chunk.modules():
-                if isinstance(mod, LINEAR_CLASSES):
-                    # Weight is always TP-sharded for parallel linear layers
-                    if hasattr(mod, 'weight') and mod.weight is not None:
-                        if not hasattr(mod.weight, 'tensor_model_parallel'):
-                            mod.weight.tensor_model_parallel = True
-                            stamped_count += 1
-                    # Bias: ColumnParallel → sharded, RowParallel → replicated
-                    if hasattr(mod, 'bias') and mod.bias is not None:
-                        if not hasattr(mod.bias, 'tensor_model_parallel'):
-                            mod.bias.tensor_model_parallel = not isinstance(mod, _row_classes)
-                            stamped_count += 1
-        if args.rank == 0:
-            impl = getattr(args, 'transformer_impl', 'local')
-            msg = f'DP-SGD: froze {frozen_count} parameters (activation'
-            if impl == 'transformer_engine':
-                msg += '+norm'
-            msg += f'), stamped {stamped_count} TP attributes'
-            print(msg)
 
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
@@ -1661,10 +1664,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 print(f'DP-SGD: Privacy accountant initialized '
                       f'(N={args.dp_num_dataset_examples}, delta={args.dp_delta})')
         except ImportError:
-            raise RuntimeError(
-                'dp-accounting library required for --dp-sgd. '
-                'Install with: pip install dp-accounting'
-            )
+            _dp_accountant = None
+            if args.rank == 0:
+                print('WARNING: dp-accounting not installed. Privacy accounting disabled. '
+                      'Install with: pip install dp-accounting')
 
     # Run training iterations till done.
     while iteration < args.train_iters:
