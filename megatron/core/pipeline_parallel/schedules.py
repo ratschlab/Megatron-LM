@@ -650,6 +650,12 @@ def _dp_sgd_ghost_forward_backward(
     print(f'DEBUG pre-finalize: total_num_tokens={total_num_tokens.item()}, '
           f'main_grad_norm={_mg_norm:.4f}, params_with_inf={_n_inf}')
 
+    # Pass total_num_tokens to noise injection for exact calibration.
+    # The gradient backward scalar divides by T (actual tokens per microbatch),
+    # so the noise must also use T, not the constant seq_length S.
+    config._dp_total_num_tokens = total_num_tokens.item()
+    config._dp_num_microbatches = num_microbatches
+
     # Finalize (all-reduce + noise + normalization)
     if config.finalize_model_grads_func is not None:
         use_num_tokens = getattr(args, 'dp_use_num_tokens_normalization', False)

@@ -36,6 +36,23 @@ from megatron.core.tensor_parallel.layers import (
 
 
 LINEAR_CLASSES = (ColumnParallelLinear, RowParallelLinear)
+TE_LINEAR_CLASSES = ()
+TE_FUSED_LN_LINEAR_CLASSES = ()
+try:
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+        TELayerNormColumnParallelLinear,
+    )
+    TE_LINEAR_CLASSES = (
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+        TELayerNormColumnParallelLinear,
+    )
+    TE_FUSED_LN_LINEAR_CLASSES = (TELayerNormColumnParallelLinear,)
+    LINEAR_CLASSES = LINEAR_CLASSES + TE_LINEAR_CLASSES
+except ImportError:
+    pass
 EMBEDDING_CLASSES = (VocabParallelEmbedding, nn.Embedding)
 
 # Norm classes that are safe for the layernorm-style Cauchy-Schwarz hook.
@@ -112,6 +129,8 @@ class GhostClippingContext:
         self._input_norms_sq: Dict[int, Deque[torch.Tensor]] = defaultdict(deque)
         self._ln_xhat_dim_sq: Dict[int, Deque[torch.Tensor]] = defaultdict(deque)
         self._embedding_input_ids: Dict[int, Deque[torch.Tensor]] = defaultdict(deque)
+        # For TE fused LN+Linear: precomputed max(|gamma|)^2 per module
+        self._fused_gamma_max_sq: Dict[int, float] = {}
 
         # Per-microbatch squared norm contributions, split by TP classification.
         # Each entry is a list of [B]-shaped tensors from individual module hooks.
@@ -461,6 +480,15 @@ class GhostClippingContext:
         h1 = module.register_forward_hook(self._linear_forward_hook)
         h2 = module.register_full_backward_hook(self._linear_backward_hook)
         self._hooks.extend([h1, h2])
+        # For TE fused LN+Linear modules, precompute the gamma bound.
+        # ||LN(x_i)||^2 <= S * H * max_gamma_sq (valid upper bound for RMSNorm).
+        # Since gamma is frozen in DP mode, this is constant for the entire run.
+        if TE_FUSED_LN_LINEAR_CLASSES and isinstance(module, TE_FUSED_LN_LINEAR_CLASSES):
+            gamma = module.layer_norm_weight.detach().float()
+            zcg = getattr(module, 'zero_centered_gamma', False)
+            if zcg:
+                gamma = 1.0 + gamma
+            self._fused_gamma_max_sq[id(module)] = gamma.abs().max().item() ** 2
 
     def _linear_forward_hook(self, module, args, output):
         """Save per-example input activation norms."""
@@ -471,6 +499,26 @@ class GhostClippingContext:
         # skip to avoid accumulating stale data.
         if not torch.is_grad_enabled():
             return
+
+        # For TE fused LN+Linear: input is pre-LN. Use constant upper bound.
+        # ||LN(x_i)||^2 <= S * H * max_gamma_sq (RMSNorm normalizes to ||h|| ~ sqrt(H))
+        if TE_FUSED_LN_LINEAR_CLASSES and isinstance(module, TE_FUSED_LN_LINEAR_CLASSES):
+            x = args[0]  # [S, B, H] pre-LN
+            S, B, H = x.shape
+            max_gamma_sq = self._fused_gamma_max_sq.get(id(module), 1.0)
+            if self._packing_mode:
+                # Per-token: ||LN(x_{i,t})||^2 <= H * max_gamma_sq
+                self._input_norms_sq[id(module)].append(
+                    torch.full((S, B), float(H * max_gamma_sq), device=x.device)
+                )
+            else:
+                # Per-example: ||LN(x_i)||^2 <= S * H * max_gamma_sq
+                self._input_norms_sq[id(module)].append(
+                    torch.full((B,), float(S * H * max_gamma_sq), device=x.device)
+                )
+            return
+
+        # Standard path: input is already post-LN (local modules or non-fused TE)
         x = args[0]  # [S, B, H_in]
         if self._packing_mode:
             # Phase 3d: Save per-token norms [S, B] for per-unit aggregation in backward.
@@ -507,9 +555,14 @@ class GhostClippingContext:
         )
         x_norm_sq = dq.popleft()
 
-        # Determine TP sharding for weight and bias
-        is_weight_sharded = getattr(module.weight, 'tensor_model_parallel', False) \
-                            if hasattr(module, 'weight') else False
+        # Determine TP sharding for weight and bias.
+        # All Column/RowParallel linear weights (including TE variants) are TP-sharded.
+        # TE CPU-init may skip setting tensor_model_parallel attr, so classify by type.
+        if isinstance(module, LINEAR_CLASSES):
+            is_weight_sharded = True
+        else:
+            is_weight_sharded = getattr(module.weight, 'tensor_model_parallel', False) \
+                                if hasattr(module, 'weight') else False
 
         if self._packing_mode:
             # Phase 3d: Per-privacy-unit norms via masked sum with precomputed doc_mask.

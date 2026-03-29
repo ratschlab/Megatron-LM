@@ -737,6 +737,35 @@ def setup_model_and_optimizer(model_provider_func,
     model = get_model(model_provider_func, model_type, wrap_with_ddp=args.ckpt_convert_format is None)
     unwrapped_model = unwrap_model(model)
 
+    # DP-SGD: freeze all norm parameters (LN γ/β, qk_norm).
+    # With frozen norms, ghost clipping computes exact total gradient norms
+    # (the norm contribution of frozen params is zero). This enables TE support
+    # since fused LN+Linear modules don't need separate LN gradient norm computation.
+    if getattr(args, 'dp_sgd', False):
+        from megatron.core.pipeline_parallel.ghost_clipping import (
+            _NORM_CLASSES, TE_FUSED_LN_LINEAR_CLASSES,
+        )
+        frozen_count = 0
+        model_list = unwrapped_model if isinstance(unwrapped_model, list) else [unwrapped_model]
+        for model_chunk in model_list:
+            for mod in model_chunk.modules():
+                # Freeze separate norm modules (input_layernorm, pre_mlp_layernorm,
+                # final_layernorm, q_layernorm, k_layernorm)
+                if isinstance(mod, _NORM_CLASSES):
+                    for p in mod.parameters():
+                        if p.requires_grad:
+                            p.requires_grad = False
+                            frozen_count += 1
+                # Freeze fused LN weights inside TE modules
+                if TE_FUSED_LN_LINEAR_CLASSES and isinstance(mod, TE_FUSED_LN_LINEAR_CLASSES):
+                    for attr in ('layer_norm_weight', 'layer_norm_bias'):
+                        param = getattr(mod, attr, None)
+                        if param is not None and param.requires_grad:
+                            param.requires_grad = False
+                            frozen_count += 1
+        if args.rank == 0:
+            print(f'DP-SGD: froze {frozen_count} norm parameters (LN/RMSNorm/qk_norm)')
+
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
         if hasattr(args, f.name):

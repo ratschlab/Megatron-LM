@@ -17,7 +17,11 @@ import psutil
 import torch
 from torch import multiprocessing as mp
 from torch.distributed.checkpoint import FileSystemWriter
-from torch.distributed.checkpoint.filesystem import DEFAULT_SUFFIX, _StoragePrefix, _write_item, SerializationFormat
+try:
+    from torch.distributed.checkpoint.filesystem import DEFAULT_SUFFIX, _StoragePrefix, _write_item, SerializationFormat
+except ImportError:
+    from torch.distributed.checkpoint.filesystem import DEFAULT_SUFFIX, _StoragePrefix, _write_item
+    SerializationFormat = None
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteItem, WriteItemType
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
@@ -295,7 +299,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         try:
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
             extra_kwargs = {}
-            extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+            if SerializationFormat is not None:
+                extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
             with open(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
                     local_results.append(_write_item(*transform_list, stream, data, write_item, storage_key, **extra_kwargs))

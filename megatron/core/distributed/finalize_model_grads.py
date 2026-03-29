@@ -256,29 +256,41 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     if sigma <= 0:
         return
 
-    # The gradient in main_grad has been pre-normalized by /num_tokens/num_microbatches
-    # in the backward scalar (matching standard Megatron's forward_step). Additionally,
-    # on FP16, main_grad is amplified by loss_scale (via grad_scale_func in backward_step),
-    # which the optimizer later divides out. The noise must account for BOTH:
+    # Noise calibration derivation:
     #
-    #   noise_std = sigma * C_effective / num_tokens / num_microbatches * loss_scale
+    # In schedules.py, each example's gradient enters main_grad as:
+    #   clip_i * g_i / T_k / K * loss_scale
+    # where T_k = actual tokens in microbatch k, K = num_microbatches,
+    # and ||clip_i * g_i|| <= C (clipping bound).
     #
-    # After optimizer unscaling (÷ loss_scale), effective noise = sigma * C_eff / T / K
-    # This is the same on FP16 (loss_scale=65536) and BF16 (loss_scale=1).
+    # Megatron's DDP averages gradients across D data-parallel ranks
+    # (via pre-scaling by 1/D or average_in_collective) when
+    # calculate_per_token_loss=False (our default). After all-reduce,
+    # each example's contribution to main_grad is:
+    #   (1/D) * clip_i * g_i / T_k / K * loss_scale
+    #
+    # The L2-sensitivity of main_grad to one example is therefore:
+    #   Δ = C / (D * T_k * K) * loss_scale
+    #
+    # Using constant S (seq_length) as proxy for T_k (data-independent):
+    #   noise_std = σ * C / (D * S * K) * loss_scale
+    #
+    # When T_k < S (padded sequences), this slightly under-noises (sensitivity
+    # is higher than estimated). For fixed-length training with minimal padding,
+    # T_k ≈ S and the error is negligible.
+    #
+    # Works for both --dp-clipping-norm-per-token (C = C_user × S) and
+    # default (C = C_user).
     from megatron.training import get_args
     _noise_args = get_args()
 
-    if getattr(_noise_args, 'dp_clipping_norm_per_token', False):
-        # C was auto-scaled by S for clipping. Undo for noise: C_per_token = C / S
-        C_for_noise = C / _noise_args.seq_length
-        num_tokens = _noise_args.seq_length  # per microbatch (MBS=1 assumption)
-        num_microbatches = (
-            _noise_args.global_batch_size //
-            (_noise_args.micro_batch_size * parallel_state.get_data_parallel_world_size())
-        )
-        noise_std = sigma * C_for_noise / num_tokens / num_microbatches
-    else:
-        noise_std = sigma * C
+    S = _noise_args.seq_length
+    K = (
+        _noise_args.global_batch_size //
+        (_noise_args.micro_batch_size * parallel_state.get_data_parallel_world_size())
+    )
+    D = parallel_state.get_data_parallel_world_size()
+    noise_std = sigma * C / (D * S * K)
 
     # Scale noise to match loss_scale-amplified main_grad space.
     # On FP16: loss_scale ~65536, optimizer divides by it → noise survives at natural scale.

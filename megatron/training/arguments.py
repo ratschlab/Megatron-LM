@@ -292,12 +292,20 @@ def validate_args(args, defaults={}):
         # Phase 3: distributed optimizer requires single instance
         if getattr(args, 'num_distributed_optimizer_instances', 1) != 1:
             raise ValueError('DP-SGD requires num_distributed_optimizer_instances=1')
-        # Require local transformer impl (TE linear modules not covered by ghost clipping hooks)
-        if hasattr(args, 'transformer_impl') and args.transformer_impl != 'local':
+        # TE is supported with frozen norm parameters (ghost clipping uses constant bound).
+        # FP8 is incompatible (two-pass causes amax desync). RMSNorm required for constant bound.
+        if hasattr(args, 'transformer_impl') and args.transformer_impl == 'transformer_engine':
             if args.rank == 0:
-                print('WARNING: --dp-sgd auto-setting --transformer-impl local '
-                      '(TE modules not supported by ghost clipping hooks)')
-            args.transformer_impl = 'local'
+                print('DP-SGD: using transformer_engine with frozen norm parameters.')
+            if getattr(args, 'fp8', None) is not None:
+                raise ValueError(
+                    'FP8 is not compatible with DP-SGD ghost clipping. '
+                    'The two-pass scheme causes FP8 amax desynchronization. '
+                    'Use --fp8 None (default).')
+            if getattr(args, 'normalization', 'LayerNorm') != 'RMSNorm':
+                raise ValueError(
+                    f'DP-SGD TE ghost clipping requires --normalization RMSNorm. '
+                    f'Got: {args.normalization}. The constant norm bound is derived for RMSNorm only.')
         # Auto-disable incompatible features.
         # NOTE: gradient_accumulation_fusion is now allowed in DP mode.
         # The fused kernel writes to main_grad during Pass 1, but this is
