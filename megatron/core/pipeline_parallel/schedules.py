@@ -681,7 +681,7 @@ def _dp_sgd_ghost_forward_backward(
 
 
 def _make_dp_forward_step_wrapper(forward_step_func, pass_number, clip_factors_list=None,
-                                   microbatch_counter=None):
+                                   microbatch_counter=None, num_tokens_accumulator=None):
     """Wrap forward_step_func to convert loss_func's 4-tuple return to 3-tuple.
 
     The problem: when loss_func returns 4 elements (scalar_loss, num_tokens,
@@ -696,6 +696,8 @@ def _make_dp_forward_step_wrapper(forward_step_func, pass_number, clip_factors_l
         pass_number: 1 for norm computation pass, 2 for clipped gradient pass.
         clip_factors_list: List of per-microbatch clip factor tensors (Pass 2 only).
         microbatch_counter: Mutable list [int] tracking current microbatch index (Pass 2 only).
+        num_tokens_accumulator: Optional mutable list to collect per-microbatch num_tokens
+            for exact noise calibration (Pass 2 only, pipeline-last-stage only).
 
     Returns:
         Wrapped forward_step function that returns 3-tuple from loss_func.
@@ -740,6 +742,8 @@ def _make_dp_forward_step_wrapper(forward_step_func, pass_number, clip_factors_l
                 else:
                     combined_loss = per_example_losses.sum()
                 microbatch_counter[0] += 1
+                if num_tokens_accumulator is not None:
+                    num_tokens_accumulator.append(num_tokens)
                 loss_reduced['dp_per_example_losses'] = per_example_losses
                 return combined_loss, num_tokens, loss_reduced
 
@@ -820,6 +824,18 @@ def _dp_sgd_pipeline_forward_backward(
 
     args = get_args()
 
+    # PP>1 DP-SGD assertions (cannot go in validate_args — parallel_state not yet initialized)
+    if getattr(args, 'dp_use_num_tokens_normalization', False):
+        raise ValueError(
+            "--dp-use-num-tokens-normalization is not supported with PP>1 DP-SGD. "
+            "The pipeline schedule uses fixed N_batch normalization."
+        )
+    if getattr(args, 'fp16', False) and parallel_state.get_data_parallel_rank() == 0:
+        print(
+            "WARNING: PP>1 + FP16 + DP-SGD: grad_scale_func is suppressed during "
+            "Pass 1, creating a secondary norm inconsistency. Use BF16."
+        )
+
     # Normalize model to list for uniform handling
     if not isinstance(model, list):
         model_list = [model]
@@ -891,6 +907,8 @@ def _dp_sgd_pipeline_forward_backward(
     saved_grad_scale = config.grad_scale_func
     saved_grad_sync = config.grad_sync_func
     saved_param_sync = config.param_sync_func
+    # BUG-2 fix: save before try so restore in finally is always safe.
+    saved_calculate_per_token_loss = config.calculate_per_token_loss
 
     # ===== PASS 1: Norm computation (no main_grad writes) =====
     try:
@@ -918,6 +936,12 @@ def _dp_sgd_pipeline_forward_backward(
         config.grad_scale_func = None
         config.grad_sync_func = None
         config.param_sync_func = None
+
+        # BUG-2 fix: Prevent forward_step from dividing by num_tokens and
+        # num_microbatches during Pass 1. Without this, ghost clipping norms
+        # are T*K smaller than PP=1 norms, making clip factors too large and
+        # violating the DP sensitivity bound (under-noised by factor T*K).
+        config.calculate_per_token_loss = True
 
         # Wrap forward_step_func for Pass 1: convert 4-tuple to 3-tuple
         # so forward_step() does NOT detach output_tensor (preserving autograd graph)
@@ -948,7 +972,11 @@ def _dp_sgd_pipeline_forward_backward(
                 clip_factors_list[k], nan=0.0, posinf=0.0, neginf=0.0
             )
 
-        # Diagnostic: check main_grad isolation
+        # Diagnostic: check main_grad isolation.
+        # NOTE: With gradient_accumulation_fusion=True, the fused kernel writes
+        # directly to main_grad despite the grad_added_to_main_grad flag. This
+        # diagnostic will report "FAIL" in that case, but the save/restore at
+        # lines below correctly handles the contamination. Expected behavior.
         if _diagnostic:
             main_grad_norm = sum(
                 p.main_grad.float().norm().item() ** 2
@@ -975,6 +1003,7 @@ def _dp_sgd_pipeline_forward_backward(
         config.grad_scale_func = saved_grad_scale
         config.grad_sync_func = saved_grad_sync
         config.param_sync_func = saved_param_sync
+        config.calculate_per_token_loss = saved_calculate_per_token_loss
 
     # BUG-1 fix: Restore main_grad to pre-Pass-1 state. Removes contamination
     # from the fused gradient_accumulation_fusion kernel while preserving any
@@ -997,10 +1026,12 @@ def _dp_sgd_pipeline_forward_backward(
     # Wrap forward_step_func for Pass 2: convert 4-tuple to 3-tuple with
     # clip-factor-scaled loss, keeping grad_fn intact for pipeline backward.
     _microbatch_counter = [0]
+    _num_tokens_acc = []  # Collect per-microbatch num_tokens for noise calibration
     pass2_forward_step = _make_dp_forward_step_wrapper(
         forward_step_func, pass_number=2,
         clip_factors_list=clip_factors_list,
         microbatch_counter=_microbatch_counter,
+        num_tokens_accumulator=_num_tokens_acc,
     )
 
     # Run the full pipeline schedule for Pass 2
@@ -1023,6 +1054,15 @@ def _dp_sgd_pipeline_forward_backward(
         config.finalize_model_grads_func = saved_finalize
 
     # ===== AFTER BOTH PASSES: finalize =====
+
+    # Set total_num_tokens for exact noise calibration (matches PP=1 at line 656).
+    # Only pipeline-last-stage accumulates num_tokens; other stages get 0.
+    if _num_tokens_acc:
+        total_num_tokens_pp = sum(
+            t.item() if hasattr(t, 'item') else int(t) for t in _num_tokens_acc
+        )
+        config._dp_total_num_tokens = total_num_tokens_pp
+        config._dp_num_microbatches = num_microbatches
 
     # Call finalize_model_grads with fixed N_batch (not num_tokens)
     if saved_finalize is not None:

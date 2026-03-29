@@ -308,8 +308,9 @@ def validate_args(args, defaults={}):
                     'PP>1 DP-SGD always uses fixed N_batch normalization.')
             if getattr(args, 'fp16', False):
                 if args.rank == 0:
-                    print('WARNING: PP>1 + FP16 + DP-SGD has an unresolved '
-                          'grad_scale_func inconsistency (BUG-2). Use BF16.')
+                    print('WARNING: PP>1 + FP16 + DP-SGD: grad_scale_func is '
+                          'suppressed during Pass 1, creating a secondary norm '
+                          'inconsistency on FP16. Use BF16.')
         # TE is supported with frozen norm parameters (ghost clipping uses constant bound).
         # FP8 is incompatible (two-pass causes amax desync). RMSNorm required for constant bound.
         if hasattr(args, 'transformer_impl') and args.transformer_impl == 'transformer_engine':
