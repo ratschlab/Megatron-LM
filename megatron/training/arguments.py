@@ -300,6 +300,16 @@ def validate_args(args, defaults={}):
                 'DP-SGD does not support --defer-embedding-wgrad-compute. '
                 'The deferred embedding wgrad path is skipped when '
                 'finalize_model_grads_func is suppressed during ghost clipping.')
+        # PP>1 + DP-SGD: warn about known limitations
+        if getattr(args, 'pipeline_model_parallel_size', 1) > 1:
+            if getattr(args, 'dp_use_num_tokens_normalization', False):
+                raise ValueError(
+                    '--dp-use-num-tokens-normalization is not supported with PP>1. '
+                    'PP>1 DP-SGD always uses fixed N_batch normalization.')
+            if getattr(args, 'fp16', False):
+                if args.rank == 0:
+                    print('WARNING: PP>1 + FP16 + DP-SGD has an unresolved '
+                          'grad_scale_func inconsistency (BUG-2). Use BF16.')
         # TE is supported with frozen norm parameters (ghost clipping uses constant bound).
         # FP8 is incompatible (two-pass causes amax desync). RMSNorm required for constant bound.
         if hasattr(args, 'transformer_impl') and args.transformer_impl == 'transformer_engine':
