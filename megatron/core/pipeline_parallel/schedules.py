@@ -858,20 +858,32 @@ def _dp_sgd_pipeline_forward_backward(
     if parallel_state.is_pipeline_first_stage():
         # First stage pre-reads boundaries from the data iterator.
         # Only TP rank 0 has a data iterator; others have None.
+        # IMPORTANT: Only peek if we need to check for packing mode. The peek
+        # consumes a batch from _PipelineReplayableIterator; if packing is NOT
+        # detected, rewind leaves only 1 entry in the cache, and the subsequent
+        # pipeline schedule (which needs K entries) will crash on the 2nd next().
+        # To avoid this, we pre-read ALL K microbatches (so the cache is full),
+        # or skip the peek entirely when packing is not expected.
         src_iter = replay_data_iterator[0] if isinstance(replay_data_iterator, list) \
                    else replay_data_iterator
         if src_iter is not None:
-            # Peek at first microbatch to check for unit_boundaries
             try:
+                # Peek at first microbatch to check for unit_boundaries
                 first_batch = next(src_iter)
                 if 'unit_boundaries' in first_batch:
                     _packing_mode = True
                     ghost_ctx.set_unit_boundaries(0, first_batch['unit_boundaries'])
-                    # Pre-read remaining microbatches
+                    # Pre-read remaining microbatches (fills cache for replay)
                     for k in range(1, num_microbatches):
                         batch = next(src_iter)
                         ghost_ctx.set_unit_boundaries(k, batch['unit_boundaries'])
-                src_iter.rewind()
+                    src_iter.rewind()
+                else:
+                    # No packing: pre-read ALL remaining microbatches so the
+                    # cache has K entries for the pipeline schedule to consume.
+                    for k in range(1, num_microbatches):
+                        next(src_iter)
+                    src_iter.rewind()
             except (StopIteration, KeyError):
                 pass
 

@@ -991,8 +991,10 @@ class _PipelineReplayableIterator:
         return batch
 
     def rewind(self):
-        """Switch to replay mode. Next __next__() calls return cached batches."""
-        assert len(self._cache) > 0, "Cannot rewind before any data was fetched"
+        """Switch to replay mode. Next __next__() calls return cached batches.
+        No-op if no data was fetched (e.g., middle PP stages that never consume data)."""
+        if len(self._cache) == 0:
+            return  # Nothing to replay — this iterator was never used
         self._replaying = True
         self._replay_idx = 0
 
