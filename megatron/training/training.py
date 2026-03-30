@@ -1757,12 +1757,23 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             else:
                 step_event = dp_evt.GaussianDpEvent(args.dp_noise_multiplier)
 
-            _dp_accountant.compose(
-                dp_evt.PoissonSampledDpEvent(
-                    sampling_probability=sampling_probability,
-                    event=step_event,
+            _sampling = getattr(args, 'dp_sampling_method', 'shuffle_wor')
+            if _sampling == 'truncated_poisson':
+                _dp_accountant.compose(
+                    dp_evt.PoissonSampledDpEvent(
+                        sampling_probability=sampling_probability,
+                        event=step_event,
+                    )
                 )
-            )
+            else:
+                # shuffle_wor: use SampledWithoutReplacementDpEvent
+                _dp_accountant.compose(
+                    dp_evt.SampledWithoutReplacementDpEvent(
+                        source_dataset_size=args.dp_num_dataset_examples,
+                        sample_size=global_batch_size,
+                        event=step_event,
+                    )
+                )
             # Add pre-resume epsilon (from checkpoint) to post-resume epsilon (from accountant).
             _dp_current_epsilon = _dp_epsilon_at_resume + _dp_accountant.get_epsilon(args.dp_delta)
 
