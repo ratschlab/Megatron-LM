@@ -689,6 +689,8 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
             state_dict['dp_sgd_epsilon_literature'] = _dp_epsilon_literature
         if getattr(args, 'dp_noise_seed', None) is not None:
             state_dict['dp_sgd_noise_seed'] = args.dp_noise_seed
+        if hasattr(args, 'dp_clipping_norm_current') and args.dp_clipping_norm_current != float('inf'):
+            state_dict['dp_clipping_norm_current'] = args.dp_clipping_norm_current
 
     return state_dict
 
@@ -1315,6 +1317,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         if getattr(args, 'dp_noise_seed', None) is None:
             args.dp_noise_seed = state_dict['dp_sgd_noise_seed']
             print_rank_0(f'DP-SGD: Restored noise seed = {args.dp_noise_seed} from checkpoint')
+        # Restore adaptive clipping C
+        if 'dp_clipping_norm_current' in state_dict:
+            args.dp_clipping_norm_current = state_dict['dp_clipping_norm_current']
+            print_rank_0(f'DP-SGD: Restored adaptive C = {args.dp_clipping_norm_current} from checkpoint')
 
     # Check arguments.
     assert args.consumed_train_samples == 0

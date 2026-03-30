@@ -2549,4 +2549,9 @@ def _add_dp_sgd_args(parser):
                        'Uses private geometric update (noise on clipped fraction).')
     group.add_argument('--dp-clipping-adapt-lr', type=float, default=0.2,
                        help='Learning rate for adaptive C geometric update.')
+    group.add_argument('--dp-adapt-sigma-b', type=float, default=10.0,
+                       help='Noise multiplier for private clipped-fraction release '
+                       'in adaptive C and per-layer thresholds. Privacy cost: '
+                       'sigma_new = (sigma^-2 - (2*sigma_b)^-2)^(-1/2). '
+                       'Default 10.0 gives sigma_new/sigma ~= 1.001.')
     return parser

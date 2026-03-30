@@ -567,10 +567,10 @@ def _dp_sgd_ghost_forward_backward(
                     C_current = getattr(args, 'dp_clipping_norm_current', C)
                     if C_current == float('inf'):
                         # First microbatch ever: initialize from percentile with jitter.
-                        # Jitter provides privacy for this one-time initialization.
-                        # Deterministic seed so all DP ranks get the same C.
+                        # Seed from dp_noise_seed (secret, cross-rank consistent).
                         _init_rng = torch.Generator()
-                        _init_rng.manual_seed(42)
+                        _init_seed = getattr(args, 'dp_noise_seed', 42) + 99
+                        _init_rng.manual_seed(_init_seed)
                         _jittered_pct = _dp_clip_pct + torch.randn(1, generator=_init_rng).item() * 5.0
                         _jittered_pct = max(1.0, min(99.0, _jittered_pct))
                         C_current = torch.quantile(
@@ -696,9 +696,12 @@ def _dp_sgd_ghost_forward_backward(
     # Adaptive clipping: set noise C to the C actually used for clipping this step,
     # then update C for the next step via private geometric update.
     _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
-    if _dp_clip_pct is not None and _dp_clip_pct != 0:
-        # Noise must use the C that was used for clipping THIS step
+    if _dp_clip_pct is not None:
+        # Noise must use the C that was used for clipping THIS step.
+        # Applies to BOTH P=0 (automatic, C=1.0) and P>0 (adaptive).
         C_this_step = getattr(args, 'dp_clipping_norm_current', C)
+        if C_this_step == float('inf'):
+            C_this_step = 1.0  # safety: inf should have been replaced in-loop
         config.dp_clipping_norm = C_this_step
 
     if _dp_clip_pct is not None and _dp_clip_pct != 0 and _adaptive_norms_list:
@@ -717,12 +720,15 @@ def _dp_sgd_ghost_forward_backward(
         _frac = _frac.item()
         _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
         _B_global = args.micro_batch_size * dp_ws * num_microbatches
+        # Seed from dp_noise_seed + step (secret, cross-rank consistent, different per step)
         _noise_rng = torch.Generator()
-        _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
+        _noise_seed = getattr(args, 'dp_noise_seed', 0) * 1000003 + getattr(args, 'curr_iteration', 0) + 7
+        _noise_rng.manual_seed(_noise_seed % (2**31 - 1))
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
         C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
         C_next = max(C_next, 1e-6)
+        C_next = min(C_next, C)  # cap at C_max (--dp-clipping-norm)
         args.dp_clipping_norm_current = C_next  # for NEXT step
 
         # Log: show C used THIS step and the updated C for next step
@@ -1107,7 +1113,8 @@ def _dp_sgd_pipeline_forward_backward(
                     for k in range(num_microbatches)
                 ])
                 _init_rng = torch.Generator()
-                _init_rng.manual_seed(42)
+                _init_seed = getattr(args, 'dp_noise_seed', 42) + 99
+                _init_rng.manual_seed(_init_seed)
                 _jittered_pct = _dp_clip_pct + torch.randn(1, generator=_init_rng).item() * 5.0
                 _jittered_pct = max(1.0, min(99.0, _jittered_pct))
                 C_current = torch.quantile(
@@ -1211,9 +1218,11 @@ def _dp_sgd_pipeline_forward_backward(
 
     # Adaptive clipping: noise uses C from THIS step, then update for NEXT step.
     _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
-    if _dp_clip_pct is not None and _dp_clip_pct != 0:
+    if _dp_clip_pct is not None:
         C_this_step = getattr(args, 'dp_clipping_norm_current', C)
-        config.dp_clipping_norm = C_this_step  # for noise injection
+        if C_this_step == float('inf'):
+            C_this_step = 1.0
+        config.dp_clipping_norm = C_this_step
 
     if _dp_clip_pct is not None and _dp_clip_pct != 0:
         import math as _math
@@ -1233,8 +1242,10 @@ def _dp_sgd_pipeline_forward_backward(
         _frac = _frac.item()
         _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
         _B_global = args.micro_batch_size * dp_ws * num_microbatches
+        # Seed from dp_noise_seed + step (secret, cross-rank consistent, different per step)
         _noise_rng = torch.Generator()
-        _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
+        _noise_seed = getattr(args, 'dp_noise_seed', 0) * 1000003 + getattr(args, 'curr_iteration', 0) + 7
+        _noise_rng.manual_seed(_noise_seed % (2**31 - 1))
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
         C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
