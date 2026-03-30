@@ -460,7 +460,9 @@ def _dp_sgd_ghost_forward_backward(
     _diagnostic = os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1'
 
     args = get_args()
-    C = config.dp_clipping_norm
+    C = config.dp_clipping_norm  # C_max (fixed, from --dp-clipping-norm)
+    # For adaptive clipping, use the running C_current (updated at end of each step)
+    C_active = getattr(args, 'dp_clipping_norm_current', C)
     model_type = get_model_type(model)
 
     forward_data_store = []
@@ -479,13 +481,17 @@ def _dp_sgd_ghost_forward_backward(
     # Each microbatch: Pass 1 (norms → clip factors) → Pass 2 (clipped backward → main_grad)
     # main_grad accumulates across all microbatches. finalize_model_grads called once at end.
 
+    # Adaptive clipping: accumulate raw norms across microbatches.
+    # C update happens AFTER all microbatches (end of step), using all norms.
+    _adaptive_norms_list = []
+
     for k in range(num_microbatches):
         is_first = (k == 0)
         is_last = (k == num_microbatches - 1)
 
         # Wrap this microbatch's data for two-pass replay
         replay_iter = _ReplayableIterator(data_iterator)
-        ghost_ctx = GhostClippingContext(model, C)
+        ghost_ctx = GhostClippingContext(model, C_active)
 
         # Save RNG state BEFORE Pass 1 (restore before Pass 2 for identical dropout)
         rng_cpu = torch.random.get_rng_state()
@@ -539,46 +545,18 @@ def _dp_sgd_ghost_forward_backward(
 
             clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
-            # Adaptive clipping: update C from gradient norm percentile.
-            # Only update C on the FIRST microbatch — all microbatches in a
-            # step use the same C. The geometric update is per-step, not per-microbatch.
+            # Adaptive clipping: save raw norms for end-of-step C update.
+            # ghost_ctx.C is already set to C_active (previous step's adaptive C),
+            # so compute_clip_factors() returns correct clip_factors for P>0.
+            # For P=0 (automatic clipping), recompute to remove the min(1,...) clamp.
             _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
             if _dp_clip_pct is not None:
-                import math as _math
                 raw_norms = ghost_ctx.get_raw_norms()
-                C_current = getattr(args, 'dp_clipping_norm_current', C)
+                _adaptive_norms_list.append(raw_norms.detach().clone())
 
                 if _dp_clip_pct == 0:
                     # Bu et al. automatic clipping: normalize all to unit norm × C
-                    clip_factors = C_current / (raw_norms + 1e-6)
-                elif is_first:
-                    # Private geometric update (Andrew et al.) — once per step
-                    _frac = (raw_norms > C_current).float().mean()
-                    dp_ws = parallel_state.get_data_parallel_world_size()
-                    if dp_ws > 1:
-                        torch.distributed.all_reduce(
-                            _frac,
-                            group=parallel_state.get_data_parallel_group())
-                        _frac = _frac / dp_ws
-                    _frac = _frac.item()
-                    _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
-                    _B_global = args.micro_batch_size * dp_ws * num_microbatches
-                    noise = torch.randn(1).item() * _sigma_b / _B_global
-                    target_frac = 1.0 - _dp_clip_pct / 100.0
-                    _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-                    C_current *= _math.exp(
-                        -_adapt_lr * (_frac + noise - target_frac))
-                    C_current = max(C_current, 1e-6)  # lower bound (prevent zero noise)
-                    C_current = min(C_current, C)      # upper bound (C_max)
-                    args.dp_clipping_norm_current = C_current
-
-                # Recompute clip factors with current C (same C for all microbatches)
-                if _dp_clip_pct != 0:
-                    clip_factors = torch.clamp(
-                        C_current / (raw_norms + 1e-6), max=1.0)
-
-                # Update config for noise calibration
-                config.dp_clipping_norm = C_current
+                    clip_factors = C_active / (raw_norms + 1e-6)
 
             # Log clip stats if requested (first microbatch only)
             if is_first and getattr(args, 'dp_log_clip_stats', False):
@@ -692,6 +670,32 @@ def _dp_sgd_ghost_forward_backward(
                    if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None)**0.5
     print(f'DEBUG pre-finalize: total_num_tokens={total_num_tokens.item()}, '
           f'main_grad_norm={_mg_norm:.4f}, params_with_inf={_n_inf}')
+
+    # Adaptive clipping: end-of-step C update from ALL microbatches' norms.
+    # Uses private geometric update (noise on fraction). Updated C applies
+    # to the NEXT step. Current step already used previous C.
+    _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
+    if _dp_clip_pct is not None and _dp_clip_pct != 0 and _adaptive_norms_list:
+        import math as _math
+        all_norms = torch.cat(_adaptive_norms_list)  # [B * K]
+        C_current = getattr(args, 'dp_clipping_norm_current', C)
+        _frac = (all_norms > C_current).float().mean()
+        dp_ws = parallel_state.get_data_parallel_world_size()
+        if dp_ws > 1:
+            torch.distributed.all_reduce(
+                _frac, group=parallel_state.get_data_parallel_group())
+            _frac = _frac / dp_ws
+        _frac = _frac.item()
+        _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
+        _B_global = args.micro_batch_size * dp_ws * num_microbatches
+        noise = torch.randn(1).item() * _sigma_b / _B_global
+        target_frac = 1.0 - _dp_clip_pct / 100.0
+        _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
+        C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
+        C_current = max(C_current, 1e-6)
+        C_current = min(C_current, C)
+        args.dp_clipping_norm_current = C_current
+        config.dp_clipping_norm = C_current
 
     # Pass total_num_tokens to noise injection for exact calibration.
     # The gradient backward scalar divides by T (actual tokens per microbatch),
