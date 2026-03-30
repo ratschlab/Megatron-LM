@@ -566,9 +566,15 @@ def _dp_sgd_ghost_forward_backward(
                     # C_active may be inf (first step) or a proper value.
                     C_current = getattr(args, 'dp_clipping_norm_current', C)
                     if C_current == float('inf'):
-                        # First microbatch ever: initialize from percentile
+                        # First microbatch ever: initialize from percentile with jitter.
+                        # Jitter provides privacy for this one-time initialization.
+                        # Deterministic seed so all DP ranks get the same C.
+                        _init_rng = torch.Generator()
+                        _init_rng.manual_seed(42)
+                        _jittered_pct = _dp_clip_pct + torch.randn(1, generator=_init_rng).item() * 5.0
+                        _jittered_pct = max(1.0, min(99.0, _jittered_pct))
                         C_current = torch.quantile(
-                            raw_norms, _dp_clip_pct / 100.0).item()
+                            raw_norms, _jittered_pct / 100.0).item()
                         C_current = max(C_current, 1e-6)
                         args.dp_clipping_norm_current = C_current
                     clip_factors = torch.clamp(
@@ -715,7 +721,7 @@ def _dp_sgd_ghost_forward_backward(
         _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_next = C_current * _math.exp(-_adapt_lr * (_frac + noise - target_frac))
+        C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
         C_next = max(C_next, 1e-6)
         args.dp_clipping_norm_current = C_next  # for NEXT step
 
@@ -1095,13 +1101,17 @@ def _dp_sgd_pipeline_forward_backward(
                     rn = ghost_ctx.get_raw_norms(microbatch_id=k)
                     clip_factors_list[k] = C_current / (rn + 1e-6)
             elif C_current == float('inf'):
-                # First step: initialize C from percentile of all microbatches
+                # First step: initialize C from jittered percentile of all microbatches
                 all_norms = torch.cat([
                     ghost_ctx.get_raw_norms(microbatch_id=k)
                     for k in range(num_microbatches)
                 ])
+                _init_rng = torch.Generator()
+                _init_rng.manual_seed(42)
+                _jittered_pct = _dp_clip_pct + torch.randn(1, generator=_init_rng).item() * 5.0
+                _jittered_pct = max(1.0, min(99.0, _jittered_pct))
                 C_current = torch.quantile(
-                    all_norms, _dp_clip_pct / 100.0).item()
+                    all_norms, _jittered_pct / 100.0).item()
                 C_current = max(C_current, 1e-6)
                 args.dp_clipping_norm_current = C_current
                 # Recompute clip_factors with initialized C
@@ -1227,7 +1237,7 @@ def _dp_sgd_pipeline_forward_backward(
         _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_next = C_current * _math.exp(-_adapt_lr * (_frac + noise - target_frac))
+        C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
         C_next = max(C_next, 1e-6)
         args.dp_clipping_norm_current = C_next
 
