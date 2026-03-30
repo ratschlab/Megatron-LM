@@ -1643,6 +1643,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Initialize adaptive clipping state
         if not hasattr(args, 'dp_clipping_norm_current'):
             args.dp_clipping_norm_current = args.dp_clipping_norm
+            # With adaptive clipping: step 1 clips at --dp-clipping-norm (C_max).
+            # End of step 1 initializes C from the actual percentile.
+            # Step 2+ uses the adapted C. If --dp-clipping-norm is too small
+            # (e.g. default 1.0), step 1 clips aggressively — but the percentile
+            # initialization still sees the true norms (from Pass 1, before clipping).
 
         if args.dp_noise_seed is None:
             args.dp_noise_seed = torch.randint(0, 2**31 - 1, (1,)).item()

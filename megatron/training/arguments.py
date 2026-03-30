@@ -2543,7 +2543,9 @@ def _add_dp_sgd_args(parser):
                        help='Set clipping norm C adaptively from per-example gradient '
                        'norm percentile. 0=automatic clipping (Bu et al.), '
                        '50=median (Andrew et al.), 90=conservative. '
-                       'When set, --dp-clipping-norm becomes initial/max C. '
+                       'When set, --dp-clipping-norm becomes max C (cap). '
+                       'Set --dp-clipping-norm large (e.g. 1e6) so the first step '
+                       'is not over-clipped before C adapts. '
                        'Uses private geometric update (noise on clipped fraction).')
     group.add_argument('--dp-clipping-adapt-lr', type=float, default=0.2,
                        help='Learning rate for adaptive C geometric update.')

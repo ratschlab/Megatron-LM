@@ -685,7 +685,10 @@ def _dp_sgd_ghost_forward_backward(
         # This avoids wasting many steps converging from a bad --dp-clipping-norm.
         # Subsequent steps use private geometric update.
         if not getattr(args, '_dp_adaptive_C_initialized', False):
-            # Gather all norms across DP ranks for global percentile
+            # First step: initialize C from noisy percentile of gradient norms.
+            # Jitter the percentile target by +/-5% for privacy (the exact
+            # percentile leaks batch information; jitter drowns the single-
+            # example effect for any reasonable batch size).
             dp_ws = parallel_state.get_data_parallel_world_size()
             if dp_ws > 1:
                 gathered = [torch.zeros_like(all_norms) for _ in range(dp_ws)]
@@ -695,8 +698,15 @@ def _dp_sgd_ghost_forward_backward(
                 global_norms = torch.cat(gathered)
             else:
                 global_norms = all_norms
+            # Jitter: target percentile +/- N(0, 5%) clamped to [1%, 99%]
+            # Jitter must be identical across all ranks (same C everywhere).
+            # Use a fixed seed derived from the step count.
+            _jitter_rng = torch.Generator()
+            _jitter_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 42)
+            jittered_pct = _dp_clip_pct + torch.randn(1, generator=_jitter_rng).item() * 5.0
+            jittered_pct = max(1.0, min(99.0, jittered_pct))
             C_current = torch.quantile(
-                global_norms, _dp_clip_pct / 100.0).item()
+                global_norms, jittered_pct / 100.0).item()
             C_current = max(C_current, 1e-6)
             C_current = min(C_current, C)
             args._dp_adaptive_C_initialized = True
@@ -711,7 +721,10 @@ def _dp_sgd_ghost_forward_backward(
             _frac = _frac.item()
             _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
             _B_global = args.micro_batch_size * dp_ws * num_microbatches
-            noise = torch.randn(1).item() * _sigma_b / _B_global
+            # Noise must be identical across all DP ranks (same C update everywhere)
+            _noise_rng = torch.Generator()
+            _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
+            noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
             _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
             C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
             C_current = max(C_current, 1e-6)
@@ -1194,7 +1207,7 @@ def _dp_sgd_pipeline_forward_backward(
         target_frac = 1.0 - _dp_clip_pct / 100.0
 
         if not getattr(args, '_dp_adaptive_C_initialized', False):
-            # First step: initialize from actual percentile
+            # First step: initialize from noisy percentile (jitter +/-5%)
             dp_ws = parallel_state.get_data_parallel_world_size()
             if dp_ws > 1:
                 gathered = [torch.zeros_like(all_raw_norms) for _ in range(dp_ws)]
@@ -1204,8 +1217,14 @@ def _dp_sgd_pipeline_forward_backward(
                 global_norms = torch.cat(gathered)
             else:
                 global_norms = all_raw_norms
+            # Jitter must be identical across all ranks (same C everywhere).
+            # Use a fixed seed derived from the step count.
+            _jitter_rng = torch.Generator()
+            _jitter_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 42)
+            jittered_pct = _dp_clip_pct + torch.randn(1, generator=_jitter_rng).item() * 5.0
+            jittered_pct = max(1.0, min(99.0, jittered_pct))
             C_current = torch.quantile(
-                global_norms, _dp_clip_pct / 100.0).item()
+                global_norms, jittered_pct / 100.0).item()
             C_current = max(C_current, 1e-6)
             C_current = min(C_current, C)
             args._dp_adaptive_C_initialized = True
@@ -1219,7 +1238,10 @@ def _dp_sgd_pipeline_forward_backward(
             _frac = _frac.item()
             _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
             _B_global = args.micro_batch_size * dp_ws * num_microbatches
-            noise = torch.randn(1).item() * _sigma_b / _B_global
+            # Noise must be identical across all DP ranks (same C update everywhere)
+            _noise_rng = torch.Generator()
+            _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
+            noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
             _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
             C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
             C_current = max(C_current, 1e-6)
