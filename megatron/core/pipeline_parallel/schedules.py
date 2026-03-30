@@ -679,23 +679,54 @@ def _dp_sgd_ghost_forward_backward(
         import math as _math
         all_norms = torch.cat(_adaptive_norms_list)  # [B * K]
         C_current = getattr(args, 'dp_clipping_norm_current', C)
-        _frac = (all_norms > C_current).float().mean()
-        dp_ws = parallel_state.get_data_parallel_world_size()
-        if dp_ws > 1:
-            torch.distributed.all_reduce(
-                _frac, group=parallel_state.get_data_parallel_group())
-            _frac = _frac / dp_ws
-        _frac = _frac.item()
-        _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
-        _B_global = args.micro_batch_size * dp_ws * num_microbatches
-        noise = torch.randn(1).item() * _sigma_b / _B_global
         target_frac = 1.0 - _dp_clip_pct / 100.0
-        _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
-        C_current = max(C_current, 1e-6)
-        C_current = min(C_current, C)
+
+        # First step: initialize C from actual percentile (non-private warmup).
+        # This avoids wasting many steps converging from a bad --dp-clipping-norm.
+        # Subsequent steps use private geometric update.
+        if not getattr(args, '_dp_adaptive_C_initialized', False):
+            # Gather all norms across DP ranks for global percentile
+            dp_ws = parallel_state.get_data_parallel_world_size()
+            if dp_ws > 1:
+                gathered = [torch.zeros_like(all_norms) for _ in range(dp_ws)]
+                torch.distributed.all_gather(
+                    gathered, all_norms,
+                    group=parallel_state.get_data_parallel_group())
+                global_norms = torch.cat(gathered)
+            else:
+                global_norms = all_norms
+            C_current = torch.quantile(
+                global_norms, _dp_clip_pct / 100.0).item()
+            C_current = max(C_current, 1e-6)
+            C_current = min(C_current, C)
+            args._dp_adaptive_C_initialized = True
+        else:
+            # Private geometric update (Andrew et al.)
+            _frac = (all_norms > C_current).float().mean()
+            dp_ws = parallel_state.get_data_parallel_world_size()
+            if dp_ws > 1:
+                torch.distributed.all_reduce(
+                    _frac, group=parallel_state.get_data_parallel_group())
+                _frac = _frac / dp_ws
+            _frac = _frac.item()
+            _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
+            _B_global = args.micro_batch_size * dp_ws * num_microbatches
+            noise = torch.randn(1).item() * _sigma_b / _B_global
+            _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
+            C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
+            C_current = max(C_current, 1e-6)
+            C_current = min(C_current, C)
+
         args.dp_clipping_norm_current = C_current
         config.dp_clipping_norm = C_current
+
+        # Log adaptive C tracking: actual fraction clipped vs target
+        actual_frac = (all_norms > C_current).float().mean().item()
+        if args.rank == 0:
+            print(f'DP-SGD adaptive C: C={C_current:.4f}, '
+                  f'frac_clipped={actual_frac:.3f} (target={target_frac:.3f}), '
+                  f'norm p50={all_norms.median():.2f} p90={all_norms.quantile(0.9):.2f} '
+                  f'max={all_norms.max():.2f}')
 
     # Pass total_num_tokens to noise injection for exact calibration.
     # The gradient backward scalar divides by T (actual tokens per microbatch),
@@ -1160,23 +1191,50 @@ def _dp_sgd_pipeline_forward_backward(
             for k in range(num_microbatches)
         ])
         C_current = getattr(args, 'dp_clipping_norm_current', C)
-        _frac = (all_raw_norms > C_current).float().mean()
-        dp_ws = parallel_state.get_data_parallel_world_size()
-        if dp_ws > 1:
-            torch.distributed.all_reduce(
-                _frac, group=parallel_state.get_data_parallel_group())
-            _frac = _frac / dp_ws
-        _frac = _frac.item()
-        _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
-        _B_global = args.micro_batch_size * dp_ws * num_microbatches
-        noise = torch.randn(1).item() * _sigma_b / _B_global
         target_frac = 1.0 - _dp_clip_pct / 100.0
-        _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
-        C_current = max(C_current, 1e-6)
-        C_current = min(C_current, C)
+
+        if not getattr(args, '_dp_adaptive_C_initialized', False):
+            # First step: initialize from actual percentile
+            dp_ws = parallel_state.get_data_parallel_world_size()
+            if dp_ws > 1:
+                gathered = [torch.zeros_like(all_raw_norms) for _ in range(dp_ws)]
+                torch.distributed.all_gather(
+                    gathered, all_raw_norms,
+                    group=parallel_state.get_data_parallel_group())
+                global_norms = torch.cat(gathered)
+            else:
+                global_norms = all_raw_norms
+            C_current = torch.quantile(
+                global_norms, _dp_clip_pct / 100.0).item()
+            C_current = max(C_current, 1e-6)
+            C_current = min(C_current, C)
+            args._dp_adaptive_C_initialized = True
+        else:
+            _frac = (all_raw_norms > C_current).float().mean()
+            dp_ws = parallel_state.get_data_parallel_world_size()
+            if dp_ws > 1:
+                torch.distributed.all_reduce(
+                    _frac, group=parallel_state.get_data_parallel_group())
+                _frac = _frac / dp_ws
+            _frac = _frac.item()
+            _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
+            _B_global = args.micro_batch_size * dp_ws * num_microbatches
+            noise = torch.randn(1).item() * _sigma_b / _B_global
+            _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
+            C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
+            C_current = max(C_current, 1e-6)
+            C_current = min(C_current, C)
+
         args.dp_clipping_norm_current = C_current
         config.dp_clipping_norm = C_current
+
+        actual_frac = (all_raw_norms > C_current).float().mean().item()
+        if args.rank == 0:
+            print(f'DP-SGD adaptive C: C={C_current:.4f}, '
+                  f'frac_clipped={actual_frac:.3f} (target={target_frac:.3f}), '
+                  f'norm p50={all_raw_norms.median():.2f} '
+                  f'p90={all_raw_norms.quantile(0.9):.2f} '
+                  f'max={all_raw_norms.max():.2f}')
 
     # Set total_num_tokens for exact noise calibration (matches PP=1 at line 656).
     # Only pipeline-last-stage accumulates num_tokens; other stages get 0.
