@@ -687,17 +687,21 @@ def _dp_sgd_ghost_forward_backward(
     print(f'DEBUG pre-finalize: total_num_tokens={total_num_tokens.item()}, '
           f'main_grad_norm={_mg_norm:.4f}, params_with_inf={_n_inf}')
 
-    # Adaptive clipping: end-of-step C update from ALL microbatches' norms.
-    # Private geometric update (noise on fraction). Updated C is used by the
-    # NEXT step. Current step already used C (set in-loop or from previous step).
+    # Adaptive clipping: set noise C to the C actually used for clipping this step,
+    # then update C for the next step via private geometric update.
     _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
+    if _dp_clip_pct is not None and _dp_clip_pct != 0:
+        # Noise must use the C that was used for clipping THIS step
+        C_this_step = getattr(args, 'dp_clipping_norm_current', C)
+        config.dp_clipping_norm = C_this_step
+
     if _dp_clip_pct is not None and _dp_clip_pct != 0 and _adaptive_norms_list:
         import math as _math
         all_norms = torch.cat(_adaptive_norms_list)  # [B * K]
         C_current = getattr(args, 'dp_clipping_norm_current', C)
         target_frac = 1.0 - _dp_clip_pct / 100.0
 
-        # Private geometric update (Andrew et al.)
+        # Private geometric update (Andrew et al.) for NEXT step
         _frac = (all_norms > C_current).float().mean()
         dp_ws = parallel_state.get_data_parallel_world_size()
         if dp_ws > 1:
@@ -707,21 +711,18 @@ def _dp_sgd_ghost_forward_backward(
         _frac = _frac.item()
         _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
         _B_global = args.micro_batch_size * dp_ws * num_microbatches
-        # Noise must be identical across all DP ranks (same C update everywhere)
         _noise_rng = torch.Generator()
         _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
-        C_current = max(C_current, 1e-6)
-        # No C_max cap — adaptive C is independent of --dp-clipping-norm
-        args.dp_clipping_norm_current = C_current
-        config.dp_clipping_norm = C_current
+        C_next = C_current * _math.exp(-_adapt_lr * (_frac + noise - target_frac))
+        C_next = max(C_next, 1e-6)
+        args.dp_clipping_norm_current = C_next  # for NEXT step
 
-        # Log adaptive C tracking: actual fraction clipped vs target
+        # Log: show C used THIS step and the updated C for next step
         actual_frac = (all_norms > C_current).float().mean().item()
         if args.rank == 0:
-            print(f'DP-SGD adaptive C: C={C_current:.4f}, '
+            print(f'DP-SGD adaptive C: C_used={C_current:.4f}, C_next={C_next:.4f}, '
                   f'frac_clipped={actual_frac:.3f} (target={target_frac:.3f}), '
                   f'norm p50={all_norms.median():.2f} p90={all_norms.quantile(0.9):.2f} '
                   f'max={all_norms.max():.2f}')
@@ -1198,8 +1199,12 @@ def _dp_sgd_pipeline_forward_backward(
 
     # ===== AFTER BOTH PASSES: finalize =====
 
-    # Adaptive clipping: end-of-step C update from ALL microbatches' norms.
+    # Adaptive clipping: noise uses C from THIS step, then update for NEXT step.
     _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
+    if _dp_clip_pct is not None and _dp_clip_pct != 0:
+        C_this_step = getattr(args, 'dp_clipping_norm_current', C)
+        config.dp_clipping_norm = C_this_step  # for noise injection
+
     if _dp_clip_pct is not None and _dp_clip_pct != 0:
         import math as _math
         all_raw_norms = torch.cat([
@@ -1209,7 +1214,6 @@ def _dp_sgd_pipeline_forward_backward(
         C_current = getattr(args, 'dp_clipping_norm_current', C)
         target_frac = 1.0 - _dp_clip_pct / 100.0
 
-        # Private geometric update (Andrew et al.)
         _frac = (all_raw_norms > C_current).float().mean()
         dp_ws = parallel_state.get_data_parallel_world_size()
         if dp_ws > 1:
@@ -1223,14 +1227,13 @@ def _dp_sgd_pipeline_forward_backward(
         _noise_rng.manual_seed(getattr(args, 'curr_iteration', 0) + 7)
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_current *= _math.exp(-_adapt_lr * (_frac + noise - target_frac))
-        C_current = max(C_current, 1e-6)
-        args.dp_clipping_norm_current = C_current
-        config.dp_clipping_norm = C_current
+        C_next = C_current * _math.exp(-_adapt_lr * (_frac + noise - target_frac))
+        C_next = max(C_next, 1e-6)
+        args.dp_clipping_norm_current = C_next
 
         actual_frac = (all_raw_norms > C_current).float().mean().item()
         if args.rank == 0:
-            print(f'DP-SGD adaptive C: C={C_current:.4f}, '
+            print(f'DP-SGD adaptive C: C_used={C_current:.4f}, C_next={C_next:.4f}, '
                   f'frac_clipped={actual_frac:.3f} (target={target_frac:.3f}), '
                   f'norm p50={all_raw_norms.median():.2f} '
                   f'p90={all_raw_norms.quantile(0.9):.2f} '
