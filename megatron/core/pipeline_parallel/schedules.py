@@ -539,7 +539,9 @@ def _dp_sgd_ghost_forward_backward(
 
             clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
-            # Adaptive clipping: update C from gradient norm percentile
+            # Adaptive clipping: update C from gradient norm percentile.
+            # Only update C on the FIRST microbatch — all microbatches in a
+            # step use the same C. The geometric update is per-step, not per-microbatch.
             _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
             if _dp_clip_pct is not None:
                 import math as _math
@@ -549,27 +551,29 @@ def _dp_sgd_ghost_forward_backward(
                 if _dp_clip_pct == 0:
                     # Bu et al. automatic clipping: normalize all to unit norm × C
                     clip_factors = C_current / (raw_norms + 1e-6)
-                else:
-                    # Private geometric update (Andrew et al.)
-                    frac_clipped = (raw_norms > C_current).float().mean()
-                    # All-reduce across DP ranks for global fraction
+                elif is_first:
+                    # Private geometric update (Andrew et al.) — once per step
+                    _frac = (raw_norms > C_current).float().mean()
                     dp_ws = parallel_state.get_data_parallel_world_size()
                     if dp_ws > 1:
                         torch.distributed.all_reduce(
-                            frac_clipped,
+                            _frac,
                             group=parallel_state.get_data_parallel_group())
-                        frac_clipped = frac_clipped / dp_ws
-                    frac_clipped = frac_clipped.item()
-                    # Noisy update for privacy
+                        _frac = _frac / dp_ws
+                    _frac = _frac.item()
                     _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
                     _B_global = args.micro_batch_size * dp_ws * num_microbatches
                     noise = torch.randn(1).item() * _sigma_b / _B_global
                     target_frac = 1.0 - _dp_clip_pct / 100.0
                     _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
                     C_current *= _math.exp(
-                        -_adapt_lr * (frac_clipped + noise - target_frac))
-                    C_current = min(C_current, C)  # cap at C_max
+                        -_adapt_lr * (_frac + noise - target_frac))
+                    C_current = max(C_current, 1e-6)  # lower bound (prevent zero noise)
+                    C_current = min(C_current, C)      # upper bound (C_max)
                     args.dp_clipping_norm_current = C_current
+
+                # Recompute clip factors with current C (same C for all microbatches)
+                if _dp_clip_pct != 0:
                     clip_factors = torch.clamp(
                         C_current / (raw_norms + 1e-6), max=1.0)
 
