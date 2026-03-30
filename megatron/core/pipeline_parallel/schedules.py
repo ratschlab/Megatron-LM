@@ -576,6 +576,7 @@ def _dp_sgd_ghost_forward_backward(
                         C_current = torch.quantile(
                             raw_norms, _jittered_pct / 100.0).item()
                         C_current = max(C_current, 1e-6)
+                        C_current = min(C_current, C)  # cap at C_max
                         args.dp_clipping_norm_current = C_current
                     clip_factors = torch.clamp(
                         C_current / (raw_norms + 1e-6), max=1.0)
@@ -1120,6 +1121,7 @@ def _dp_sgd_pipeline_forward_backward(
                 C_current = torch.quantile(
                     all_norms, _jittered_pct / 100.0).item()
                 C_current = max(C_current, 1e-6)
+                C_current = min(C_current, C)  # cap at C_max
                 args.dp_clipping_norm_current = C_current
                 # Recompute clip_factors with initialized C
                 for k in range(len(clip_factors_list)):
@@ -1250,6 +1252,7 @@ def _dp_sgd_pipeline_forward_backward(
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
         C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
         C_next = max(C_next, 1e-6)
+        C_next = min(C_next, C)  # cap at C_max (--dp-clipping-norm)
         args.dp_clipping_norm_current = C_next
 
         actual_frac = (all_raw_norms > C_current).float().mean().item()

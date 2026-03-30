@@ -1742,15 +1742,33 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # DP-SGD: Update privacy accountant after each step.
         # Skip when sigma=0 (no noise = infinite privacy cost, nothing to track).
         if _dp_accountant is not None and skipped_iter == 0 and args.dp_noise_multiplier > 0:
+            import math as _math
             from dp_accounting import dp_event as dp_evt
             global_batch_size = (mpu.get_data_parallel_world_size()
                                  * args.micro_batch_size
                                  * get_num_microbatches())
             sampling_probability = global_batch_size / args.dp_num_dataset_examples
+
+            # Adjust sigma for adaptive clipping/per-layer threshold privacy budget.
+            # The private fraction release (noisy clipped count) costs additional
+            # privacy. sigma_new = (sigma^-2 - (2*sigma_b)^-2)^(-1/2).
+            _sigma_for_accounting = args.dp_noise_multiplier
+            if getattr(args, 'dp_clipping_percentile', None) is not None and \
+                    getattr(args, 'dp_clipping_percentile', 0) != 0:
+                _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
+                _sigma = args.dp_noise_multiplier
+                _sigma_new_sq = 1.0 / (1.0 / _sigma**2 - 1.0 / (2.0 * _sigma_b)**2)
+                if _sigma_new_sq > 0:
+                    _sigma_for_accounting = _math.sqrt(_sigma_new_sq)
+                else:
+                    print_rank_0(
+                        f'WARNING: adaptive clipping budget exhausts total budget '
+                        f'(sigma={_sigma}, sigma_b={_sigma_b}). Using raw sigma.')
+
             _dp_accountant.compose(
                 dp_evt.PoissonSampledDpEvent(
                     sampling_probability=sampling_probability,
-                    event=dp_evt.GaussianDpEvent(args.dp_noise_multiplier),
+                    event=dp_evt.GaussianDpEvent(_sigma_for_accounting),
                 )
             )
             # Add pre-resume epsilon (from checkpoint) to post-resume epsilon (from accountant).
