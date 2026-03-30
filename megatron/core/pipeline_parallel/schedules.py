@@ -856,32 +856,59 @@ def _dp_sgd_pipeline_forward_backward(
     # Broadcasting inside forward_step would deadlock with staggered 1F1B.
     _packing_mode = False
     if parallel_state.is_pipeline_first_stage():
-        # First stage pre-reads boundaries from the data iterator
+        # First stage pre-reads boundaries from the data iterator.
+        # Only TP rank 0 has a data iterator; others have None.
         src_iter = replay_data_iterator[0] if isinstance(replay_data_iterator, list) \
                    else replay_data_iterator
-        # Peek at first microbatch to check for unit_boundaries
-        try:
-            first_batch = next(src_iter)
-            if 'unit_boundaries' in first_batch:
-                _packing_mode = True
-                ghost_ctx.set_unit_boundaries(0, first_batch['unit_boundaries'])
-                # Pre-read remaining microbatches
-                for k in range(1, num_microbatches):
-                    batch = next(src_iter)
-                    ghost_ctx.set_unit_boundaries(k, batch['unit_boundaries'])
-            src_iter.rewind()
-        except (StopIteration, KeyError):
-            pass
+        if src_iter is not None:
+            # Peek at first microbatch to check for unit_boundaries
+            try:
+                first_batch = next(src_iter)
+                if 'unit_boundaries' in first_batch:
+                    _packing_mode = True
+                    ghost_ctx.set_unit_boundaries(0, first_batch['unit_boundaries'])
+                    # Pre-read remaining microbatches
+                    for k in range(1, num_microbatches):
+                        batch = next(src_iter)
+                        ghost_ctx.set_unit_boundaries(k, batch['unit_boundaries'])
+                src_iter.rewind()
+            except (StopIteration, KeyError):
+                pass
 
-    # Broadcast packing mode flag + boundaries to all PP stages
+    # Broadcast packing mode flag to all PP stages so they know whether to participate.
+    # Without this, only PP first stage sets _packing_mode=True, and the boundary
+    # broadcast below is a collective that deadlocks when other stages skip it.
+    if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        _packing_flag = torch.tensor([int(_packing_mode)], dtype=torch.long,
+                                      device=torch.cuda.current_device())
+        torch.distributed.broadcast(
+            _packing_flag,
+            src=parallel_state.get_pipeline_model_parallel_first_rank(),
+            group=parallel_state.get_pipeline_model_parallel_group())
+        _packing_mode = bool(_packing_flag.item())
+
+    # Broadcast packing mode boundaries to all PP stages
     if parallel_state.get_pipeline_model_parallel_world_size() > 1 and _packing_mode:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
+        # Broadcast D_max from first stage so non-first stages allocate correct shape
+        if parallel_state.is_pipeline_first_stage():
+            _first_boundaries = ghost_ctx.get_unit_boundaries(0)
+            _d_max_tensor = torch.tensor([_first_boundaries.shape[1]], dtype=torch.long,
+                                          device=torch.cuda.current_device())
+        else:
+            _d_max_tensor = torch.tensor([0], dtype=torch.long,
+                                          device=torch.cuda.current_device())
+        torch.distributed.broadcast(
+            _d_max_tensor,
+            src=parallel_state.get_pipeline_model_parallel_first_rank(),
+            group=pp_group)
+        D_max = _d_max_tensor.item()
+
         for k in range(num_microbatches):
-            boundaries_k = ghost_ctx.get_unit_boundaries(k) if _packing_mode else None
+            boundaries_k = ghost_ctx.get_unit_boundaries(k) if parallel_state.is_pipeline_first_stage() else None
             if not parallel_state.is_pipeline_first_stage():
-                # Non-first stages allocate empty tensors for the broadcast
+                # Non-first stages allocate tensors matching the actual D_max
                 B = args.micro_batch_size
-                D_max = 16  # TODO: make configurable
                 boundaries_k = torch.zeros(B, D_max, 2, dtype=torch.long,
                                            device=torch.cuda.current_device())
             torch.distributed.broadcast(boundaries_k,
