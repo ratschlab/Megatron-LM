@@ -539,13 +539,52 @@ def _dp_sgd_ghost_forward_backward(
 
             clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
+            # Adaptive clipping: update C from gradient norm percentile
+            _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
+            if _dp_clip_pct is not None:
+                import math as _math
+                raw_norms = ghost_ctx.get_raw_norms()
+                C_current = getattr(args, 'dp_clipping_norm_current', C)
+
+                if _dp_clip_pct == 0:
+                    # Bu et al. automatic clipping: normalize all to unit norm × C
+                    clip_factors = C_current / (raw_norms + 1e-6)
+                else:
+                    # Private geometric update (Andrew et al.)
+                    frac_clipped = (raw_norms > C_current).float().mean()
+                    # All-reduce across DP ranks for global fraction
+                    dp_ws = parallel_state.get_data_parallel_world_size()
+                    if dp_ws > 1:
+                        torch.distributed.all_reduce(
+                            frac_clipped,
+                            group=parallel_state.get_data_parallel_group())
+                        frac_clipped = frac_clipped / dp_ws
+                    frac_clipped = frac_clipped.item()
+                    # Noisy update for privacy
+                    _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
+                    _B_global = args.micro_batch_size * dp_ws * num_microbatches
+                    noise = torch.randn(1).item() * _sigma_b / _B_global
+                    target_frac = 1.0 - _dp_clip_pct / 100.0
+                    _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
+                    C_current *= _math.exp(
+                        -_adapt_lr * (frac_clipped + noise - target_frac))
+                    C_current = min(C_current, C)  # cap at C_max
+                    args.dp_clipping_norm_current = C_current
+                    clip_factors = torch.clamp(
+                        C_current / (raw_norms + 1e-6), max=1.0)
+
+                # Update config for noise calibration
+                config.dp_clipping_norm = C_current
+
             # Log clip stats if requested (first microbatch only)
             if is_first and getattr(args, 'dp_log_clip_stats', False):
                 all_norms_list = ghost_ctx._per_example_norm_sq_sharded + ghost_ctx._per_example_norm_sq_replicated
                 if all_norms_list:
                     norms = torch.stack(all_norms_list).sum(dim=0).sqrt()
                     frac_clipped = (clip_factors < 1.0).float().mean().item()
+                    _C_log = getattr(args, 'dp_clipping_norm_current', C)
                     print(f'DP-SGD clip stats: frac_clipped={frac_clipped:.2f}, '
+                          f'C={_C_log:.4f}, '
                           f'norm min={norms.min():.2f} med={norms.median():.2f} '
                           f'max={norms.max():.2f}, '
                           f'clip min={clip_factors.min():.4f} max={clip_factors.max():.4f}')

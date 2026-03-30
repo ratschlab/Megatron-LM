@@ -441,8 +441,26 @@ class GhostClippingContext:
             )
 
         norms = total_sq.sqrt()
+        # Save raw norms for adaptive clipping (before clamping).
+        # Accessed via get_raw_norms() after compute_clip_factors() returns.
+        if not hasattr(self, '_raw_norms'):
+            self._raw_norms = {}
+        self._raw_norms[microbatch_id] = norms.detach()
         # clip_factor = min(1, C / ||g||). Shape: [B] or [B, D_max].
         return torch.clamp(self.C / (norms + 1e-6), max=1.0)
+
+    def get_raw_norms(self, microbatch_id: int = 0) -> torch.Tensor:
+        """Return per-example gradient norms [B] for a microbatch.
+
+        Must be called AFTER compute_clip_factors() which aggregates norms
+        across TP and PP ranks. Used by adaptive clipping to set C from the
+        gradient norm distribution.
+        """
+        assert hasattr(self, '_raw_norms') and microbatch_id in self._raw_norms, (
+            f"No raw norms for microbatch {microbatch_id}. "
+            f"Call compute_clip_factors() first."
+        )
+        return self._raw_norms[microbatch_id]
 
     def compute_clip_factors_all_microbatches(self) -> List[torch.Tensor]:
         """Compute clip factors for all microbatches (PP>1 path).

@@ -1640,6 +1640,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
         # Generate random base seed for DP noise if not specified or restored.
         # This seed is serialized in checkpoints for resume correctness.
+        # Initialize adaptive clipping state
+        if not hasattr(args, 'dp_clipping_norm_current'):
+            args.dp_clipping_norm_current = args.dp_clipping_norm
+
         if args.dp_noise_seed is None:
             args.dp_noise_seed = torch.randint(0, 2**31 - 1, (1,)).item()
             # Broadcast from rank 0 to ensure all ranks use the same base seed.

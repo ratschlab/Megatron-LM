@@ -2539,4 +2539,12 @@ def _add_dp_sgd_args(parser):
                        'instead of fixed N_batch. For experiments proving DP correctness '
                        '(bit-identical to non-DP when sigma=0, C=inf). Production DP '
                        'should use the default N_batch to avoid leaking batch composition.')
+    group.add_argument('--dp-clipping-percentile', type=int, default=None,
+                       help='Set clipping norm C adaptively from per-example gradient '
+                       'norm percentile. 0=automatic clipping (Bu et al.), '
+                       '50=median (Andrew et al.), 90=conservative. '
+                       'When set, --dp-clipping-norm becomes initial/max C. '
+                       'Uses private geometric update (noise on clipped fraction).')
+    group.add_argument('--dp-clipping-adapt-lr', type=float, default=0.2,
+                       help='Learning rate for adaptive C geometric update.')
     return parser
