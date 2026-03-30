@@ -479,6 +479,9 @@ class GhostClippingContext:
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+        # Clear adaptive clipping norms
+        if hasattr(self, '_raw_norms'):
+            self._raw_norms.clear()
         # Clear deques
         self._input_norms_sq.clear()
         self._ln_xhat_dim_sq.clear()
