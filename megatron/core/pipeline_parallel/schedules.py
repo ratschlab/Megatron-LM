@@ -556,30 +556,11 @@ def _dp_sgd_ghost_forward_backward(
 
                 if _dp_clip_pct == 0:
                     # Bu et al. automatic clipping: normalize all to unit norm × C
-                    C_current = getattr(args, 'dp_clipping_norm_current', C)
-                    if C_current == float('inf'):
-                        C_current = 1.0  # convention for automatic clipping
-                        args.dp_clipping_norm_current = C_current
-                    clip_factors = C_current / (raw_norms + 1e-6)
+                    clip_factors = C_active / (raw_norms + 1e-6)
                 else:
-                    # Recompute clip_factors with current adaptive C.
-                    # C_active may be inf (first step) or a proper value.
-                    C_current = getattr(args, 'dp_clipping_norm_current', C)
-                    if C_current == float('inf'):
-                        # First microbatch ever: initialize from percentile with jitter.
-                        # Seed from dp_noise_seed (secret, cross-rank consistent).
-                        _init_rng = torch.Generator()
-                        _init_seed = getattr(args, 'dp_noise_seed', 42) + 99
-                        _init_rng.manual_seed(_init_seed)
-                        _jittered_pct = _dp_clip_pct + torch.randn(1, generator=_init_rng).item() * 5.0
-                        _jittered_pct = max(1.0, min(99.0, _jittered_pct))
-                        C_current = torch.quantile(
-                            raw_norms, _jittered_pct / 100.0).item()
-                        C_current = max(C_current, 1e-6)
-                        C_current = min(C_current, C)  # cap at C_max
-                        args.dp_clipping_norm_current = C_current
-                    clip_factors = torch.clamp(
-                        C_current / (raw_norms + 1e-6), max=1.0)
+                    # P>0: clip_factors already computed by ghost_ctx with C_active.
+                    # No recomputation needed — ghost_ctx.C = C_active = dp_clipping_norm_current.
+                    pass
 
             # Log clip stats if requested (first microbatch only)
             if is_first and getattr(args, 'dp_log_clip_stats', False):
@@ -701,8 +682,6 @@ def _dp_sgd_ghost_forward_backward(
         # Noise must use the C that was used for clipping THIS step.
         # Applies to BOTH P=0 (automatic, C=1.0) and P>0 (adaptive).
         C_this_step = getattr(args, 'dp_clipping_norm_current', C)
-        if C_this_step == float('inf'):
-            C_this_step = 1.0  # safety: inf should have been replaced in-loop
         config.dp_clipping_norm = C_this_step
 
     if _dp_clip_pct is not None and _dp_clip_pct != 0 and _adaptive_norms_list:
@@ -1099,35 +1078,13 @@ def _dp_sgd_pipeline_forward_backward(
         # Adaptive clipping for PP>1.
         _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
         if _dp_clip_pct is not None:
-            C_current = getattr(args, 'dp_clipping_norm_current', C)
             if _dp_clip_pct == 0:
-                if C_current == float('inf'):
-                    C_current = 1.0
-                    args.dp_clipping_norm_current = C_current
+                # Bu et al. automatic clipping: recompute without min(1,...) clamp
                 for k in range(len(clip_factors_list)):
                     rn = ghost_ctx.get_raw_norms(microbatch_id=k)
-                    clip_factors_list[k] = C_current / (rn + 1e-6)
-            elif C_current == float('inf'):
-                # First step: initialize C from jittered percentile of all microbatches
-                all_norms = torch.cat([
-                    ghost_ctx.get_raw_norms(microbatch_id=k)
-                    for k in range(num_microbatches)
-                ])
-                _init_rng = torch.Generator()
-                _init_seed = getattr(args, 'dp_noise_seed', 42) + 99
-                _init_rng.manual_seed(_init_seed)
-                _jittered_pct = _dp_clip_pct + torch.randn(1, generator=_init_rng).item() * 5.0
-                _jittered_pct = max(1.0, min(99.0, _jittered_pct))
-                C_current = torch.quantile(
-                    all_norms, _jittered_pct / 100.0).item()
-                C_current = max(C_current, 1e-6)
-                C_current = min(C_current, C)  # cap at C_max
-                args.dp_clipping_norm_current = C_current
-                # Recompute clip_factors with initialized C
-                for k in range(len(clip_factors_list)):
-                    rn = ghost_ctx.get_raw_norms(microbatch_id=k)
-                    clip_factors_list[k] = torch.clamp(
-                        C_current / (rn + 1e-6), max=1.0)
+                    clip_factors_list[k] = C_active / (rn + 1e-6)
+            # P>0: clip_factors already computed by ghost_ctx with C_active.
+            # No recomputation needed.
 
         # Sanitize clip factors
         for k in range(len(clip_factors_list)):

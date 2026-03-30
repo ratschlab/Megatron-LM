@@ -1642,15 +1642,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # This seed is serialized in checkpoints for resume correctness.
         # Initialize adaptive clipping state
         if not hasattr(args, 'dp_clipping_norm_current'):
-            if getattr(args, 'dp_clipping_percentile', None) is not None:
-                # Adaptive clipping: step 1 initializes C from the percentile
-                # BETWEEN Pass 1 and Pass 2 (in the microbatch loop). Set
-                # C_active = inf so Pass 1 doesn't clip (allows measuring true
-                # norms). The in-loop code detects uninitialized C and
-                # recomputes clip_factors before Pass 2.
-                args.dp_clipping_norm_current = float('inf')
-            else:
-                args.dp_clipping_norm_current = args.dp_clipping_norm
+            # Always start from --dp-clipping-norm. With adaptive clipping,
+            # the geometric update converges C to the target percentile within
+            # ~10-20 steps. No data-dependent initialization needed.
+            args.dp_clipping_norm_current = args.dp_clipping_norm
 
         if args.dp_noise_seed is None:
             args.dp_noise_seed = torch.randint(0, 2**31 - 1, (1,)).item()
@@ -1749,26 +1744,23 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                  * get_num_microbatches())
             sampling_probability = global_batch_size / args.dp_num_dataset_examples
 
-            # Adjust sigma for adaptive clipping/per-layer threshold privacy budget.
-            # The private fraction release (noisy clipped count) costs additional
-            # privacy. sigma_new = (sigma^-2 - (2*sigma_b)^-2)^(-1/2).
-            _sigma_for_accounting = args.dp_noise_multiplier
-            if getattr(args, 'dp_clipping_percentile', None) is not None and \
-                    getattr(args, 'dp_clipping_percentile', 0) != 0:
+            # Compose the DP event. When adaptive clipping is active (P>0),
+            # the threshold update also consumes privacy (noisy fraction release).
+            # Both mechanisms operate on the same Poisson-subsampled batch.
+            _dp_pct = getattr(args, 'dp_clipping_percentile', None)
+            if _dp_pct is not None and _dp_pct != 0:
                 _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
-                _sigma = args.dp_noise_multiplier
-                _sigma_new_sq = 1.0 / (1.0 / _sigma**2 - 1.0 / (2.0 * _sigma_b)**2)
-                if _sigma_new_sq > 0:
-                    _sigma_for_accounting = _math.sqrt(_sigma_new_sq)
-                else:
-                    print_rank_0(
-                        f'WARNING: adaptive clipping budget exhausts total budget '
-                        f'(sigma={_sigma}, sigma_b={_sigma_b}). Using raw sigma.')
+                step_event = dp_evt.ComposedDpEvent([
+                    dp_evt.GaussianDpEvent(args.dp_noise_multiplier),  # gradient noise
+                    dp_evt.GaussianDpEvent(_sigma_b),  # threshold fraction noise
+                ])
+            else:
+                step_event = dp_evt.GaussianDpEvent(args.dp_noise_multiplier)
 
             _dp_accountant.compose(
                 dp_evt.PoissonSampledDpEvent(
                     sampling_probability=sampling_probability,
-                    event=dp_evt.GaussianDpEvent(_sigma_for_accounting),
+                    event=step_event,
                 )
             )
             # Add pre-resume epsilon (from checkpoint) to post-resume epsilon (from accountant).
