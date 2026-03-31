@@ -460,9 +460,9 @@ def _dp_sgd_ghost_forward_backward(
     _diagnostic = os.environ.get('DP_SGD_DIAGNOSTIC', '0') == '1'
 
     args = get_args()
-    C = config.dp_clipping_norm  # C_max (fixed, from --dp-clipping-norm)
+    C_max = args.dp_clipping_norm  # C_max from CLI (immutable upper bound)
     # For adaptive clipping, use the running C_current (updated at end of each step)
-    C_active = getattr(args, 'dp_clipping_norm_current', C)
+    C_active = getattr(args, 'dp_clipping_norm_current', C_max)
     model_type = get_model_type(model)
 
     forward_data_store = []
@@ -488,6 +488,9 @@ def _dp_sgd_ghost_forward_backward(
     for k in range(num_microbatches):
         is_first = (k == 0)
         is_last = (k == num_microbatches - 1)
+
+        # Re-read C_active each microbatch (first-iteration init may update it)
+        C_active = getattr(args, 'dp_clipping_norm_current', C_max)
 
         # Wrap this microbatch's data for two-pass replay
         replay_iter = _ReplayableIterator(data_iterator)
@@ -545,10 +548,7 @@ def _dp_sgd_ghost_forward_backward(
 
             clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
-            # Adaptive clipping: compute C from this microbatch's norms and
-            # recompute clip_factors. Every microbatch uses the CURRENT C
-            # (no lag from previous step). For the first microbatch of the
-            # first step, this initializes C from the actual percentile.
+            # Adaptive clipping: use raw norms to compute clip_factors.
             _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
             if _dp_clip_pct is not None:
                 raw_norms = ghost_ctx.get_raw_norms()
@@ -558,9 +558,30 @@ def _dp_sgd_ghost_forward_backward(
                     # Bu et al. automatic clipping: normalize all to unit norm × C
                     clip_factors = C_active / (raw_norms + 1e-6)
                 else:
-                    # P>0: clip_factors already computed by ghost_ctx with C_active.
-                    # No recomputation needed — ghost_ctx.C = C_active = dp_clipping_norm_current.
-                    pass
+                    # First-iteration initialization: C_active is inf on step 0.
+                    # Set C from the target percentile of the observed norms so
+                    # clipping is immediately effective (no 100+ step convergence).
+                    if C_active == float('inf'):
+                        target_quantile = _dp_clip_pct / 100.0  # P=50 → median
+                        C_init = raw_norms.quantile(target_quantile).item()
+                        C_init = max(C_init, 1e-6)
+                        # Broadcast from DP rank 0 for cross-rank consistency
+                        # (with MBS=1, each rank sees different norms)
+                        _c_tensor = torch.tensor([C_init], dtype=torch.float32,
+                                                 device=raw_norms.device)
+                        dp_group = parallel_state.get_data_parallel_group()
+                        dp_src = parallel_state.get_data_parallel_src_rank()
+                        torch.distributed.broadcast(_c_tensor, src=dp_src,
+                                                    group=dp_group)
+                        C_init = _c_tensor.item()
+                        C_active = C_init
+                        args.dp_clipping_norm_current = C_init
+                        # Recompute clip_factors with the data-initialized C
+                        clip_factors = torch.clamp(C_active / raw_norms, max=1.0)
+                        if args.rank == 0:
+                            print(f'DP-SGD adaptive C: initialized from first-iteration '
+                                  f'norms: C={C_init:.4f} (P{_dp_clip_pct} of norms)')
+                    # else: clip_factors already computed by ghost_ctx with C_active
 
             # Log clip stats if requested (first microbatch only)
             if is_first and getattr(args, 'dp_log_clip_stats', False):
@@ -568,7 +589,7 @@ def _dp_sgd_ghost_forward_backward(
                 if all_norms_list:
                     norms = torch.stack(all_norms_list).sum(dim=0).sqrt()
                     frac_clipped = (clip_factors < 1.0).float().mean().item()
-                    _C_log = getattr(args, 'dp_clipping_norm_current', C)
+                    _C_log = getattr(args, 'dp_clipping_norm_current', C_max)
                     print(f'DP-SGD clip stats: frac_clipped={frac_clipped:.2f}, '
                           f'C={_C_log:.4f}, '
                           f'norm min={norms.min():.2f} med={norms.median():.2f} '
@@ -641,11 +662,12 @@ def _dp_sgd_ghost_forward_backward(
             print(f'DEBUG pre-pass2-bwd: main_grad_norm={_mg_pre:.4f}, inf={_n_inf_pre}')
 
         # Scaled loss: backward produces Σ(clip_i · g_i) → accumulates into main_grad
-        # Match standard Megatron scaling: divide by num_tokens and num_microbatches
-        # (same as forward_step lines 310-316 when calculate_per_token_loss=False).
-        # Without this, the backward scalar is ~32768x larger, causing FP16 overflow.
+        # per_example_losses are already per-token means (loss_func divides by token count).
+        # Divide only by num_microbatches (matching non-DP forward_step scaling).
+        # Do NOT divide by num_tokens — that would double-normalize since per_example
+        # losses are already means. finalize receives None (no further division).
         scaled_loss = (clip_factors.detach() * per_example_losses2).sum()
-        scaled_loss = scaled_loss / num_tokens2.float().clamp(min=1.0) / num_microbatches
+        scaled_loss = scaled_loss / num_microbatches
         backward_step(input_tensor, scaled_loss, output_tensor_grad, model_type, config)
 
         # Manually flush non-fused params (bias, embedding) from FP16 param.grad
@@ -681,13 +703,13 @@ def _dp_sgd_ghost_forward_backward(
     if _dp_clip_pct is not None:
         # Noise must use the C that was used for clipping THIS step.
         # Applies to BOTH P=0 (automatic, C=1.0) and P>0 (adaptive).
-        C_this_step = getattr(args, 'dp_clipping_norm_current', C)
+        C_this_step = getattr(args, 'dp_clipping_norm_current', C_max)
         config.dp_clipping_norm = C_this_step
 
     if _dp_clip_pct is not None and _dp_clip_pct != 0 and _adaptive_norms_list:
         import math as _math
         all_norms = torch.cat(_adaptive_norms_list)  # [B * K]
-        C_current = getattr(args, 'dp_clipping_norm_current', C)
+        C_current = getattr(args, 'dp_clipping_norm_current', C_max)
         target_frac = 1.0 - _dp_clip_pct / 100.0
 
         # Private geometric update (Andrew et al.) for NEXT step
@@ -708,7 +730,7 @@ def _dp_sgd_ghost_forward_backward(
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
         C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
         C_next = max(C_next, 1e-6)
-        C_next = min(C_next, C)  # cap at C_max (--dp-clipping-norm)
+        C_next = min(C_next, C_max)  # cap at C_max (--dp-clipping-norm)
         args.dp_clipping_norm_current = C_next  # for NEXT step
 
         # Log: show C used THIS step and the updated C for next step
@@ -725,21 +747,11 @@ def _dp_sgd_ghost_forward_backward(
     config._dp_total_num_tokens = total_num_tokens.item()
     config._dp_num_microbatches = num_microbatches
 
-    # Finalize (all-reduce + noise + normalization)
+    # Finalize (all-reduce + noise). Pass None for num_tokens — gradient is
+    # already normalized in Pass 2 (per-token mean / K), matching non-DP.
+    # No additional division needed (was double-dividing by N_batch before).
     if config.finalize_model_grads_func is not None:
-        use_num_tokens = getattr(args, 'dp_use_num_tokens_normalization', False)
-        if use_num_tokens:
-            # Match standard non-DP: pass None (num_tokens already divided in scaled_loss).
-            config.finalize_model_grads_func([model], None)
-        else:
-            # Production default: pass fixed N_batch for DP-safe normalization.
-            global_batch_size = (
-                args.micro_batch_size
-                * parallel_state.get_data_parallel_world_size()
-                * num_microbatches
-            )
-            n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
-            config.finalize_model_grads_func([model], n_batch)
+        config.finalize_model_grads_func([model], None)
 
     # Remove per-example losses from logging dict
     for entry in forward_data_store:
@@ -750,7 +762,8 @@ def _dp_sgd_ghost_forward_backward(
 
 
 def _make_dp_forward_step_wrapper(forward_step_func, pass_number, clip_factors_list=None,
-                                   microbatch_counter=None, num_tokens_accumulator=None):
+                                   microbatch_counter=None, num_tokens_accumulator=None,
+                                   num_microbatches=1):
     """Wrap forward_step_func to convert loss_func's 4-tuple return to 3-tuple.
 
     The problem: when loss_func returns 4 elements (scalar_loss, num_tokens,
@@ -810,6 +823,9 @@ def _make_dp_forward_step_wrapper(forward_step_func, pass_number, clip_factors_l
                         combined_loss = (cf * per_example_losses).sum()
                 else:
                     combined_loss = per_example_losses.sum()
+                # Divide by K here since calculate_per_token_loss=True skips
+                # forward_step's /num_microbatches (matching PP=1 line 669).
+                combined_loss = combined_loss / num_microbatches
                 microbatch_counter[0] += 1
                 if num_tokens_accumulator is not None:
                     num_tokens_accumulator.append(num_tokens)
@@ -912,8 +928,8 @@ def _dp_sgd_pipeline_forward_backward(
         model_list = model
 
     config = get_model_config(model_list[0])
-    C = config.dp_clipping_norm  # C_max
-    C_active = getattr(args, 'dp_clipping_norm_current', C)  # adaptive C
+    C_max = args.dp_clipping_norm  # C_max from CLI (immutable upper bound)
+    C_active = getattr(args, 'dp_clipping_norm_current', C_max)  # adaptive C
 
     # Wrap data iterator for two-pass replay (caches all microbatches)
     replay_data_iterator = _wrap_data_iterator(data_iterator, use_pipeline=True)
@@ -1143,6 +1159,11 @@ def _dp_sgd_pipeline_forward_backward(
     # Rewind data iterator for replay
     _rewind_data_iterator(replay_data_iterator)
 
+    # Skip forward_step's /num_tokens division for Pass 2. per_example_losses
+    # are already per-token means; forward_step's division would double-normalize.
+    # (Same flag used for Pass 1 at line 1069 for the same reason.)
+    config.calculate_per_token_loss = True
+
     # Wrap forward_step_func for Pass 2: convert 4-tuple to 3-tuple with
     # clip-factor-scaled loss, keeping grad_fn intact for pipeline backward.
     _microbatch_counter = [0]
@@ -1152,6 +1173,7 @@ def _dp_sgd_pipeline_forward_backward(
         clip_factors_list=clip_factors_list,
         microbatch_counter=_microbatch_counter,
         num_tokens_accumulator=_num_tokens_acc,
+        num_microbatches=num_microbatches,
     )
 
     # Run the full pipeline schedule for Pass 2
@@ -1172,13 +1194,14 @@ def _dp_sgd_pipeline_forward_backward(
         )
     finally:
         config.finalize_model_grads_func = saved_finalize
+        config.calculate_per_token_loss = saved_calculate_per_token_loss
 
     # ===== AFTER BOTH PASSES: finalize =====
 
     # Adaptive clipping: noise uses C from THIS step, then update for NEXT step.
     _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
     if _dp_clip_pct is not None:
-        C_this_step = getattr(args, 'dp_clipping_norm_current', C)
+        C_this_step = getattr(args, 'dp_clipping_norm_current', C_max)
         if C_this_step == float('inf'):
             C_this_step = 1.0
         config.dp_clipping_norm = C_this_step
@@ -1189,7 +1212,7 @@ def _dp_sgd_pipeline_forward_backward(
             ghost_ctx.get_raw_norms(microbatch_id=k)
             for k in range(num_microbatches)
         ])
-        C_current = getattr(args, 'dp_clipping_norm_current', C)
+        C_current = getattr(args, 'dp_clipping_norm_current', C_max)
         target_frac = 1.0 - _dp_clip_pct / 100.0
 
         _frac = (all_raw_norms > C_current).float().mean()
@@ -1209,7 +1232,7 @@ def _dp_sgd_pipeline_forward_backward(
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
         C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
         C_next = max(C_next, 1e-6)
-        C_next = min(C_next, C)  # cap at C_max (--dp-clipping-norm)
+        C_next = min(C_next, C_max)  # cap at C_max (--dp-clipping-norm)
         args.dp_clipping_norm_current = C_next
 
         actual_frac = (all_raw_norms > C_current).float().mean().item()
@@ -1229,15 +1252,10 @@ def _dp_sgd_pipeline_forward_backward(
         config._dp_total_num_tokens = total_num_tokens_pp
         config._dp_num_microbatches = num_microbatches
 
-    # Call finalize_model_grads with fixed N_batch (not num_tokens)
+    # Finalize (all-reduce + noise). Pass None — gradient already normalized
+    # in Pass 2 (per-token mean / K), matching non-DP.
     if saved_finalize is not None:
-        global_batch_size = (
-            args.micro_batch_size
-            * parallel_state.get_data_parallel_world_size()
-            * num_microbatches
-        )
-        n_batch = torch.tensor(global_batch_size, dtype=torch.int, device="cuda")
-        saved_finalize(model_list, n_batch)
+        saved_finalize(model_list, None)
 
     # Remove per-example losses from logging dict
     for entry in forward_data_store:

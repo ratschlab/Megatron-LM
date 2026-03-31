@@ -145,6 +145,9 @@ class MegatronOptimizer(ABC):
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
                 grad = param.grad
+                # DP-SGD accumulates in main_grad; param.grad is None after cleanup.
+                if grad is None and hasattr(param, 'main_grad') and param.main_grad is not None:
+                    grad = param.main_grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)

@@ -285,13 +285,15 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     from megatron.training import get_args
     _noise_args = get_args()
 
-    S = _noise_args.seq_length
     K = (
         _noise_args.global_batch_size //
         (_noise_args.micro_batch_size * parallel_state.get_data_parallel_world_size())
     )
     D = parallel_state.get_data_parallel_world_size()
-    noise_std = sigma * C / (D * S * K)
+    # Noise calibrated to per-example-mean sensitivity: each example's clipped
+    # gradient (in per-token-mean space) has L2 norm ≤ C. After DDP average (1/D)
+    # and K-microbatch accumulation (1/K), sensitivity = C / (D * K).
+    noise_std = sigma * C / (D * K)
 
     # Scale noise to match loss_scale-amplified main_grad space.
     # On FP16: loss_scale ~65536, optimizer divides by it → noise survives at natural scale.
@@ -403,32 +405,13 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
 
-    # DP-SGD: inject noise AFTER all gradient syncs, BEFORE normalization.
-    # This is the correct injection point per the DP-SGD protocol.
+    # DP-SGD: inject noise AFTER all gradient syncs.
+    # No additional gradient scaling here — the DP scheduler already normalizes
+    # the loss by num_microbatches (matching non-DP forward_step), and passes
+    # num_tokens=None to skip finalize's division. This avoids double-normalization.
     if getattr(config, 'dp_sgd', False):
         _dp_sgd_inject_noise(model, config)
-
-        # Check if DP mode should use standard num_tokens normalization
-        # (for experiments proving DP correctness) or fixed N_batch
-        # (production default, avoids leaking batch composition).
-        from megatron.training import get_args
-        _dp_args = get_args()
-        use_num_tokens = getattr(_dp_args, 'dp_use_num_tokens_normalization', False)
-
-        if use_num_tokens:
-            # Use standard num_tokens normalization (same as non-DP path below).
-            # This makes DP and non-DP bit-identical when sigma=0 and C=inf.
-            pass  # Fall through to the standard num_tokens normalization below
-        else:
-            # Production default: normalize by fixed N_batch (number of sequences
-            # in global batch) instead of num_tokens (data-dependent, leaks batch
-            # composition). N_batch is passed via num_tokens when dp_sgd is set
-            # (see training.py and schedules.py).
-            if num_tokens is not None and num_tokens > 0:
-                scaling = 1.0 / num_tokens
-                for model_chunk in model:
-                    model_chunk.scale_gradients(scaling)
-            return
+        return
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

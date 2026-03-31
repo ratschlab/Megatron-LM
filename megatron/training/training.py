@@ -1642,10 +1642,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # This seed is serialized in checkpoints for resume correctness.
         # Initialize adaptive clipping state
         if not hasattr(args, 'dp_clipping_norm_current'):
-            # Always start from --dp-clipping-norm. With adaptive clipping,
-            # the geometric update converges C to the target percentile within
-            # ~10-20 steps. No data-dependent initialization needed.
-            args.dp_clipping_norm_current = args.dp_clipping_norm
+            if getattr(args, 'dp_clipping_percentile', None) is not None:
+                # Adaptive clipping: start from inf so the first iteration
+                # initializes C from observed gradient norms (in schedules.py).
+                args.dp_clipping_norm_current = float('inf')
+            else:
+                args.dp_clipping_norm_current = args.dp_clipping_norm
 
         if args.dp_noise_seed is None:
             args.dp_noise_seed = torch.randint(0, 2**31 - 1, (1,)).item()
