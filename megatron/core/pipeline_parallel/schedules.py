@@ -485,11 +485,88 @@ def _dp_sgd_ghost_forward_backward(
     # C update happens AFTER all microbatches (end of step), using all norms.
     _adaptive_norms_list = []
 
+    # ===== FIRST-STEP C INITIALIZATION (adaptive clipping only) =====
+    # When C_active is inf, collect norms from ALL K microbatches via Pass 1,
+    # compute percentile from GBS examples, set C, then let the normal loop
+    # run Pass 1+2 with the correct C using cached/replayed data.
+    _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
+    if (C_active == float('inf') and _dp_clip_pct is not None
+            and _dp_clip_pct != 0):
+        _init_norms = []
+        _init_batches = []  # cache raw batches for replay
+        _tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        for k in range(num_microbatches):
+            # Read one microbatch and cache it. Only consume from data_iterator
+            # on TP rank 0 (other ranks receive via broadcast in get_batch).
+            # This mirrors get_batch_on_this_tp_rank's consumption pattern.
+            if _tp_rank == 0:
+                _batch = next(data_iterator)
+                _init_batches.append(_batch)
+            else:
+                _init_batches.append(None)  # placeholder, not used on TP rank > 0
+
+            # Run Pass 1 to collect norms (no main_grad writes)
+            _saved_mg = {}
+            for p in model.parameters():
+                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None:
+                    _saved_mg[p] = p.main_grad.clone()
+            try:
+                for p in model.parameters():
+                    if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                        p.grad_added_to_main_grad = True
+                ghost_ctx = GhostClippingContext(model, float('inf'))
+                ghost_ctx.register_hooks()
+
+                fds_tmp = []
+                output_tensor, _ = forward_step(
+                    forward_step_func, iter([_batch]), model, num_microbatches,
+                    input_tensor, fds_tmp, config,
+                    collect_non_loss_data if k == 0 else False,
+                    is_first_microbatch=check_first_val_step(first_val_step, False, k == 0),
+                    current_microbatch=k,
+                )
+                per_ex = fds_tmp[-1].get('dp_per_example_losses')
+                assert per_ex is not None
+                torch.autograd.backward(per_ex.sum())
+                ghost_ctx.compute_clip_factors()
+                _init_norms.append(ghost_ctx.get_raw_norms().detach().clone())
+            finally:
+                ghost_ctx.remove_hooks()
+                for p in model.parameters():
+                    if p.requires_grad and hasattr(p, 'grad_added_to_main_grad'):
+                        p.grad_added_to_main_grad = False
+                    if p.grad is not None:
+                        p.grad = None
+                    if p in _saved_mg:
+                        p.main_grad.copy_(_saved_mg[p])
+                del _saved_mg
+
+        # Compute C from ALL GBS norms
+        all_norms = torch.cat(_init_norms)
+        target_quantile = _dp_clip_pct / 100.0
+        C_init = all_norms.quantile(target_quantile).item()
+        C_init = max(C_init, 1e-6)
+        _c_tensor = torch.tensor([C_init], dtype=torch.float32, device='cuda')
+        dp_group = parallel_state.get_data_parallel_group()
+        dp_src = parallel_state.get_data_parallel_src_rank()
+        torch.distributed.broadcast(_c_tensor, src=dp_src, group=dp_group)
+        C_init = _c_tensor.item()
+        C_active = C_init
+        args.dp_clipping_norm_current = C_init
+        if args.rank == 0:
+            print(f'DP-SGD adaptive C: initialized from {len(all_norms)} examples: '
+                  f'C={C_init:.4f} (P{_dp_clip_pct} of norms, '
+                  f'median={all_norms.median():.2f}, max={all_norms.max():.2f})')
+
+        # Replace data_iterator with a replay of cached batches so the normal
+        # loop below re-processes the same data with the correct C.
+        data_iterator = iter(_init_batches)
+        del _init_norms, _init_batches
+
     for k in range(num_microbatches):
         is_first = (k == 0)
         is_last = (k == num_microbatches - 1)
 
-        # Re-read C_active each microbatch (first-iteration init may update it)
         C_active = getattr(args, 'dp_clipping_norm_current', C_max)
 
         # Wrap this microbatch's data for two-pass replay
@@ -548,8 +625,7 @@ def _dp_sgd_ghost_forward_backward(
 
             clip_factors = ghost_ctx.compute_clip_factors()  # [B]
 
-            # Adaptive clipping: use raw norms to compute clip_factors.
-            _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
+            # Adaptive clipping: accumulate raw norms for end-of-step update.
             if _dp_clip_pct is not None:
                 raw_norms = ghost_ctx.get_raw_norms()
                 _adaptive_norms_list.append(raw_norms.detach().clone())
@@ -557,31 +633,7 @@ def _dp_sgd_ghost_forward_backward(
                 if _dp_clip_pct == 0:
                     # Bu et al. automatic clipping: normalize all to unit norm × C
                     clip_factors = C_active / (raw_norms + 1e-6)
-                else:
-                    # First-iteration initialization: C_active is inf on step 0.
-                    # Set C from the target percentile of the observed norms so
-                    # clipping is immediately effective (no 100+ step convergence).
-                    if C_active == float('inf'):
-                        target_quantile = _dp_clip_pct / 100.0  # P=50 → median
-                        C_init = raw_norms.quantile(target_quantile).item()
-                        C_init = max(C_init, 1e-6)
-                        # Broadcast from DP rank 0 for cross-rank consistency
-                        # (with MBS=1, each rank sees different norms)
-                        _c_tensor = torch.tensor([C_init], dtype=torch.float32,
-                                                 device=raw_norms.device)
-                        dp_group = parallel_state.get_data_parallel_group()
-                        dp_src = parallel_state.get_data_parallel_src_rank()
-                        torch.distributed.broadcast(_c_tensor, src=dp_src,
-                                                    group=dp_group)
-                        C_init = _c_tensor.item()
-                        C_active = C_init
-                        args.dp_clipping_norm_current = C_init
-                        # Recompute clip_factors with the data-initialized C
-                        clip_factors = torch.clamp(C_active / raw_norms, max=1.0)
-                        if args.rank == 0:
-                            print(f'DP-SGD adaptive C: initialized from first-iteration '
-                                  f'norms: C={C_init:.4f} (P{_dp_clip_pct} of norms)')
-                    # else: clip_factors already computed by ghost_ctx with C_active
+                # else: clip_factors already computed by ghost_ctx with C_active
 
             # Log clip stats if requested (first microbatch only)
             if is_first and getattr(args, 'dp_log_clip_stats', False):
