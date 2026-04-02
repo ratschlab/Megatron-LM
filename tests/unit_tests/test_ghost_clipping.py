@@ -447,12 +447,14 @@ class TestReplayableIterator:
         batch2 = next(it)
         assert torch.equal(batch2['tokens'], torch.tensor([1, 2, 3])), "Replay should return same data"
 
-    def test_rewind_before_fetch_fails(self):
+    def test_rewind_before_fetch_is_noop(self):
+        """Rewind on empty cache is a silent no-op (no error, no data available)."""
         from megatron.core.pipeline_parallel.ghost_clipping import _ReplayableIterator
 
         it = _ReplayableIterator(iter([]))
-        with pytest.raises(AssertionError, match="Cannot rewind"):
-            it.rewind()
+        it.rewind()  # should not raise
+        with pytest.raises(StopIteration):
+            next(it)
 
     def test_second_fetch_after_replay_advances(self):
         """After replay, the next non-replay fetch gets the second batch."""

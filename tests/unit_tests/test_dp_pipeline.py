@@ -935,13 +935,14 @@ class TestActualPipelineReplayableIterator:
         with pytest.raises(RuntimeError, match="Pass 2 consumed more data than Pass 1 recorded"):
             next(it)
 
-    def test_rewind_before_any_data_raises(self):
-        """Rewind before any data was fetched should raise."""
+    def test_rewind_before_any_data_is_noop(self):
+        """Rewind before any data was fetched is a silent no-op (no error, no replay)."""
         from megatron.core.pipeline_parallel.ghost_clipping import _PipelineReplayableIterator
 
         it = _PipelineReplayableIterator(iter([1, 2, 3]))
-        with pytest.raises(AssertionError, match="Cannot rewind before any data"):
-            it.rewind()
+        it.rewind()  # should not raise
+        # After no-op rewind, iterator should still work normally (not in replay mode)
+        assert next(it) == 1
 
     def test_wrap_data_iterator_pipeline(self):
         """Test _wrap_data_iterator with use_pipeline=True."""
