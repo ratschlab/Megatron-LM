@@ -979,3 +979,74 @@ class TestMultiChunkModel:
         _ = chunk1(x)
         _ = chunk2(x)
         ctx.remove_hooks()
+
+
+# ---------------------------------------------------------------------------
+# TE backward_pre_hook gate test (GPU required, TE required)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+class TestTEBackwardPreHook:
+    """Verify register_full_backward_pre_hook modifies weight gradients for
+    TE modules. This is the gate test for per-layer clipping viability with TE.
+
+    Requires GPU + Transformer Engine. Skips gracefully if unavailable.
+    """
+
+    @staticmethod
+    def _test_hook_halves_gradient(module_cls, H_in, H_out, **kwargs):
+        """Helper: build module, verify 0.5× hook changes the input gradient.
+
+        TE modules may not expose .weight.grad directly, so we check the
+        input gradient (dx) instead — if the hook scales go by 0.5, dx
+        should also be 0.5× baseline (since dx = go @ W).
+        """
+        device = torch.cuda.current_device()
+        module = module_cls(H_in, H_out, **kwargs).to(device)
+
+        x = torch.randn(32, 2, H_in, device=device, requires_grad=True)
+
+        # Baseline: forward + backward without hook
+        y = module(x)
+        if isinstance(y, tuple):
+            y = y[0]
+        y.sum().backward()
+        dx_baseline = x.grad.clone()
+        module.zero_grad()
+        x.grad.zero_()
+
+        # With hook: scale grad_output by 0.5
+        def half_hook(mod, grad_output):
+            return (grad_output[0] * 0.5,)
+
+        handle = module.register_full_backward_pre_hook(half_hook)
+        y2 = module(x)
+        if isinstance(y2, tuple):
+            y2 = y2[0]
+        y2.sum().backward()
+        dx_hooked = x.grad.clone()
+        handle.remove()
+
+        # Input gradient should be exactly 0.5× baseline (dx = go @ W)
+        ratio = dx_hooked / (dx_baseline + 1e-10)
+        max_err = (ratio - 0.5).abs().max().item()
+        assert max_err < 0.01, (
+            f"backward_pre_hook did NOT modify TE gradient! "
+            f"mean ratio={ratio.mean():.4f}, max_err={max_err:.6f}"
+        )
+
+    def test_te_linear(self):
+        """te.Linear: basic TE linear layer."""
+        try:
+            import transformer_engine.pytorch as te
+        except ImportError:
+            pytest.skip("Transformer Engine not available")
+        self._test_hook_halves_gradient(te.Linear, 64, 64, bias=False)
+
+    def test_te_layernorm_linear(self):
+        """te.LayerNormLinear: fused LN+Linear (the critical one for our model)."""
+        try:
+            import transformer_engine.pytorch as te
+        except ImportError:
+            pytest.skip("Transformer Engine not available")
+        self._test_hook_halves_gradient(te.LayerNormLinear, 64, 64, bias=False)

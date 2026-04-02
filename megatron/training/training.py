@@ -1746,15 +1746,23 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                  * get_num_microbatches())
             sampling_probability = global_batch_size / args.dp_num_dataset_examples
 
-            # Compose the DP event. When adaptive clipping is active (P>0),
+            # Compose the DP event. When adaptive thresholds are active,
             # the threshold update also consumes privacy (noisy fraction release).
             # Use effective_sigma via inverse-variance composition:
             #   1/σ_eff² = 1/σ² + K/σ_b²
             # where K = number of threshold queries per step.
+            #
+            # Adaptive thresholds are active when:
+            # - Global clipping with dp_clipping_percentile > 0 (K=1 query)
+            # - Per-layer clipping (always adaptive, K=L queries)
+            _clipping_mode = getattr(args, 'dp_clipping_mode', 'global')
             _dp_pct = getattr(args, 'dp_clipping_percentile', None)
-            if _dp_pct is not None and _dp_pct != 0:
+            _has_adaptive = (
+                _clipping_mode == 'per_layer'  # per-layer always uses adaptive
+                or (_dp_pct is not None and _dp_pct != 0)  # global with percentile
+            )
+            if _has_adaptive:
                 _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
-                _clipping_mode = getattr(args, 'dp_clipping_mode', 'global')
                 if _clipping_mode == 'per_layer':
                     # ---- Per-layer accounting (new) ----
                     # K = number of hooked modules (~320 for 70B)

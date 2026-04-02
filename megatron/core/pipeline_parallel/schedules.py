@@ -573,6 +573,14 @@ def _dp_sgd_perlayer_forward_backward(
             per_example_losses = forward_data_store_k[-1].get('dp_per_example_losses')
             assert per_example_losses is not None, "loss_func did not return per-example losses."
 
+            # Per-layer clipping does NOT support packing (per-privacy-unit norms).
+            # It clips per sequence, not per privacy unit. Reject packed batches.
+            if 'unit_boundaries' in forward_data_store_k[-1]:
+                raise RuntimeError(
+                    "Per-layer clipping does not support document packing. "
+                    "Use --dp-clipping-mode global for packed batches."
+                )
+
             total_num_tokens += num_tokens
 
             # per_example_losses are already per-token means. Divide by K only.
