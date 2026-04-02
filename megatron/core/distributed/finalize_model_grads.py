@@ -239,11 +239,10 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
 def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig):
     """Inject Gaussian noise into gradients for DP-SGD.
 
-    Supports two modes:
-    - Global clipping: all parameters get noise scaled by a single C
-      (config.dp_clipping_norm = adaptive C or C_max).
-    - Per-layer clipping: each module's parameters get noise scaled by
-      that module's C_l (config._dp_per_layer_param_C maps param id → C_l).
+    All parameters get noise scaled by a single C (config.dp_clipping_norm).
+    For global clipping: C = adaptive C. For per-layer clipping: C = effective_global_C
+    = sqrt(Σ C_l²). Per-layer noise (σ×C_l per layer) is NOT used because it's
+    L× worse for privacy by RDP composition.
 
     Uses two torch.Generator objects for correct TP noise synchronization:
     - gen_replicated: same seed on all TP ranks (replicated params stay in sync)
@@ -259,9 +258,7 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     if sigma <= 0:
         return
 
-    # Per-layer C_l map: param id → C_l. If not set, use global C for all params.
-    per_layer_C = getattr(config, '_dp_per_layer_param_C', None)
-    global_C = getattr(config, 'dp_clipping_norm', 1.0)
+    C = getattr(config, 'dp_clipping_norm', 1.0)
 
     from megatron.training import get_args
     _noise_args = get_args()
@@ -272,15 +269,15 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     )
     D = parallel_state.get_data_parallel_world_size()
 
-    # Base noise_std factor: σ / (D × K). Multiply by C per parameter.
-    base_noise_factor = sigma / (D * K)
+    # noise_std = σ × C / (D × K). Same for all parameters.
+    noise_std = sigma * C / (D * K)
 
     # Scale noise to match loss_scale-amplified main_grad space.
     if config.grad_scale_func is not None:
         loss_scale = config.grad_scale_func(
             torch.tensor(1.0, dtype=torch.float32, device='cuda')
         ).item()
-        base_noise_factor = base_noise_factor * loss_scale
+        noise_std = noise_std * loss_scale
 
     args = _noise_args
     step = getattr(args, 'curr_iteration', 0)
@@ -313,11 +310,6 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad or not hasattr(param, 'main_grad') or param.main_grad is None:
                 continue
-
-            # Per-layer noise: use C_l for this parameter's module.
-            # Global noise: use single C for all parameters.
-            C = per_layer_C.get(id(param), global_C) if per_layer_C else global_C
-            noise_std = base_noise_factor * C
 
             is_sharded = getattr(param, 'tensor_model_parallel', False)
             gen = gen_sharded if is_sharded else gen_replicated

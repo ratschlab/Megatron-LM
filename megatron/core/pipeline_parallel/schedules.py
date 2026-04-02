@@ -594,17 +594,12 @@ def _dp_sgd_perlayer_forward_backward(
 
     # ===== NOISE, THEN UPDATE THRESHOLDS =====
 
-    # Per-layer noise: each parameter gets noise scaled by its module's C_l.
-    # Build a param_id → C_l map so finalize_model_grads can look up per param.
-    _param_C_map = {}
-    for _, mod, _ in per_layer_ctx._modules:
-        C_l = per_layer_ctx.C_per_module[id(mod)]
-        for p in mod.parameters(recurse=False):
-            if p.requires_grad:
-                _param_C_map[id(p)] = C_l
-    config._dp_per_layer_param_C = _param_C_map
-    # dp_clipping_norm is unused for per-layer (per-param C_l used instead),
-    # but set it to effective_global_C for logging/diagnostics.
+    # Noise uses effective_global_C = sqrt(Σ C_l²), NOT per-layer C_l.
+    # Per-layer noise (σ×C_l per layer) is L× worse for privacy by RDP
+    # composition — each layer is an independent mechanism. Global noise
+    # (σ×C per coordinate, C = sqrt(Σ C_l²)) exploits the L2 norm structure
+    # and gives RDP α/(2σ²) instead of α×L/(2σ²). FlashDP confirms this:
+    # their per-layer noise uses σ^(l)=σ×C/C^(l), which equals σ×C everywhere.
     config.dp_clipping_norm = per_layer_ctx.effective_global_C
     config._dp_total_num_tokens = total_num_tokens.item()
     config._dp_num_microbatches = num_microbatches
