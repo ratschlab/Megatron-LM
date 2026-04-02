@@ -2597,4 +2597,11 @@ def _add_dp_sgd_args(parser):
     group.add_argument('--dp-target-quantile', type=float, default=0.75,
                        help='Target fraction of unclipped examples per layer (per_layer mode). '
                        '0.75 means 25%% of examples are clipped at each layer.')
+    group.add_argument('--dp-noise-calibration', type=str, default='global',
+                       choices=['global', 'per_layer'],
+                       help='Noise calibration mode for per-layer clipping. '
+                       'global (default): σ×C/(D×K) for all params, C=sqrt(ΣC_l²). '
+                       'per_layer: σ×√L×C_l/(D×K) per layer. Same RDP α/(2σ²) but '
+                       'redistributes noise proportional to each layer\'s sensitivity. '
+                       'Only effective with --dp-clipping-mode per_layer.')
     return parser

@@ -431,3 +431,80 @@ class TestPPCalculatePerTokenLoss:
         # Restore in finally
         config.calculate_per_token_loss = saved
         assert config.calculate_per_token_loss == original_value
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Per-layer noise calibration (Approach B)
+# ---------------------------------------------------------------------------
+
+class TestPerLayerNoiseCalibration:
+    """Per-layer noise: σ×√L×C_l/(D×K) per layer gives same RDP as global noise."""
+
+    def test_rdp_equivalence(self):
+        """Both approaches give RDP = α/(2σ²) at worst-case sensitivity."""
+        import math
+        sigma = 0.6
+        L = 320
+        D = 4
+        K = 256
+
+        # Layer C_l distribution: 10 large, 310 small
+        C_large = 1000.0
+        C_small = 100.0
+        C_l_values = [C_large] * 10 + [C_small] * 310
+        C_global = math.sqrt(sum(c**2 for c in C_l_values))
+
+        # Approach A: global noise
+        # Worst-case Mahalanobis distance: ||δ||² / (σ²C²/(D×K)²) = 1/σ²
+        noise_A = sigma * C_global / (D * K)
+        delta_sq_A = C_global**2 / (D * K)**2
+        mahal_A = delta_sq_A / noise_A**2
+        assert mahal_A == pytest.approx(1.0 / sigma**2, rel=1e-6)
+
+        # Approach B: per-layer noise
+        # Worst case: Σ_l ||δ_l||²/(σ²L×C_l²/(D×K)²) = Σ_l 1/(σ²L) = 1/σ²
+        mahal_B = 0.0
+        for C_l in C_l_values:
+            delta_l_sq = (C_l / (D * K))**2
+            noise_l_sq = (sigma * math.sqrt(L) * C_l / (D * K))**2
+            mahal_B += delta_l_sq / noise_l_sq
+        assert mahal_B == pytest.approx(1.0 / sigma**2, rel=1e-6)
+
+        # Both equal
+        assert mahal_A == pytest.approx(mahal_B, rel=1e-6)
+
+    def test_small_layers_get_less_noise(self):
+        """Approach B gives less noise to layers with C_l < C/√L."""
+        import math
+        L = 320
+        C_l_values = [1000.0] * 10 + [100.0] * 310
+        C_global = math.sqrt(sum(c**2 for c in C_l_values))
+        sigma = 0.6
+        D, K = 4, 256
+
+        noise_A = sigma * C_global / (D * K)  # same for all
+        threshold = C_global / math.sqrt(L)
+
+        for C_l in C_l_values:
+            noise_B = sigma * math.sqrt(L) * C_l / (D * K)
+            if C_l < threshold:
+                assert noise_B < noise_A, \
+                    f"C_l={C_l} < threshold={threshold:.1f}: B should have less noise"
+            elif C_l > threshold:
+                assert noise_B > noise_A, \
+                    f"C_l={C_l} > threshold={threshold:.1f}: B should have more noise"
+
+    def test_uniform_Cl_gives_same_noise(self):
+        """When all C_l are equal, Approach A and B produce identical noise."""
+        import math
+        L = 320
+        C_max = 100.0
+        C_l = C_max / math.sqrt(L)  # uniform
+        C_global = math.sqrt(L * C_l**2)  # = C_max
+        sigma = 0.6
+        D, K = 4, 256
+
+        noise_A = sigma * C_global / (D * K)
+        noise_B = sigma * math.sqrt(L) * C_l / (D * K)
+
+        assert noise_A == pytest.approx(noise_B, rel=1e-6)
