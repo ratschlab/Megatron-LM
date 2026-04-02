@@ -444,6 +444,10 @@ class TransformerConfig(ModelParallelConfig):
     dp_noise_multiplier: float = 0.0
     """Noise multiplier sigma for DP-SGD. Noise std = sigma * C."""
 
+    dp_clipping_mode: str = 'global'
+    """Clipping mode: 'global' (two-pass ghost clipping) or 'per_layer'
+    (single-pass per-layer clipping with adaptive thresholds)."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

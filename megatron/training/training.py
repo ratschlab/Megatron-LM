@@ -1748,14 +1748,25 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
             # Compose the DP event. When adaptive clipping is active (P>0),
             # the threshold update also consumes privacy (noisy fraction release).
-            # Both mechanisms operate on the same Poisson-subsampled batch.
+            # Use effective_sigma via inverse-variance composition:
+            #   1/σ_eff² = 1/σ² + K/σ_b²
+            # where K = number of threshold queries per step.
             _dp_pct = getattr(args, 'dp_clipping_percentile', None)
             if _dp_pct is not None and _dp_pct != 0:
                 _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
-                step_event = dp_evt.ComposedDpEvent([
-                    dp_evt.GaussianDpEvent(args.dp_noise_multiplier),  # gradient noise
-                    dp_evt.GaussianDpEvent(_sigma_b),  # threshold fraction noise
-                ])
+                _clipping_mode = getattr(args, 'dp_clipping_mode', 'global')
+                if _clipping_mode == 'per_layer':
+                    # ---- Per-layer accounting (new) ----
+                    # K = number of hooked modules (~320 for 70B)
+                    _config = get_model_config(model[0])
+                    _K = len(getattr(_config, '_dp_per_layer_thresholds', {})) or 320
+                    _sigma_eff = (1.0 / args.dp_noise_multiplier**2 + _K / _sigma_b**2) ** -0.5
+                    step_event = dp_evt.GaussianDpEvent(_sigma_eff)
+                else:
+                    # ---- Global clipping accounting (existing, do not modify) ----
+                    # K = 1 threshold query per step
+                    _sigma_eff = (1.0 / args.dp_noise_multiplier**2 + 1.0 / _sigma_b**2) ** -0.5
+                    step_event = dp_evt.GaussianDpEvent(_sigma_eff)
             else:
                 step_event = dp_evt.GaussianDpEvent(args.dp_noise_multiplier)
 

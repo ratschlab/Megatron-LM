@@ -341,6 +341,40 @@ def validate_args(args, defaults={}):
         # (e.g., clip_grad=1.0) is post-processing of the already-private gradient
         # and does not affect the DP guarantee. Users can set it explicitly.
         # NOTE: untied embeddings NOT auto-enabled. Keeps standard Apertus config.
+        # Per-layer clipping validation.
+        if getattr(args, 'dp_clipping_mode', 'global') == 'per_layer':
+            if getattr(args, 'dp_clipping_percentile', None) is None:
+                raise ValueError(
+                    "--dp-clipping-percentile is required with --dp-clipping-mode per_layer. "
+                    "Fixed per-layer thresholds severely degrade utility (He et al., 2022)."
+                )
+            if getattr(args, 'virtual_pipeline_model_parallel_size', None) is not None:
+                raise ValueError(
+                    "--dp-clipping-mode per_layer does not support virtual pipeline parallelism. "
+                    "Checkpoint serialization of per-layer thresholds is not VP-safe."
+                )
+            # Auto-increase σ_b for per-layer mode (320 modules need higher threshold
+            # noise to avoid exhausting privacy budget). Default 10 → 50.
+            if args.dp_adapt_sigma_b <= 10.0:
+                if args.rank == 0:
+                    print(f'WARNING: --dp-adapt-sigma-b={args.dp_adapt_sigma_b} is too low '
+                          f'for per-layer clipping (~320 modules). Auto-setting to 50.0. '
+                          f'Override with --dp-adapt-sigma-b <value> if intended.')
+                args.dp_adapt_sigma_b = 50.0
+        # Warn if σ_b is large relative to GBS (threshold adaptation becomes noisy).
+        # Rule of thumb: σ_b < GBS / 10 for useful adaptation.
+        _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
+        _gbs = args.global_batch_size
+        if _sigma_b > 0 and _gbs > 0 and _sigma_b >= _gbs:
+            if args.rank == 0:
+                print(f'WARNING: --dp-adapt-sigma-b={_sigma_b} >= GBS={_gbs}. '
+                      f'Adaptive clipping fraction noise (σ_b/GBS={_sigma_b/_gbs:.1f}) '
+                      f'will dominate the signal. C will random-walk instead of adapting. '
+                      f'Reduce --dp-adapt-sigma-b or increase GBS.')
+        elif _sigma_b > 0 and _gbs > 0 and _sigma_b > _gbs / 10:
+            if args.rank == 0:
+                print(f'NOTE: --dp-adapt-sigma-b={_sigma_b} is >{_gbs//10} (GBS/10). '
+                      f'Adaptive C may converge slowly. Consider reducing σ_b or increasing GBS.')
         # Disable sequence parallelism (per-example norms need extra SP all-reduces).
         if hasattr(args, 'sequence_parallel') and args.sequence_parallel:
             if args.rank == 0:
@@ -2554,4 +2588,13 @@ def _add_dp_sgd_args(parser):
                        'in adaptive C and per-layer thresholds. Privacy cost: '
                        'sigma_new = (sigma^-2 - (2*sigma_b)^-2)^(-1/2). '
                        'Default 10.0 gives sigma_new/sigma ~= 1.001.')
+    # ---- Per-layer clipping (independent code path from global ghost clipping) ----
+    group.add_argument('--dp-clipping-mode', type=str, default='global',
+                       choices=['global', 'per_layer'],
+                       help='Gradient clipping mode. global: two-pass ghost clipping. '
+                       'per_layer: single-pass per-layer clipping with adaptive thresholds '
+                       '(He et al., 2022). Requires --dp-clipping-percentile.')
+    group.add_argument('--dp-target-quantile', type=float, default=0.75,
+                       help='Target fraction of unclipped examples per layer (per_layer mode). '
+                       '0.75 means 25%% of examples are clipped at each layer.')
     return parser

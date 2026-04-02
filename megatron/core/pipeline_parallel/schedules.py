@@ -102,23 +102,37 @@ def get_forward_backward_func():
 
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-    if pipeline_model_parallel_size > 1:
-        # DP-SGD with PP>1: use the two-pass pipeline wrapper that handles
-        # ghost clipping across all pipeline stages and microbatches.
-        # This delegates to the appropriate pipeline schedule internally.
-        try:
-            from megatron.core.utils import get_model_config as _get_config
-            # Check if dp_sgd is enabled — need to peek at config.
-            # If we can't determine (no model available here), fall through
-            # to standard schedules (the no-pipelining path handles dp_sgd
-            # via _dp_sgd_ghost_forward_backward).
-            from megatron.training import get_args as _get_args
-            _args = _get_args()
-            if getattr(_args, 'dp_sgd', False):
-                return _dp_sgd_pipeline_forward_backward
-        except (ImportError, RuntimeError):
-            pass
 
+    # DP-SGD dispatch: route to the appropriate clipping schedule.
+    try:
+        from megatron.training import get_args as _get_args
+        _args = _get_args()
+        if getattr(_args, 'dp_sgd', False):
+            clipping_mode = getattr(_args, 'dp_clipping_mode', 'global')
+            if clipping_mode == 'per_layer':
+                # ---- PER-LAYER CLIPPING (single-pass, hook-based) ----
+                # IMPORTANT: This code path is completely independent of the global
+                # ghost clipping path below. It uses per_layer_clipping.py (not
+                # ghost_clipping.py), different schedule functions, and different
+                # adaptive threshold mechanics. Changes here must NOT modify any
+                # code shared with the global path. See per-layer-clipping-plan.md.
+                if pipeline_model_parallel_size > 1:
+                    raise NotImplementedError(
+                        "Per-layer clipping with PP>1 is not yet implemented. "
+                        "Use --dp-clipping-mode global for PP>1."
+                    )
+                return _dp_sgd_perlayer_forward_backward
+            else:
+                # ---- GLOBAL GHOST CLIPPING (two-pass) ----
+                # IMPORTANT: This is the original DP-SGD path. Do not modify it
+                # when adding per-layer clipping features. The two paths must
+                # remain independent to avoid regression risk.
+                if pipeline_model_parallel_size > 1:
+                    return _dp_sgd_pipeline_forward_backward
+    except (ImportError, RuntimeError):
+        pass
+
+    if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
@@ -429,6 +443,186 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return first_val_step and cond
     else:
         return cond
+
+
+def _dp_sgd_perlayer_forward_backward(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,  # unused
+    micro_batch_size: int,  # unused
+    decoder_seq_length: int = None,  # unused
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
+):
+    """DP-SGD with per-layer clipping: single-pass, no replay (PP=1 only).
+
+    Each linear/embedding module clips grad_output inline during backward
+    via register_full_backward_pre_hook. No main_grad isolation, no RNG
+    save/restore, no data replay.
+
+    IMPORTANT: This is completely independent of _dp_sgd_ghost_forward_backward.
+    Changes here must NOT modify any shared code. See per-layer-clipping-plan.md.
+    """
+    from megatron.core.pipeline_parallel.per_layer_clipping import PerLayerClippingContext
+    from megatron.training import get_args
+
+    args = get_args()
+    if not isinstance(model, list):
+        model = [model]
+    assert len(model) == 1, "Per-layer clipping PP=1 expects a single model chunk"
+    model = model[0]
+
+    config = get_model_config(model)
+    C_max = args.dp_clipping_norm  # immutable CLI upper bound
+    model_type = get_model_type(model)
+    forward_data_store = []
+    input_tensor, output_tensor_grad = None, None
+
+    # Get loss_scale for norm unscaling (FP16 dynamic scaling)
+    loss_scale = 1.0
+    if config.grad_scale_func is not None:
+        loss_scale = config.grad_scale_func(
+            torch.tensor(1.0, dtype=torch.float32, device='cuda')
+        ).item()
+
+    # Reuse persistent context across steps (created once, stored on config).
+    if not hasattr(config, '_dp_per_layer_ctx') or config._dp_per_layer_ctx is None:
+        per_layer_ctx = PerLayerClippingContext(
+            model, global_C=C_max,
+            target_quantile=getattr(args, 'dp_target_quantile', 0.75),
+            adapt_lr=getattr(args, 'dp_clipping_adapt_lr', 0.3),
+            sigma_b=getattr(args, 'dp_adapt_sigma_b', 50.0),
+            total_scale_factor=loss_scale / num_microbatches,
+        )
+        # Restore thresholds from checkpoint if available
+        if hasattr(config, '_dp_per_layer_thresholds') and config._dp_per_layer_thresholds:
+            per_layer_ctx.set_thresholds(config._dp_per_layer_thresholds)
+        config._dp_per_layer_ctx = per_layer_ctx
+    else:
+        per_layer_ctx = config._dp_per_layer_ctx
+
+    per_layer_ctx.set_total_scale_factor(loss_scale / num_microbatches)
+    per_layer_ctx.register_hooks()
+
+    total_num_tokens = torch.tensor(0, dtype=torch.int, device="cuda")
+
+    # ===== FIRST-STEP C_l INITIALIZATION =====
+    # When C_l values are inf (first step), run all K microbatches' forward+backward
+    # with hooks recording norms (no clipping). Then set C_l per layer from GBS norms.
+    # Replay cached data for the actual clipped training pass.
+    _any_inf = any(c == float('inf') for c in per_layer_ctx.C_per_module.values())
+    if _any_inf:
+        _init_batches = []
+        _tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        for k in range(num_microbatches):
+            if _tp_rank == 0:
+                _batch = next(data_iterator)
+                _init_batches.append(_batch)
+            else:
+                _init_batches.append(None)
+
+            fds_tmp = []
+            output_tensor, num_tokens = forward_step(
+                forward_step_func, iter([_init_batches[-1]]), model, num_microbatches,
+                input_tensor, fds_tmp, config,
+                collect_non_loss_data if k == 0 else False,
+                is_first_microbatch=check_first_val_step(first_val_step, False, k == 0),
+                current_microbatch=k,
+            )
+            per_ex = fds_tmp[-1].get('dp_per_example_losses')
+            assert per_ex is not None
+            scaled_loss = per_ex.sum() / num_microbatches
+            backward_step(input_tensor, scaled_loss, output_tensor_grad, model_type, config)
+
+            # Zero main_grad — init phase shouldn't contribute gradients
+            for p in model.parameters():
+                if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None:
+                    p.main_grad.zero_()
+                if p.grad is not None:
+                    p.grad = None
+
+        # Set C_l from accumulated norms, project onto C_max ball
+        per_layer_ctx.initialize_from_accumulated_norms()
+        if args.rank == 0:
+            print(f'DP-SGD per-layer C: initialized {len(per_layer_ctx.C_per_module)} '
+                  f'modules, effective_C={per_layer_ctx.effective_global_C:.4f}')
+
+        # Replay cached batches in normal loop
+        data_iterator = iter(_init_batches)
+        del _init_batches
+
+    # ===== NORMAL TRAINING LOOP =====
+    try:
+        for k in range(num_microbatches):
+            is_first = (k == 0)
+
+            forward_data_store_k = []
+            output_tensor, num_tokens = forward_step(
+                forward_step_func, data_iterator, model, num_microbatches,
+                input_tensor, forward_data_store_k, config,
+                collect_non_loss_data if is_first else False,
+                is_first_microbatch=check_first_val_step(first_val_step, False, is_first),
+                current_microbatch=k,
+            )
+            forward_data_store.extend(forward_data_store_k)
+
+            per_example_losses = forward_data_store_k[-1].get('dp_per_example_losses')
+            assert per_example_losses is not None, "loss_func did not return per-example losses."
+
+            total_num_tokens += num_tokens
+
+            # per_example_losses are already per-token means. Divide by K only.
+            # Clip factors applied in hooks (not here).
+            scaled_loss = per_example_losses.sum() / num_microbatches
+            backward_step(input_tensor, scaled_loss, output_tensor_grad, model_type, config)
+
+            # Flush non-fused params from param.grad to main_grad
+            for p in model.parameters():
+                if not p.requires_grad:
+                    continue
+                if p.grad is not None and hasattr(p, 'main_grad') and p.main_grad is not None:
+                    if not getattr(p, 'grad_added_to_main_grad', False):
+                        p.main_grad.add_(p.grad.data)
+                    p.grad = None
+
+    finally:
+        per_layer_ctx.remove_hooks()
+
+    # ===== NOISE, THEN UPDATE THRESHOLDS =====
+
+    # Use FIXED C_max for noise, NOT adaptive C_effective.
+    config.dp_clipping_norm = C_max
+    config._dp_total_num_tokens = total_num_tokens.item()
+    config._dp_num_microbatches = num_microbatches
+
+    # Finalize (all-reduce + noise). Pass None — gradient already normalized.
+    if config.finalize_model_grads_func is not None:
+        config.finalize_model_grads_func([model], None)
+
+    # Update adaptive thresholds AFTER noise injection.
+    step_batch_size = args.micro_batch_size * num_microbatches
+    per_layer_ctx.update_adaptive_thresholds(step_batch_size)
+
+    # Save thresholds for checkpoint serialization
+    config._dp_per_layer_thresholds = per_layer_ctx.get_thresholds()
+
+    # Log per-layer stats
+    if args.rank == 0 and getattr(args, 'dp_log_clip_stats', False):
+        C_vals = list(per_layer_ctx.C_per_module.values())
+        print(f'DP-SGD per-layer: effective_C={per_layer_ctx.effective_global_C:.4f}, '
+              f'C_min={min(C_vals):.4f}, C_max_layer={max(C_vals):.4f}, '
+              f'L={len(C_vals)} modules')
+
+    # Remove per-example losses from logging dict
+    for entry in forward_data_store:
+        if isinstance(entry, dict):
+            entry.pop('dp_per_example_losses', None)
+
+    return forward_data_store
 
 
 def _dp_sgd_ghost_forward_backward(

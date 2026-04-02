@@ -691,6 +691,12 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
             state_dict['dp_sgd_noise_seed'] = args.dp_noise_seed
         if hasattr(args, 'dp_clipping_norm_current') and args.dp_clipping_norm_current != float('inf'):
             state_dict['dp_clipping_norm_current'] = args.dp_clipping_norm_current
+        # Save per-layer clipping thresholds
+        if getattr(args, 'dp_clipping_mode', 'global') == 'per_layer':
+            from megatron.core.utils import get_model_config
+            _config = get_model_config(model[0] if isinstance(model, list) else model)
+            if hasattr(_config, '_dp_per_layer_thresholds') and _config._dp_per_layer_thresholds:
+                state_dict['dp_per_layer_C'] = _config._dp_per_layer_thresholds
 
     return state_dict
 
@@ -1321,6 +1327,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         if 'dp_clipping_norm_current' in state_dict:
             args.dp_clipping_norm_current = state_dict['dp_clipping_norm_current']
             print_rank_0(f'DP-SGD: Restored adaptive C = {args.dp_clipping_norm_current} from checkpoint')
+        # Restore per-layer clipping thresholds
+        if 'dp_per_layer_C' in state_dict:
+            from megatron.core.utils import get_model_config
+            _config = get_model_config(model[0] if isinstance(model, list) else model)
+            _config._dp_per_layer_thresholds = state_dict['dp_per_layer_C']
+            print_rank_0(f'DP-SGD: Restored {len(state_dict["dp_per_layer_C"])} per-layer thresholds from checkpoint')
 
     # Check arguments.
     assert args.consumed_train_samples == 0
