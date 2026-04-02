@@ -239,6 +239,12 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
 def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig):
     """Inject Gaussian noise into gradients for DP-SGD.
 
+    Supports two modes:
+    - Global clipping: all parameters get noise scaled by a single C
+      (config.dp_clipping_norm = adaptive C or C_max).
+    - Per-layer clipping: each module's parameters get noise scaled by
+      that module's C_l (config._dp_per_layer_param_C maps param id → C_l).
+
     Uses two torch.Generator objects for correct TP noise synchronization:
     - gen_replicated: same seed on all TP ranks (replicated params stay in sync)
     - gen_sharded: different seed per TP rank (sharded params get independent noise)
@@ -246,42 +252,17 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     With distributed optimizer: each DP rank adds independent noise by including
     dp_rank in the seed. Without: all DP ranks add identical noise.
 
-    Sequential torch.normal() calls advance each generator's state, ensuring
-    cross-parameter independence (no seed collisions between parameters).
-
     Prerequisite: model.named_parameters() must have identical order across TP ranks.
     """
     sigma = getattr(config, 'dp_noise_multiplier', 0.0)
-    C = getattr(config, 'dp_clipping_norm', 1.0)
 
     if sigma <= 0:
         return
 
-    # Noise calibration derivation:
-    #
-    # In schedules.py, each example's gradient enters main_grad as:
-    #   clip_i * g_i / T_k / K * loss_scale
-    # where T_k = actual tokens in microbatch k, K = num_microbatches,
-    # and ||clip_i * g_i|| <= C (clipping bound).
-    #
-    # Megatron's DDP averages gradients across D data-parallel ranks
-    # (via pre-scaling by 1/D or average_in_collective) when
-    # calculate_per_token_loss=False (our default). After all-reduce,
-    # each example's contribution to main_grad is:
-    #   (1/D) * clip_i * g_i / T_k / K * loss_scale
-    #
-    # The L2-sensitivity of main_grad to one example is therefore:
-    #   Δ = C / (D * T_k * K) * loss_scale
-    #
-    # Using constant S (seq_length) as proxy for T_k (data-independent):
-    #   noise_std = σ * C / (D * S * K) * loss_scale
-    #
-    # When T_k < S (padded sequences), this slightly under-noises (sensitivity
-    # is higher than estimated). For fixed-length training with minimal padding,
-    # T_k ≈ S and the error is negligible.
-    #
-    # Works for both --dp-clipping-norm-per-token (C = C_user × S) and
-    # default (C = C_user).
+    # Per-layer C_l map: param id → C_l. If not set, use global C for all params.
+    per_layer_C = getattr(config, '_dp_per_layer_param_C', None)
+    global_C = getattr(config, 'dp_clipping_norm', 1.0)
+
     from megatron.training import get_args
     _noise_args = get_args()
 
@@ -290,31 +271,24 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
         (_noise_args.micro_batch_size * parallel_state.get_data_parallel_world_size())
     )
     D = parallel_state.get_data_parallel_world_size()
-    # Noise calibrated to per-example-mean sensitivity: each example's clipped
-    # gradient (in per-token-mean space) has L2 norm ≤ C. After DDP average (1/D)
-    # and K-microbatch accumulation (1/K), sensitivity = C / (D * K).
-    noise_std = sigma * C / (D * K)
+
+    # Base noise_std factor: σ / (D × K). Multiply by C per parameter.
+    base_noise_factor = sigma / (D * K)
 
     # Scale noise to match loss_scale-amplified main_grad space.
-    # On FP16: loss_scale ~65536, optimizer divides by it → noise survives at natural scale.
-    # On BF16: loss_scale=1 (or grad_scale_func=None), no amplification → noise stays as-is.
     if config.grad_scale_func is not None:
         loss_scale = config.grad_scale_func(
             torch.tensor(1.0, dtype=torch.float32, device='cuda')
         ).item()
-        noise_std = noise_std * loss_scale
+        base_noise_factor = base_noise_factor * loss_scale
 
-    from megatron.training import get_args
-    args = get_args()
+    args = _noise_args
     step = getattr(args, 'curr_iteration', 0)
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     dp_rank = parallel_state.get_data_parallel_rank()
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
     use_dist_opt = getattr(args, 'use_distributed_optimizer', False)
 
-    # Base seed: random (generated once at training start) or user-specified for
-    # reproducibility.  Stored in args.dp_noise_seed and serialized in checkpoints.
-    # Without this, seeds would be predictable from the step number alone.
     base = getattr(args, 'dp_noise_seed', None)
     assert base is not None, (
         "dp_noise_seed must be set before noise injection. "
@@ -322,16 +296,10 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
     )
 
     # Per-step seeds derived from base seed + step + rank.
-    # arithmetic mixing (NOT Python hash() — non-deterministic across processes)
     if use_dist_opt:
-        # Distributed optimizer: each DP rank generates independent noise.
-        # pp_rank ensures each pipeline stage gets independent noise (each stage
-        # holds different model layers with different parameters).
         replicated_seed = (base + step * 1000003 + dp_rank * 1000011 + pp_rank * 1000019 + 7) % (2**31 - 1)
         sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + pp_rank * 1000019 + 13) % (2**31 - 1)
     else:
-        # Standard: all DP ranks get identical noise (no dp_rank in seed).
-        # pp_rank still needed for independent noise per pipeline stage.
         replicated_seed = (base + step * 1000003 + pp_rank * 1000019 + 7) % (2**31 - 1)
         sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + pp_rank * 1000019 + 13) % (2**31 - 1)
 
@@ -345,6 +313,12 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad or not hasattr(param, 'main_grad') or param.main_grad is None:
                 continue
+
+            # Per-layer noise: use C_l for this parameter's module.
+            # Global noise: use single C for all parameters.
+            C = per_layer_C.get(id(param), global_C) if per_layer_C else global_C
+            noise_std = base_noise_factor * C
+
             is_sharded = getattr(param, 'tensor_model_parallel', False)
             gen = gen_sharded if is_sharded else gen_replicated
             noise = torch.normal(
