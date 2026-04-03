@@ -48,8 +48,16 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
 
 # DP-SGD privacy accounting (optional dependency).
+# Three accountants run in parallel for comparison:
+#   _dp_accountant: RDP-based (conservative, current default)
+#   _dp_pld_accountant: PLD-based via FFT (tighter, Koskela et al. 2020)
+#   _dp_prv_accountant: PRV-based (tightest, Gopi et al. 2021)
 _dp_accountant = None
+_dp_pld_accountant = None
+_dp_prv_accountant = None
 _dp_current_epsilon = 0.0
+_dp_current_epsilon_pld = 0.0
+_dp_current_epsilon_prv = 0.0
 _dp_epsilon_at_resume = 0.0  # epsilon restored from checkpoint (pre-resume expenditure)
 # Dual privacy analysis: track epsilon separately for clinical and literature data.
 # Same mechanism (noise + clipping), different N → different sampling rate → different epsilon.
@@ -1634,7 +1642,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # DP-SGD: Initialize privacy accountant and noise seed.
-    global _dp_accountant, _dp_current_epsilon, _dp_epsilon_at_resume
+    global _dp_accountant, _dp_pld_accountant, _dp_prv_accountant
+    global _dp_current_epsilon, _dp_current_epsilon_pld, _dp_current_epsilon_prv
+    global _dp_epsilon_at_resume
     global _dp_clinical_steps, _dp_literature_steps
     global _dp_epsilon_clinical, _dp_epsilon_literature
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
@@ -1668,6 +1678,37 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
                 neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
             )
+
+            # PLD accountant (tighter than RDP, FFT-based)
+            try:
+                from dp_accounting.pld import privacy_loss_distribution
+                from dp_accounting.pld import pld_privacy_accountant
+                _dp_pld_accountant = pld_privacy_accountant.PLDAccountant()
+                if args.rank == 0:
+                    print('DP-SGD: PLD accountant initialized (tighter than RDP)')
+            except (ImportError, AttributeError):
+                _dp_pld_accountant = None
+                if args.rank == 0:
+                    print('NOTE: PLD accountant not available (dp-accounting version may be too old)')
+
+            # PRV accountant (tightest, Gopi et al. 2021)
+            try:
+                from prv_accountant import Accountant as PRVAccountant
+                _dp_prv_accountant = PRVAccountant(
+                    noise_multiplier=args.dp_noise_multiplier,
+                    sampling_probability=global_batch_size / args.dp_num_dataset_examples
+                        if hasattr(args, 'dp_num_dataset_examples') and args.dp_num_dataset_examples > 0
+                        else 0.01,
+                    delta=args.dp_delta,
+                    max_compositions=getattr(args, 'train_iters', 1000),
+                    eps_error=0.1,
+                )
+                if args.rank == 0:
+                    print('DP-SGD: PRV accountant initialized (tightest)')
+            except ImportError:
+                _dp_prv_accountant = None
+                if args.rank == 0:
+                    print('NOTE: PRV accountant not available. Install with: pip install prv-accountant')
             _dp_current_epsilon = 0.0
             if args.rank == 0:
                 print(f'DP-SGD: Privacy accountant initialized '
@@ -1795,8 +1836,54 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         event=step_event,
                     )
                 )
+            # PLD accountant: compose same event
+            if _dp_pld_accountant is not None:
+                try:
+                    if _sampling == 'truncated_poisson':
+                        _dp_pld_accountant.compose(
+                            dp_evt.PoissonSampledDpEvent(
+                                sampling_probability=sampling_probability,
+                                event=step_event,
+                            )
+                        )
+                    else:
+                        _dp_pld_accountant.compose(
+                            dp_evt.SampledWithoutReplacementDpEvent(
+                                source_dataset_size=args.dp_num_dataset_examples,
+                                sample_size=global_batch_size,
+                                event=step_event,
+                            )
+                        )
+                except Exception as e:
+                    if args.rank == 0 and iteration == 1:
+                        print(f'WARNING: PLD accountant composition failed: {e}')
+                    _dp_pld_accountant = None
+
+            # PRV accountant: uses step count, not per-step composition
+            # (PRV computes epsilon for N compositions at init time)
+
             # Add pre-resume epsilon (from checkpoint) to post-resume epsilon (from accountant).
             _dp_current_epsilon = _dp_epsilon_at_resume + _dp_accountant.get_epsilon(args.dp_delta)
+
+            # PLD epsilon (tighter)
+            if _dp_pld_accountant is not None:
+                try:
+                    _dp_current_epsilon_pld = _dp_epsilon_at_resume + _dp_pld_accountant.get_epsilon(args.dp_delta)
+                except Exception:
+                    _dp_current_epsilon_pld = float('inf')
+            else:
+                _dp_current_epsilon_pld = float('inf')
+
+            # PRV epsilon (tightest) — computed from step count
+            if _dp_prv_accountant is not None:
+                try:
+                    _step_count = iteration - getattr(args, '_dp_resume_iteration', 0)
+                    _prv_eps_low, _prv_eps_est, _prv_eps_high = _dp_prv_accountant.compute_epsilon(_step_count)
+                    _dp_current_epsilon_prv = _dp_epsilon_at_resume + _prv_eps_est
+                except Exception:
+                    _dp_current_epsilon_prv = float('inf')
+            else:
+                _dp_current_epsilon_prv = float('inf')
 
             # Dual privacy analysis: compute epsilon separately for clinical and literature.
             # Same noisy mechanism, different N → different q → different epsilon.
@@ -1814,7 +1901,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     _dp_literature_steps, q_lit, args.dp_noise_multiplier, args.dp_delta)
 
             if args.rank == 0 and iteration % args.log_interval == 0:
-                eps_str = f'DP-SGD: step={iteration}, epsilon={_dp_current_epsilon:.4f}'
+                eps_str = f'DP-SGD: step={iteration}, eps_rdp={_dp_current_epsilon:.4f}'
+                if _dp_current_epsilon_pld < float('inf'):
+                    eps_str += f', eps_pld={_dp_current_epsilon_pld:.4f}'
+                    _gap_pct = (_dp_current_epsilon / _dp_current_epsilon_pld - 1) * 100 if _dp_current_epsilon_pld > 0 else 0
+                    eps_str += f' (RDP {_gap_pct:+.1f}% vs PLD)'
+                if _dp_current_epsilon_prv < float('inf'):
+                    eps_str += f', eps_prv={_dp_current_epsilon_prv:.4f}'
                 if N_clinical > 0:
                     eps_str += f', eps_clinical={_dp_epsilon_clinical:.4f}'
                 if N_literature > 0:
