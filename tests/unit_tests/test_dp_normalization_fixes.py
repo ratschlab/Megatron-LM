@@ -348,30 +348,35 @@ class TestSamplingAccountingMatch:
     the actual dataloader."""
 
     def test_shuffle_wor_uses_correct_event(self):
-        """shuffle_wor sampling should use SampledWithoutReplacementDpEvent,
-        not PoissonSampledDpEvent (which underreports ε by ~15×)."""
-        try:
-            from dp_accounting import dp_event as dp_evt
+        """shuffle_wor must be accounted as sampling without replacement under
+        replace-one adjacency with sigma/2, and the event must actually
+        compose (constructing it alone never caught the add/remove mismatch
+        that crashed training after the first step)."""
+        pytest.importorskip("dp_accounting")
+        from dp_accounting import dp_event as dp_evt
+        from megatron.training.dp_accounting_utils import DPAccountantBundle
 
-            # Poisson ε
-            poisson_event = dp_evt.PoissonSampledDpEvent(
-                sampling_probability=0.01,
-                event=dp_evt.GaussianDpEvent(0.6),
-            )
+        b = DPAccountantBundle('shuffle_wor', 10000, 100, 0.01, 1e-7, 0.6,
+                               enable_prv=False)
+        ev = b.step_event(0.6)
+        assert isinstance(ev, dp_evt.SampledWithoutReplacementDpEvent)
+        assert ev.event.noise_multiplier == pytest.approx(0.3)
+        b.compose_step(0.6)
+        assert 0 < b.epsilon(force=True) < float('inf')
 
-            # Shuffle-WOR ε
-            swor_event = dp_evt.SampledWithoutReplacementDpEvent(
-                sample_size=100,
-                source_dataset_size=10000,
-                event=dp_evt.GaussianDpEvent(0.6),
-            )
+    def test_truncated_poisson_uses_truncated_event(self):
+        """truncated_poisson must be accounted with the certified truncated
+        event (random-subset truncation), not plain Poisson sampling."""
+        pytest.importorskip("dp_accounting")
+        from dp_accounting import dp_event as dp_evt
+        from megatron.training.dp_accounting_utils import DPAccountantBundle
 
-            # Both should be valid events (no crash)
-            assert poisson_event is not None
-            assert swor_event is not None
-
-        except ImportError:
-            pytest.skip("dp-accounting not installed")
+        b = DPAccountantBundle('truncated_poisson', 10000, 100, 0.0085, 1e-7, 0.6,
+                               enable_prv=False, pld_discretization=1e-2)
+        ev = b.step_event(0.6)
+        assert isinstance(ev, dp_evt.TruncatedSubsampledGaussianDpEvent)
+        b.compose_step(0.6)
+        assert 0 < b.epsilon(force=True) < float('inf')
 
 
 # ---------------------------------------------------------------------------

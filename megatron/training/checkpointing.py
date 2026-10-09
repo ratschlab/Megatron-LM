@@ -379,6 +379,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
     maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
 
+    # DP-SGD: capture the external dataloader's sampler state so that a resumed
+    # run continues the sampling sequence instead of restarting from epoch 0.
+    args._dp_dataloader_state_to_save = None
+    if getattr(args, 'dp_sgd', False) and train_data_iterator is not None:
+        _dp_iter = train_data_iterator[0] if isinstance(train_data_iterator, list) \
+            else train_data_iterator
+        _dp_loader = getattr(_dp_iter, 'iterable', None)
+        if hasattr(_dp_loader, 'save_state') and hasattr(_dp_loader, 'accounting_params'):
+            args._dp_dataloader_state_to_save = _dp_loader.save_state()
+
     # Save distributed optimizer's custom parameter state.
     if (
         args.use_distributed_optimizer
@@ -676,21 +686,39 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
 
     # DP-SGD privacy accountant state and noise seed.
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
-        from megatron.training.training import (
-            _dp_accountant, _dp_current_epsilon,
-            _dp_clinical_steps, _dp_literature_steps,
-            _dp_epsilon_clinical, _dp_epsilon_literature,
-        )
+        import megatron.training.training as training_module
+        _dp_accountant = training_module._dp_accountant
         if _dp_accountant is not None:
-            state_dict['dp_sgd_epsilon'] = _dp_current_epsilon
-            state_dict['dp_sgd_clinical_steps'] = _dp_clinical_steps
-            state_dict['dp_sgd_literature_steps'] = _dp_literature_steps
-            state_dict['dp_sgd_epsilon_clinical'] = _dp_epsilon_clinical
-            state_dict['dp_sgd_epsilon_literature'] = _dp_epsilon_literature
+            # Force an exact evaluation so the stored epsilon is certified, not a bound.
+            state_dict['dp_sgd_epsilon'] = _dp_accountant.epsilon(force=True)
+            state_dict['dp_sgd_accounting'] = {
+                'sampling_method': _dp_accountant.sampling_method,
+                'dataset_size': _dp_accountant.N,
+                'physical_batch': _dp_accountant.B,
+                'sampling_probability': _dp_accountant.q,
+                'delta': _dp_accountant.delta,
+                'total_steps': _dp_accountant.total_steps,
+                'last_increment': _dp_accountant.last_increment,
+            }
+            state_dict['dp_sgd_clinical_steps'] = training_module._dp_clinical_steps
+            state_dict['dp_sgd_literature_steps'] = training_module._dp_literature_steps
+            state_dict['dp_sgd_epsilon_clinical'] = training_module._dp_epsilon_clinical
+            state_dict['dp_sgd_epsilon_literature'] = training_module._dp_epsilon_literature
         if getattr(args, 'dp_noise_seed', None) is not None:
             state_dict['dp_sgd_noise_seed'] = args.dp_noise_seed
-        if hasattr(args, 'dp_clipping_norm_current') and args.dp_clipping_norm_current != float('inf'):
+        state_dict['dp_sgd_noise_multiplier'] = args.dp_noise_multiplier
+        state_dict['dp_sgd_clipping_norm_cli'] = args.dp_clipping_norm
+        # Adaptive clipping state only: in fixed-C mode the clipping norm is the
+        # command-line value and must not be carried over (clipping and noise
+        # would otherwise use different C after a resume with a changed C).
+        if getattr(args, 'dp_clipping_percentile', None) is not None and \
+                hasattr(args, 'dp_clipping_norm_current') and \
+                args.dp_clipping_norm_current != float('inf'):
             state_dict['dp_clipping_norm_current'] = args.dp_clipping_norm_current
+        # DP external dataloader sampler state (identical on all ranks: shared seed).
+        _dl_state = getattr(args, '_dp_dataloader_state_to_save', None)
+        if _dl_state is not None:
+            state_dict['dp_dataloader_state'] = _dl_state
         # Save per-layer clipping thresholds
         if getattr(args, 'dp_clipping_mode', 'global') == 'per_layer':
             from megatron.core.utils import get_model_config
@@ -1306,6 +1334,35 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         import megatron.training.training as training_module
         training_module._dp_current_epsilon = state_dict['dp_sgd_epsilon']
         print_rank_0(f'DP-SGD: Restored epsilon = {state_dict["dp_sgd_epsilon"]:.4f} from checkpoint')
+        _acct = state_dict.get('dp_sgd_accounting')
+        if _acct is not None:
+            args._dp_accounting_at_resume = _acct
+            if _acct.get('sampling_method') != getattr(args, 'dp_sampling_method', None):
+                raise RuntimeError(
+                    f'DP-SGD: checkpoint was trained with --dp-sampling-method '
+                    f'{_acct.get("sampling_method")} but the current run uses '
+                    f'{getattr(args, "dp_sampling_method", None)}. The sampling '
+                    f'analysis cannot be continued across sampler changes.')
+            if abs(_acct.get('delta', args.dp_delta) - args.dp_delta) > 0:
+                raise RuntimeError(
+                    f'DP-SGD: checkpoint delta={_acct.get("delta")} differs from '
+                    f'--dp-delta {args.dp_delta}; epsilons at different delta do not add.')
+        if 'dp_sgd_noise_multiplier' in state_dict and \
+                state_dict['dp_sgd_noise_multiplier'] != args.dp_noise_multiplier:
+            print_rank_0(f'DP-SGD: NOTE noise multiplier changed on resume '
+                         f'({state_dict["dp_sgd_noise_multiplier"]} -> {args.dp_noise_multiplier}); '
+                         f'pre-resume epsilon is carried over by basic composition.')
+    if 'dp_dataloader_state' in state_dict:
+        # Consumed by the DP external dataloader when it is constructed
+        # (train_valid_test_datasets_provider runs after checkpoint load).
+        args._dp_dataloader_state = state_dict['dp_dataloader_state']
+        print_rank_0('DP-SGD: Restored sampler state from checkpoint '
+                     f'(steps_completed={state_dict["dp_dataloader_state"].get("steps_completed")})')
+    elif getattr(args, 'dp_sgd', False) and getattr(args, 'dp_data_path', None) \
+            and not args.finetune:
+        print_rank_0('WARNING: DP-SGD checkpoint has no sampler state; the dataloader '
+                     'restarts its sampling sequence. Repeated batches are charged '
+                     'as independent steps, which under-states epsilon.')
         # Restore dual analysis state
         if 'dp_sgd_clinical_steps' in state_dict:
             training_module._dp_clinical_steps = state_dict['dp_sgd_clinical_steps']
@@ -1323,10 +1380,20 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         if getattr(args, 'dp_noise_seed', None) is None:
             args.dp_noise_seed = state_dict['dp_sgd_noise_seed']
             print_rank_0(f'DP-SGD: Restored noise seed = {args.dp_noise_seed} from checkpoint')
-        # Restore adaptive clipping C
-        if 'dp_clipping_norm_current' in state_dict:
-            args.dp_clipping_norm_current = state_dict['dp_clipping_norm_current']
-            print_rank_0(f'DP-SGD: Restored adaptive C = {args.dp_clipping_norm_current} from checkpoint')
+        # Restore adaptive clipping C (adaptive mode only). In fixed-C mode the
+        # clipping norm is always the command-line value so that clipping and
+        # noise calibration agree; a changed C on resume is reported, not mixed.
+        if getattr(args, 'dp_clipping_percentile', None) is not None:
+            if 'dp_clipping_norm_current' in state_dict:
+                args.dp_clipping_norm_current = state_dict['dp_clipping_norm_current']
+                print_rank_0(f'DP-SGD: Restored adaptive C = {args.dp_clipping_norm_current} from checkpoint')
+        else:
+            args.dp_clipping_norm_current = args.dp_clipping_norm
+            _ckpt_c = state_dict.get('dp_sgd_clipping_norm_cli', state_dict.get('dp_clipping_norm_current'))
+            if _ckpt_c is not None and _ckpt_c != args.dp_clipping_norm:
+                print_rank_0(f'DP-SGD: NOTE clipping norm changed on resume '
+                             f'({_ckpt_c} -> {args.dp_clipping_norm}); clipping and noise '
+                             f'both use the new value from this step on.')
         # Restore per-layer clipping thresholds
         if 'dp_per_layer_C' in state_dict:
             from megatron.core.utils import get_model_config

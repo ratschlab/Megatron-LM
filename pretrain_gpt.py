@@ -327,33 +327,62 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
         print_rank_0(f"> building DP external dataloader from {args.dp_data_path} ...")
 
+        # On-the-fly JSONL mode needs a tokenizer; the pre-tokenized directory
+        # mode does not (it carries eod_token_id in metadata.json).
+        tokenizer = None
+        if os.path.isfile(args.dp_data_path) and args.dp_data_path.endswith('.jsonl'):
+            tokenizer = get_tokenizer()
+
         train_ds = DPExternalDataloader(
             data_path=args.dp_data_path,
             micro_batch_size=args.micro_batch_size,
             seq_length=args.seq_length,
-            sampling_method=getattr(args, 'dp_sampling_method', 'shuffle_wor'),
+            sampling_method=getattr(args, 'dp_sampling_method', 'truncated_poisson'),
             seed=args.seed,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             num_microbatches=num_microbatches,
+            tokenizer=tokenizer,
+            poisson_expected_fraction=getattr(args, 'dp_poisson_expected_fraction', 0.85),
         )
 
-        # N for privacy accounting: can be larger than the dataloader size.
-        # E.g., 250K total patients in the hospital, but only 5K tokenized so far.
-        # Epsilon is computed with the POOL size, not the training set size.
+        # Resume: continue the sampling sequence from the checkpointed state.
+        _dl_state = getattr(args, '_dp_dataloader_state', None)
+        if _dl_state is not None:
+            train_ds.load_state(_dl_state)
+            print_rank_0(f"  Restored sampler state: epoch={train_ds._epoch}, "
+                         f"steps_completed={train_ds._steps_completed}")
+
+        # N for privacy accounting is the number of records the sampler can
+        # actually draw. A larger "pool" N would understate the per-record
+        # sampling rate of the records that are trained on and is not valid.
         if args.dp_num_dataset_examples == 0:
             args.dp_num_dataset_examples = train_ds.N
             print_rank_0(f"  Auto-detected N={train_ds.N} from dataloader")
         elif args.dp_num_dataset_examples > train_ds.N:
-            print_rank_0(f"  NOTE: N for epsilon accounting ({args.dp_num_dataset_examples}) > "
-                         f"dataloader size ({train_ds.N}). This is valid when the total "
-                         f"patient pool is larger than the tokenized training set.")
+            raise ValueError(
+                f"--dp-num-dataset-examples ({args.dp_num_dataset_examples}) is larger than "
+                f"the number of records the dataloader can sample ({train_ds.N}). The "
+                f"accountant must use the sampled population; a larger pool understates "
+                f"epsilon. Set it to {train_ds.N} or omit it.")
         elif args.dp_num_dataset_examples < train_ds.N:
             print_rank_0(f"  WARNING: N for accounting ({args.dp_num_dataset_examples}) < "
-                         f"dataloader size ({train_ds.N}). Epsilon may be overstated.")
+                         f"dataloader size ({train_ds.N}). Epsilon is overstated "
+                         f"(conservative).")
+
+        # Hand the sampler's exact parameters to the accountant so both describe
+        # the same mechanism (sampler, population, physical batch, inclusion rate).
+        _acct = train_ds.accounting_params()
+        if args.dp_num_dataset_examples != train_ds.N:
+            # Conservative: smaller N means a larger assumed inclusion rate.
+            _acct['dataset_size'] = args.dp_num_dataset_examples
+            _acct['sampling_probability'] = min(
+                1.0, _acct['sampling_probability'] * train_ds.N / args.dp_num_dataset_examples)
+        args.dp_accounting_params = _acct
 
         print_rank_0(f"  {train_ds.N} training records, N={args.dp_num_dataset_examples} for accounting, "
-                     f"sampling={train_ds.sampling_method}")
+                     f"sampling={train_ds.sampling_method}, q={_acct['sampling_probability']:.6g}, "
+                     f"physical batch={_acct['physical_batch']}")
         # Return train_ds as validation too (for --skip-train eval with same data).
         # The eval path is forward-only, so reusing train data is fine for loss comparison.
         return train_ds, train_ds, None

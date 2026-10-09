@@ -24,6 +24,8 @@ Phase 3c: Extended for pipeline parallelism (PP>1).
 from collections import defaultdict, deque
 from typing import Dict, Deque, List, Optional, Set, Tuple, Union
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -1059,3 +1061,68 @@ def _rewind_data_iterator(wrapped_iterator):
                 it.rewind()
     else:
         wrapped_iterator.rewind()
+
+
+# ---------------------------------------------------------------------------
+# Private initialization of the adaptive clipping norm
+# ---------------------------------------------------------------------------
+
+def private_quantile_init(
+    raw_norms: torch.Tensor,
+    target_quantile: float,
+    c_min: float,
+    c_max: float,
+    sigma_b: float,
+    batch_size_global: int,
+    num_queries: int,
+    seed: int,
+    dp_group=None,
+) -> float:
+    """Differentially private initialization of the clipping norm C.
+
+    Runs ``num_queries`` rounds of bisection in log space on the public
+    interval [c_min, c_max]. Each round releases the fraction of examples
+    whose gradient norm exceeds the candidate C with Gaussian noise of
+    standard deviation ``sigma_b / batch_size_global`` (the same noisy-count
+    query Andrew et al. 2021 use for the geometric update), so every query is
+    a Gaussian mechanism with noise multiplier ``sigma_b`` on the sampled
+    batch and must be charged to the accountant as such.
+
+    ``raw_norms`` holds this rank's local per-example norms; fractions are
+    averaged over the data-parallel group so all ranks obtain the same C.
+    The noise is drawn from a generator seeded identically on all ranks.
+
+    Returns the initialized C (always within [c_min, c_max]).
+    """
+    assert 0.0 < target_quantile < 1.0, target_quantile
+    assert 0.0 < c_min < c_max, (c_min, c_max)
+    assert num_queries >= 1, num_queries
+
+    dp_ws = 1
+    if dp_group is not None and torch.distributed.is_initialized():
+        dp_ws = torch.distributed.get_world_size(group=dp_group)
+    # Each rank holds B_local = batch_size_global / dp_ws norms; the global
+    # fraction is the mean of local fractions when all ranks hold equal counts.
+    target_frac_above = 1.0 - target_quantile
+
+    gen = torch.Generator()
+    gen.manual_seed(int(seed) % (2 ** 31 - 1))
+
+    lo = math.log(c_min)
+    hi = math.log(c_max)
+    norms = raw_norms.detach().float()
+    for _ in range(num_queries):
+        mid = 0.5 * (lo + hi)
+        c_mid = math.exp(mid)
+        frac = (norms > c_mid).float().mean()
+        if dp_ws > 1:
+            torch.distributed.all_reduce(frac, group=dp_group)
+            frac = frac / dp_ws
+        noise = torch.randn(1, generator=gen).item() * sigma_b / batch_size_global
+        noisy_frac = frac.item() + noise
+        if noisy_frac > target_frac_above:
+            lo = mid  # too many above threshold: raise C
+        else:
+            hi = mid
+    c_init = math.exp(0.5 * (lo + hi))
+    return float(min(max(c_init, c_min), c_max))

@@ -681,6 +681,9 @@ def _dp_sgd_ghost_forward_backward(
     C_max = args.dp_clipping_norm  # C_max from CLI (immutable upper bound)
     # For adaptive clipping, use the running C_current (updated at end of each step)
     C_active = getattr(args, 'dp_clipping_norm_current', C_max)
+    # Remember the C in force at the start of this step so a skipped optimizer
+    # step can discard the (private) adaptive update computed below.
+    args._dp_C_prev_step = C_active
     model_type = get_model_type(model)
 
     forward_data_store = []
@@ -759,22 +762,11 @@ def _dp_sgd_ghost_forward_backward(
                         p.main_grad.copy_(_saved_mg[p])
                 del _saved_mg
 
-        # Compute C from ALL GBS norms
-        all_norms = torch.cat(_init_norms)
-        target_quantile = _dp_clip_pct / 100.0
-        C_init = all_norms.quantile(target_quantile).item()
-        C_init = max(C_init, 1e-6)
-        _c_tensor = torch.tensor([C_init], dtype=torch.float32, device='cuda')
-        dp_group = parallel_state.get_data_parallel_group()
-        dp_src = parallel_state.get_data_parallel_src_rank()
-        torch.distributed.broadcast(_c_tensor, src=dp_src, group=dp_group)
-        C_init = _c_tensor.item()
+        # Private initialization of C from ALL GBS norms (noisy bisection; every
+        # query is charged to the accountant via args._dp_extra_sigma_b_queries).
+        C_init = _private_init_C(args, torch.cat(_init_norms), C_max, num_microbatches)
         C_active = C_init
-        args.dp_clipping_norm_current = C_init
-        if args.rank == 0:
-            print(f'DP-SGD adaptive C: initialized from {len(all_norms)} examples: '
-                  f'C={C_init:.4f} (P{_dp_clip_pct} of norms, '
-                  f'median={all_norms.median():.2f}, max={all_norms.max():.2f})')
+        args._dp_C_prev_step = C_init
 
         # Replace data_iterator with a replay of cached batches so the normal
         # loop below re-processes the same data with the correct C.
@@ -853,14 +845,16 @@ def _dp_sgd_ghost_forward_backward(
                     clip_factors = C_active / (raw_norms + 1e-6)
                 # else: clip_factors already computed by ghost_ctx with C_active
 
-            # Log clip stats if requested (first microbatch only)
-            if is_first and getattr(args, 'dp_log_clip_stats', False):
+            # Raw (un-noised) per-example statistics. NOT covered by the
+            # accountant: only under --dp-log-raw-stats, synthetic data only.
+            # With micro-batch size 1 these are single records' gradient norms.
+            if is_first and getattr(args, 'dp_log_raw_stats', False) and args.rank == 0:
                 all_norms_list = ghost_ctx._per_example_norm_sq_sharded + ghost_ctx._per_example_norm_sq_replicated
                 if all_norms_list:
                     norms = torch.stack(all_norms_list).sum(dim=0).sqrt()
                     frac_clipped = (clip_factors < 1.0).float().mean().item()
                     _C_log = getattr(args, 'dp_clipping_norm_current', C_max)
-                    print(f'DP-SGD clip stats: frac_clipped={frac_clipped:.2f}, '
+                    print(f'DP-SGD RAW (not private) clip stats: frac_clipped={frac_clipped:.2f}, '
                           f'C={_C_log:.4f}, '
                           f'norm min={norms.min():.2f} med={norms.median():.2f} '
                           f'max={norms.max():.2f}, '
@@ -922,14 +916,16 @@ def _dp_sgd_ghost_forward_backward(
             print(f'DIAGNOSTIC {status}: RNG replay verified (max loss diff = {max_diff:.2e})')
 
         # DEBUG: check main_grad BEFORE Pass 2 backward
-        if is_first:
+        # Diagnostic only (DP_SGD_DIAGNOSTIC=1): un-noised gradient norms are
+        # not covered by the accountant and must not be logged in production.
+        if is_first and _diagnostic:
             _n_inf_pre = sum(1 for p in model.parameters()
                 if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
                 and (torch.isinf(p.main_grad).any() or torch.isnan(p.main_grad).any()))
             _mg_pre = sum(p.main_grad.float().norm().item()**2
                 for p in model.parameters()
                 if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None)**0.5
-            print(f'DEBUG pre-pass2-bwd: main_grad_norm={_mg_pre:.4f}, inf={_n_inf_pre}')
+            print(f'DIAGNOSTIC pre-pass2-bwd: main_grad_norm={_mg_pre:.4f}, inf={_n_inf_pre}')
 
         # Scaled loss: backward produces Σ(clip_i · g_i) → accumulates into main_grad
         # per_example_losses are already per-token means (loss_func divides by token count).
@@ -954,18 +950,20 @@ def _dp_sgd_ghost_forward_backward(
 
     # ===== AFTER ALL MICROBATCHES: finalize =====
 
-    # DEBUG: check main_grad for inf/nan before finalize
-    _inf_names = [n for n, p in model.named_parameters()
-                  if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
-                  and (torch.isinf(p.main_grad).any() or torch.isnan(p.main_grad).any())]
-    _n_inf = len(_inf_names)
-    if _n_inf > 0:
-        print(f'DEBUG inf params: {_inf_names}')
-    _mg_norm = sum(p.main_grad.float().norm().item()**2
-                   for p in model.parameters()
-                   if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None)**0.5
-    print(f'DEBUG pre-finalize: total_num_tokens={total_num_tokens.item()}, '
-          f'main_grad_norm={_mg_norm:.4f}, params_with_inf={_n_inf}')
+    # Diagnostic only (DP_SGD_DIAGNOSTIC=1): the pre-noise clipped gradient
+    # norm is an un-noised function of the batch and must not be logged.
+    if _diagnostic:
+        _inf_names = [n for n, p in model.named_parameters()
+                      if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None
+                      and (torch.isinf(p.main_grad).any() or torch.isnan(p.main_grad).any())]
+        _n_inf = len(_inf_names)
+        if _n_inf > 0:
+            print(f'DIAGNOSTIC inf params: {_inf_names}')
+        _mg_norm = sum(p.main_grad.float().norm().item()**2
+                       for p in model.parameters()
+                       if p.requires_grad and hasattr(p, 'main_grad') and p.main_grad is not None)**0.5
+        print(f'DIAGNOSTIC pre-finalize: total_num_tokens={total_num_tokens.item()}, '
+              f'main_grad_norm={_mg_norm:.4f}, params_with_inf={_n_inf}')
 
     # Adaptive clipping: set noise C to the C actually used for clipping this step,
     # then update C for the next step via private geometric update.
@@ -998,16 +996,21 @@ def _dp_sgd_ghost_forward_backward(
         _noise_rng.manual_seed(_noise_seed % (2**31 - 1))
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
+        _released_frac = _frac + noise  # the only quantity that leaves the batch
+        C_next = C_current * _math.exp(_adapt_lr * (_released_frac - target_frac))
         C_next = max(C_next, 1e-6)
         C_next = min(C_next, C_max)  # cap at C_max (--dp-clipping-norm)
         args.dp_clipping_norm_current = C_next  # for NEXT step
 
-        # Log: show C used THIS step and the updated C for next step
-        actual_frac = (all_norms > C_current).float().mean().item()
-        if args.rank == 0:
+        # Log only privately released quantities (C_used, C_next and the noisy
+        # fraction). The raw fraction and norm quantiles are un-noised functions
+        # of private data and are printed only under --dp-log-raw-stats.
+        if args.rank == 0 and getattr(args, 'dp_log_clip_stats', False):
             print(f'DP-SGD adaptive C: C_used={C_current:.4f}, C_next={C_next:.4f}, '
-                  f'frac_clipped={actual_frac:.3f} (target={target_frac:.3f}), '
+                  f'released_frac_clipped={_released_frac:.3f} (target={target_frac:.3f})')
+        if args.rank == 0 and getattr(args, 'dp_log_raw_stats', False):
+            actual_frac = (all_norms > C_current).float().mean().item()
+            print(f'DP-SGD RAW (not private) adaptive C: frac_clipped={actual_frac:.3f}, '
                   f'norm p50={all_norms.median():.2f} p90={all_norms.quantile(0.9):.2f} '
                   f'max={all_norms.max():.2f}')
 
@@ -1200,6 +1203,8 @@ def _dp_sgd_pipeline_forward_backward(
     config = get_model_config(model_list[0])
     C_max = args.dp_clipping_norm  # C_max from CLI (immutable upper bound)
     C_active = getattr(args, 'dp_clipping_norm_current', C_max)  # adaptive C
+    args._dp_C_prev_step = C_active  # restored if the optimizer step is skipped
+    _pp_raw_norms = None  # per-example norms snapshot for the adaptive update
 
     # Wrap data iterator for two-pass replay (caches all microbatches)
     replay_data_iterator = _wrap_data_iterator(data_iterator, use_pipeline=True)
@@ -1364,13 +1369,29 @@ def _dp_sgd_pipeline_forward_backward(
         # Adaptive clipping for PP>1.
         _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
         if _dp_clip_pct is not None:
+            # Snapshot raw norms now: remove_hooks() in the finally block below
+            # clears them, and the end-of-step adaptive update needs them.
+            _pp_raw_norms = torch.cat([
+                ghost_ctx.get_raw_norms(microbatch_id=k) for k in range(num_microbatches)
+            ])
             if _dp_clip_pct == 0:
-                # Bu et al. automatic clipping: recompute without min(1,...) clamp
+                # Bu et al. automatic clipping: recompute without min(1,...) clamp.
+                # C_active is the (finite) --dp-clipping-norm scale.
                 for k in range(len(clip_factors_list)):
                     rn = ghost_ctx.get_raw_norms(microbatch_id=k)
                     clip_factors_list[k] = C_active / (rn + 1e-6)
-            # P>0: clip_factors already computed by ghost_ctx with C_active.
-            # No recomputation needed.
+            elif C_active == float('inf'):
+                # First step: private initialization of C from this step's Pass 1
+                # norms (PP>1 runs Pass 1 for all microbatches before Pass 2, so
+                # no separate replay is needed). Queries are charged via
+                # args._dp_extra_sigma_b_queries.
+                C_active = _private_init_C(args, _pp_raw_norms, C_max, num_microbatches)
+                args._dp_C_prev_step = C_active
+                ghost_ctx.C = C_active
+                for k in range(len(clip_factors_list)):
+                    rn = ghost_ctx.get_raw_norms(microbatch_id=k)
+                    clip_factors_list[k] = torch.clamp(C_active / (rn + 1e-6), max=1.0)
+            # P>0 with finite C: clip_factors already computed with C_active.
 
         # Sanitize clip factors
         for k in range(len(clip_factors_list)):
@@ -1472,16 +1493,16 @@ def _dp_sgd_pipeline_forward_backward(
     _dp_clip_pct = getattr(args, 'dp_clipping_percentile', None)
     if _dp_clip_pct is not None:
         C_this_step = getattr(args, 'dp_clipping_norm_current', C_max)
-        if C_this_step == float('inf'):
-            C_this_step = 1.0
+        assert C_this_step != float('inf'), (
+            'DP-SGD: clipping norm is still infinite after Pass 1; the private '
+            'initialization did not run. Noise cannot be calibrated.'
+        )
         config.dp_clipping_norm = C_this_step
 
     if _dp_clip_pct is not None and _dp_clip_pct != 0:
         import math as _math
-        all_raw_norms = torch.cat([
-            ghost_ctx.get_raw_norms(microbatch_id=k)
-            for k in range(num_microbatches)
-        ])
+        assert _pp_raw_norms is not None, 'Pass 1 did not produce raw norms'
+        all_raw_norms = _pp_raw_norms  # snapshot taken before remove_hooks()
         C_current = getattr(args, 'dp_clipping_norm_current', C_max)
         target_frac = 1.0 - _dp_clip_pct / 100.0
 
@@ -1500,15 +1521,20 @@ def _dp_sgd_pipeline_forward_backward(
         _noise_rng.manual_seed(_noise_seed % (2**31 - 1))
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
-        C_next = C_current * _math.exp(_adapt_lr * (_frac + noise - target_frac))
+        _released_frac = _frac + noise  # the only quantity that leaves the batch
+        C_next = C_current * _math.exp(_adapt_lr * (_released_frac - target_frac))
         C_next = max(C_next, 1e-6)
         C_next = min(C_next, C_max)  # cap at C_max (--dp-clipping-norm)
         args.dp_clipping_norm_current = C_next
 
-        actual_frac = (all_raw_norms > C_current).float().mean().item()
-        if args.rank == 0:
+        # Log only privately released quantities; raw statistics are un-noised
+        # functions of private data and need --dp-log-raw-stats.
+        if args.rank == 0 and getattr(args, 'dp_log_clip_stats', False):
             print(f'DP-SGD adaptive C: C_used={C_current:.4f}, C_next={C_next:.4f}, '
-                  f'frac_clipped={actual_frac:.3f} (target={target_frac:.3f}), '
+                  f'released_frac_clipped={_released_frac:.3f} (target={target_frac:.3f})')
+        if args.rank == 0 and getattr(args, 'dp_log_raw_stats', False):
+            actual_frac = (all_raw_norms > C_current).float().mean().item()
+            print(f'DP-SGD RAW (not private) adaptive C: frac_clipped={actual_frac:.3f}, '
                   f'norm p50={all_raw_norms.median():.2f} '
                   f'p90={all_raw_norms.quantile(0.9):.2f} '
                   f'max={all_raw_norms.max():.2f}')
@@ -3052,3 +3078,43 @@ def forward_backward_pipelining_without_interleaving(
         create_cudagraphs()
 
     return forward_data_store
+
+
+def _private_init_C(args, raw_norms_local, C_max, num_microbatches):
+    """Initialize the adaptive clipping norm privately on the first step.
+
+    Runs ``args.dp_clipping_init_queries`` noisy-fraction bisection queries on
+    the public interval [C_max * 1e-9, C_max] (see
+    ``ghost_clipping.private_quantile_init``). All data-parallel ranks obtain
+    the same C from all-reduced fractions and a shared noise seed. The number
+    of queries is recorded in ``args._dp_extra_sigma_b_queries`` so that
+    ``train()`` charges them to the accountant.
+    """
+    from megatron.core.pipeline_parallel.ghost_clipping import private_quantile_init
+
+    pct = args.dp_clipping_percentile
+    num_queries = int(getattr(args, 'dp_clipping_init_queries', 12))
+    sigma_b = float(getattr(args, 'dp_adapt_sigma_b', 10.0))
+    dp_ws = parallel_state.get_data_parallel_world_size()
+    batch_global = args.micro_batch_size * dp_ws * num_microbatches
+    seed = (int(getattr(args, 'dp_noise_seed', 0)) * 1000003
+            + int(getattr(args, 'curr_iteration', 0)) + 101)
+    c_min = max(C_max * 1e-9, 1e-9)
+    C_init = private_quantile_init(
+        raw_norms=raw_norms_local,
+        target_quantile=pct / 100.0,
+        c_min=c_min,
+        c_max=C_max,
+        sigma_b=sigma_b,
+        batch_size_global=batch_global,
+        num_queries=num_queries,
+        seed=seed,
+        dp_group=parallel_state.get_data_parallel_group() if dp_ws > 1 else None,
+    )
+    args.dp_clipping_norm_current = C_init
+    args._dp_extra_sigma_b_queries = getattr(args, '_dp_extra_sigma_b_queries', 0) + num_queries
+    if args.rank == 0:
+        print(f'DP-SGD adaptive C: privately initialized C={C_init:.4f} '
+              f'(P{pct}, {num_queries} noisy-fraction queries at sigma_b={sigma_b}, '
+              f'charged to the accountant)')
+    return C_init

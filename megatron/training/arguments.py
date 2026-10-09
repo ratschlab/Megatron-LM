@@ -286,6 +286,28 @@ def validate_args(args, defaults={}):
             'DP-SGD requires context_parallel_size=1'
         assert not getattr(args, 'num_experts', None), \
             'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
+        # Tied input embedding / output projection share one weight, but ghost
+        # clipping sums their squared norm contributions as if independent. The
+        # true per-example norm of the shared weight can exceed that estimate
+        # by up to sqrt(2), so the clipping bound C would not hold.
+        assert args.untie_embeddings_and_output_weights, \
+            'DP-SGD requires --untie-embeddings-and-output-weights (ghost clipping ' \
+            'norms are not valid for a weight shared by embedding and output layer)'
+        _pct = getattr(args, 'dp_clipping_percentile', None)
+        if _pct is not None:
+            assert 0 <= _pct < 100, \
+                f'--dp-clipping-percentile must be in [0, 100), got {_pct}'
+            assert getattr(args, 'dp_clipping_init_queries', 12) >= 1, \
+                '--dp-clipping-init-queries must be >= 1'
+        _frac = getattr(args, 'dp_poisson_expected_fraction', 0.85)
+        assert 0.0 < _frac <= 1.0, \
+            f'--dp-poisson-expected-fraction must be in (0, 1], got {_frac}'
+        if getattr(args, 'dp_sampling_method', 'truncated_poisson') == 'shuffle_wor' \
+                and args.rank == 0:
+            print('WARNING: --dp-sampling-method shuffle_wor is accounted as sampling '
+                  'without replacement under replace-one adjacency with sigma/2 '
+                  '(RDP, heuristic). Expect roughly 2.4x the noise of truncated_poisson '
+                  'at equal epsilon. Prefer the default truncated_poisson.')
 
     # DP-SGD-specific auto-configuration (only when --dp-sgd is set).
     if args.dp_sgd:
@@ -2557,13 +2579,46 @@ def _add_dp_sgd_args(parser):
                        help='Path to JSONL or pre-tokenized data directory for '
                        'DP training. When set, uses DPExternalDataloader '
                        'instead of GPTDataset.')
-    group.add_argument('--dp-sampling-method', type=str, default='shuffle_wor',
-                       choices=['shuffle_wor', 'truncated_poisson'],
-                       help='Batch sampling method for DP accounting. '
-                       'shuffle_wor: fixed-batch WOR with REPLACE_ONE. '
-                       'truncated_poisson: Poisson inclusion with ADD_OR_REMOVE_ONE.')
+    group.add_argument('--dp-sampling-method', type=str, default='truncated_poisson',
+                       choices=['truncated_poisson', 'shuffle_wor'],
+                       help='Batch sampling method; the accountant is derived from it. '
+                       'truncated_poisson (default): Poisson inclusion, random-subset '
+                       'truncation to the physical batch, certified by the PLD accountant '
+                       '(TruncatedSubsampledGaussianDpEvent, add/remove adjacency). '
+                       'shuffle_wor: fixed-batch epoch scan, accounted as sampling '
+                       'without replacement under replace-one adjacency with sigma/2 '
+                       '(RDP only, heuristic upper bound; PLD/PRV disabled).')
+    group.add_argument('--dp-poisson-expected-fraction', type=float, default=0.85,
+                       help='truncated_poisson only: expected Poisson draw as a fraction '
+                       'of the physical batch (q = fraction * B / N). Below 1.0 the '
+                       'certified epsilon stays close to the untruncated one; at 1.0 '
+                       'truncation fires on half the steps and epsilon is ~10x larger.')
+    group.add_argument('--dp-accounting-eval-interval', type=int, default=10,
+                       help='Steps between exact evaluations of the certified epsilon '
+                       '(a truncated-Poisson PLD evaluation costs ~0.3 s at the default '
+                       'discretization). Between evaluations a conservative bound from '
+                       'the last per-step increment is used; the budget gate forces an '
+                       'exact evaluation when the bound approaches the budget.')
+    group.add_argument('--dp-pld-discretization', type=float, default=1e-3,
+                       help='PLD value_discretization_interval for the certified '
+                       'accountant. 1e-3 is ~10x faster than 1e-4 and about 0.5%% '
+                       'looser; any value is a valid upper bound.')
+    group.add_argument('--dp-allow-no-accounting', action='store_true', default=False,
+                       help='Permit DP training without dp-accounting installed '
+                       '(no epsilon, no budget gate). For synthetic-data tests only.')
+    group.add_argument('--dp-clipping-init-queries', type=int, default=12,
+                       help='Adaptive clipping only: number of noisy-fraction bisection '
+                       'queries used to initialize C privately on the first step. Each '
+                       'query is a Gaussian mechanism with --dp-adapt-sigma-b on the '
+                       'sampled batch and is charged to the accountant.')
     group.add_argument('--dp-log-clip-stats', action='store_true', default=False,
-                       help='Log per-step clip fraction, norm stats, and epsilon.')
+                       help='Log per-step clipping norm C, the privately released '
+                       'clipped fraction (adaptive mode) and epsilon. Prints only '
+                       'quantities covered by the accountant.')
+    group.add_argument('--dp-log-raw-stats', action='store_true', default=False,
+                       help='Additionally print raw (un-noised) per-example gradient '
+                       'norm statistics and clipped fractions. NOT PRIVATE: such logs '
+                       'must never leave the trusted data boundary. Synthetic data only.')
     group.add_argument('--dp-clipping-norm-per-token', action='store_true', default=False,
                        help='Interpret --dp-clipping-norm as a per-token value and '
                        'auto-scale by sequence length S. Internal C = C_per_token * S. '

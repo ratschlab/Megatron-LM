@@ -67,24 +67,13 @@ _dp_epsilon_clinical = 0.0
 _dp_epsilon_literature = 0.0
 
 
-def _compute_epsilon_for_steps(num_steps, q, sigma, delta):
-    """Compute epsilon for a given number of steps with sampling rate q."""
-    from dp_accounting.rdp import rdp_privacy_accountant
-    from dp_accounting import dp_event as dp_evt
-    acc = rdp_privacy_accountant.RdpAccountant(
-        orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
-        neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
-    )
-    acc.compose(
-        dp_evt.SelfComposedDpEvent(
-            event=dp_evt.PoissonSampledDpEvent(
-                sampling_probability=q,
-                event=dp_evt.GaussianDpEvent(sigma),
-            ),
-            count=num_steps,
-        )
-    )
-    return acc.get_epsilon(delta)
+def _compute_epsilon_for_steps(num_steps, q, sigma, delta, sampling_method,
+                               dataset_size, physical_batch):
+    """Certified epsilon of ``num_steps`` identical steps for one population
+    (used by the dual clinical/literature counters)."""
+    from megatron.training.dp_accounting_utils import epsilon_for_steps
+    return epsilon_for_steps(sampling_method, dataset_size, physical_batch,
+                             q, sigma, delta, num_steps)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1648,16 +1637,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     global _dp_clinical_steps, _dp_literature_steps
     global _dp_epsilon_clinical, _dp_epsilon_literature
     if hasattr(args, 'dp_sgd') and args.dp_sgd:
-        # Generate random base seed for DP noise if not specified or restored.
-        # This seed is serialized in checkpoints for resume correctness.
-        # Initialize adaptive clipping state
+        # Adaptive clipping state. Percentile > 0: C is initialized privately on
+        # the first step (noisy bisection in schedules.py), so start from inf.
+        # Percentile == 0 (automatic clipping, Bu et al.): every example is
+        # normalized to norm C = --dp-clipping-norm, which must be finite.
         if not hasattr(args, 'dp_clipping_norm_current'):
-            if getattr(args, 'dp_clipping_percentile', None) is not None:
-                # Adaptive clipping: start from inf so the first iteration
-                # initializes C from observed gradient norms (in schedules.py).
+            _pct = getattr(args, 'dp_clipping_percentile', None)
+            if _pct is not None and _pct != 0:
                 args.dp_clipping_norm_current = float('inf')
             else:
                 args.dp_clipping_norm_current = args.dp_clipping_norm
+        args._dp_extra_sigma_b_queries = 0
 
         if args.dp_noise_seed is None:
             args.dp_noise_seed = torch.randint(0, 2**31 - 1, (1,)).item()
@@ -1667,57 +1657,73 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             torch.distributed.broadcast(seed_tensor, src=0)
             args.dp_noise_seed = seed_tensor.item()
         if args.rank == 0:
-            print(f'DP-SGD: Noise base seed = {args.dp_noise_seed}'
-                  f'{" (user-specified)" if "--dp-noise-seed" in sys.argv else " (random)"}')
+            _seed_src = ('user-specified' if '--dp-noise-seed' in sys.argv
+                         else 'random, stored in the checkpoint')
+            # The seed value itself is deliberately not logged: with two
+            # consecutive checkpoints it allows exact reconstruction of the
+            # noise and therefore of the un-noised clipped gradient sum.
+            print(f'DP-SGD: Noise base seed set ({_seed_src}); value not logged.')
 
         # If epsilon was restored from a checkpoint, record it as the baseline.
         _dp_epsilon_at_resume = _dp_current_epsilon
-        try:
-            from dp_accounting.rdp import rdp_privacy_accountant
-            _dp_accountant = rdp_privacy_accountant.RdpAccountant(
-                orders=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
-                neighboring_relation=rdp_privacy_accountant.NeighborRel.ADD_OR_REMOVE_ONE,
-            )
-
-            # PLD accountant (tighter than RDP, FFT-based)
-            try:
-                from dp_accounting.pld import privacy_loss_distribution
-                from dp_accounting.pld import pld_privacy_accountant
-                _dp_pld_accountant = pld_privacy_accountant.PLDAccountant()
+        _dp_accountant = None
+        _dp_pld_accountant = None
+        _dp_prv_accountant = None
+        if args.dp_noise_multiplier > 0:
+            _acct_params = getattr(args, 'dp_accounting_params', None)
+            if _acct_params is None:
+                # Not using the DP external dataloader: derive the parameters
+                # from the command line. GPTDataset does not sample the way the
+                # accountant assumes, so this is only acceptable for tests.
+                _B = (mpu.get_data_parallel_world_size() * args.micro_batch_size
+                      * get_num_microbatches())
+                _method = getattr(args, 'dp_sampling_method', 'truncated_poisson')
+                _q = _B / args.dp_num_dataset_examples
+                if _method == 'truncated_poisson':
+                    _q *= getattr(args, 'dp_poisson_expected_fraction', 0.85)
+                _acct_params = dict(sampling_method=_method,
+                                    dataset_size=args.dp_num_dataset_examples,
+                                    physical_batch=_B,
+                                    sampling_probability=min(1.0, _q))
                 if args.rank == 0:
-                    print('DP-SGD: PLD accountant initialized (tighter than RDP)')
-            except (ImportError, AttributeError):
-                _dp_pld_accountant = None
-                if args.rank == 0:
-                    print('NOTE: PLD accountant not available (dp-accounting version may be too old)')
-
-            # PRV accountant (tightest, Gopi et al. 2021)
+                    print('WARNING: DP-SGD accounting without --dp-data-path: the '
+                          'accountant assumes the sampler matches --dp-sampling-method, '
+                          'which GPTDataset does not. Synthetic tests only.')
             try:
-                from prv_accountant import Accountant as PRVAccountant
-                _dp_prv_accountant = PRVAccountant(
-                    noise_multiplier=args.dp_noise_multiplier,
-                    sampling_probability=global_batch_size / args.dp_num_dataset_examples
-                        if hasattr(args, 'dp_num_dataset_examples') and args.dp_num_dataset_examples > 0
-                        else 0.01,
+                from megatron.training.dp_accounting_utils import DPAccountantBundle
+                _dp_accountant = DPAccountantBundle(
+                    sampling_method=_acct_params['sampling_method'],
+                    dataset_size=_acct_params['dataset_size'],
+                    physical_batch=_acct_params['physical_batch'],
+                    sampling_probability=_acct_params['sampling_probability'],
                     delta=args.dp_delta,
-                    max_compositions=getattr(args, 'train_iters', 1000),
-                    eps_error=0.1,
+                    noise_multiplier=args.dp_noise_multiplier,
+                    train_iters=args.train_iters,
+                    eval_interval=getattr(args, 'dp_accounting_eval_interval', 10),
+                    pld_discretization=getattr(args, 'dp_pld_discretization', 1e-3),
                 )
+            except ImportError as e:
+                if not getattr(args, 'dp_allow_no_accounting', False):
+                    raise RuntimeError(
+                        'DP-SGD requires dp-accounting (pip install dp-accounting) to '
+                        'certify epsilon. Pass --dp-allow-no-accounting to train without '
+                        'accounting and without a budget gate (synthetic data only).'
+                    ) from e
                 if args.rank == 0:
-                    print('DP-SGD: PRV accountant initialized (tightest)')
-            except ImportError:
-                _dp_prv_accountant = None
+                    print('WARNING: dp-accounting not installed; privacy accounting and '
+                          'the epsilon budget are DISABLED (--dp-allow-no-accounting).')
+            if _dp_accountant is not None:
+                _dp_accountant.epsilon_at_resume = _dp_epsilon_at_resume
+                _resume = getattr(args, '_dp_accounting_at_resume', None)
+                if _resume is not None:
+                    _dp_accountant.last_increment = float(_resume.get('last_increment', 0.0))
                 if args.rank == 0:
-                    print('NOTE: PRV accountant not available. Install with: pip install prv-accountant')
-            _dp_current_epsilon = 0.0
-            if args.rank == 0:
-                print(f'DP-SGD: Privacy accountant initialized '
-                      f'(N={args.dp_num_dataset_examples}, delta={args.dp_delta})')
-        except ImportError:
-            _dp_accountant = None
-            if args.rank == 0:
-                print('WARNING: dp-accounting not installed. Privacy accounting disabled. '
-                      'Install with: pip install dp-accounting')
+                    print(f'DP-SGD: Privacy accountant initialized ({_dp_accountant.describe()})')
+                    if _dp_epsilon_at_resume > 0:
+                        print(f'DP-SGD: pre-resume epsilon {_dp_epsilon_at_resume:.4f} is '
+                              f'added by basic composition (conservative).')
+        elif args.rank == 0:
+            print('DP-SGD: sigma=0, no privacy accounting (epsilon is infinite).')
 
     # Run training iterations till done.
     while iteration < args.train_iters:
@@ -1749,18 +1755,22 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
-        # DP-SGD: Check epsilon budget BEFORE the step.
-        # With dual analysis, use max(eps_clinical, eps_literature) if both are tracked.
+        # DP-SGD: stop BEFORE a step that may exceed the epsilon budget. The
+        # check adds the last observed per-step increment to the certified
+        # epsilon (and forces an exact evaluation near the budget), so the
+        # budget is never crossed by the step that is about to run.
         if (_dp_accountant is not None
                 and args.dp_noise_multiplier > 0
-                and _dp_current_epsilon >= args.dp_epsilon_budget):
+                and _dp_accountant.would_exceed(args.dp_epsilon_budget)):
+            _dp_current_epsilon = _dp_accountant.epsilon(force=True)
             if args.rank == 0:
-                msg = f'DP-SGD: Epsilon budget exhausted (current={_dp_current_epsilon:.4f}'
+                msg = f'DP-SGD: Epsilon budget reached (current={_dp_current_epsilon:.4f}'
                 if _dp_epsilon_clinical > 0:
                     msg += f', clinical={_dp_epsilon_clinical:.4f}'
                 if _dp_epsilon_literature > 0:
                     msg += f', literature={_dp_epsilon_literature:.4f}'
-                msg += f', budget={args.dp_epsilon_budget}). Stopping training.'
+                msg += (f', next step would add up to {_dp_accountant.last_increment:.4f}'
+                        f', budget={args.dp_epsilon_budget}). Stopping training.')
                 print(msg)
             should_exit = True
             break
@@ -1777,143 +1787,78 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        config)
         ft_integration.on_training_step_end()
 
-        # DP-SGD: Update privacy accountant after each step.
-        # Skip when sigma=0 (no noise = infinite privacy cost, nothing to track).
-        if _dp_accountant is not None and skipped_iter == 0 and args.dp_noise_multiplier > 0:
-            import math as _math
-            from dp_accounting import dp_event as dp_evt
-            global_batch_size = (mpu.get_data_parallel_world_size()
-                                 * args.micro_batch_size
-                                 * get_num_microbatches())
-            sampling_probability = global_batch_size / args.dp_num_dataset_examples
+        # DP-SGD: discard the adaptive-C update of a skipped optimizer step so
+        # that no computed-but-unused query influences later steps, then charge
+        # the step. A skipped step (fp16 overflow) still released the noisy
+        # gradient and the adaptive query, so it is charged too (conservative).
+        if (hasattr(args, 'dp_sgd') and args.dp_sgd and skipped_iter != 0
+                and getattr(args, 'dp_clipping_percentile', None) is not None
+                and hasattr(args, '_dp_C_prev_step')):
+            args.dp_clipping_norm_current = args._dp_C_prev_step
+        if _dp_accountant is not None and args.dp_noise_multiplier > 0:
+            from megatron.training.dp_accounting_utils import effective_sigma
 
-            # Compose the DP event. When adaptive thresholds are active,
-            # the threshold update also consumes privacy (noisy fraction release).
-            # Use effective_sigma via inverse-variance composition:
-            #   1/σ_eff² = 1/σ² + K/σ_b²
-            # where K = number of threshold queries per step.
-            #
-            # Adaptive thresholds are active when:
-            # - Global clipping with dp_clipping_percentile > 0 (K=1 query)
-            # - Per-layer clipping (always adaptive, K=L queries)
+            # Per-step noise multiplier of the joint mechanism. Adaptive
+            # thresholds release K noisy clipped-fraction counts per step on
+            # the same batch: 1/sigma_eff^2 = 1/sigma^2 + K/sigma_b^2.
             _clipping_mode = getattr(args, 'dp_clipping_mode', 'global')
             _dp_pct = getattr(args, 'dp_clipping_percentile', None)
             _has_adaptive = (
                 _clipping_mode == 'per_layer'  # per-layer always uses adaptive
                 or (_dp_pct is not None and _dp_pct != 0)  # global with percentile
             )
+            _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
             if _has_adaptive:
-                _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
                 if _clipping_mode == 'per_layer':
-                    # ---- Per-layer accounting (new) ----
-                    # K = number of hooked modules (~320 for 70B)
                     _config = get_model_config(model[0])
                     _K = len(getattr(_config, '_dp_per_layer_thresholds', {})) or 320
-                    _sigma_eff = (1.0 / args.dp_noise_multiplier**2 + _K / _sigma_b**2) ** -0.5
-                    step_event = dp_evt.GaussianDpEvent(_sigma_eff)
                 else:
-                    # ---- Global clipping accounting (existing, do not modify) ----
-                    # K = 1 threshold query per step
-                    _sigma_eff = (1.0 / args.dp_noise_multiplier**2 + 1.0 / _sigma_b**2) ** -0.5
-                    step_event = dp_evt.GaussianDpEvent(_sigma_eff)
+                    _K = 1
+                _sigma_eff = effective_sigma(args.dp_noise_multiplier, _sigma_b, _K)
             else:
-                step_event = dp_evt.GaussianDpEvent(args.dp_noise_multiplier)
+                _sigma_eff = args.dp_noise_multiplier
+            _dp_accountant.compose_step(_sigma_eff)
 
-            _sampling = getattr(args, 'dp_sampling_method', 'shuffle_wor')
-            if _sampling == 'truncated_poisson':
-                _dp_accountant.compose(
-                    dp_evt.PoissonSampledDpEvent(
-                        sampling_probability=sampling_probability,
-                        event=step_event,
-                    )
-                )
-            else:
-                # shuffle_wor: use SampledWithoutReplacementDpEvent
-                _dp_accountant.compose(
-                    dp_evt.SampledWithoutReplacementDpEvent(
-                        source_dataset_size=args.dp_num_dataset_examples,
-                        sample_size=global_batch_size,
-                        event=step_event,
-                    )
-                )
-            # PLD accountant: compose same event
-            if _dp_pld_accountant is not None:
-                try:
-                    if _sampling == 'truncated_poisson':
-                        _dp_pld_accountant.compose(
-                            dp_evt.PoissonSampledDpEvent(
-                                sampling_probability=sampling_probability,
-                                event=step_event,
-                            )
-                        )
-                    else:
-                        _dp_pld_accountant.compose(
-                            dp_evt.SampledWithoutReplacementDpEvent(
-                                source_dataset_size=args.dp_num_dataset_examples,
-                                sample_size=global_batch_size,
-                                event=step_event,
-                            )
-                        )
-                except Exception as e:
-                    if args.rank == 0 and iteration == 1:
-                        print(f'WARNING: PLD accountant composition failed: {e}')
-                    _dp_pld_accountant = None
+            # Private initialization of the adaptive clipping norm (first step):
+            # each bisection query is a sampled Gaussian mechanism at sigma_b.
+            _extra_queries = getattr(args, '_dp_extra_sigma_b_queries', 0)
+            if _extra_queries:
+                _dp_accountant.compose_queries(_sigma_b, _extra_queries)
+                args._dp_extra_sigma_b_queries = 0
 
-            # PRV accountant: uses step count, not per-step composition
-            # (PRV computes epsilon for N compositions at init time)
+            _dp_current_epsilon = _dp_accountant.epsilon()
 
-            # Add pre-resume epsilon (from checkpoint) to post-resume epsilon (from accountant).
-            _dp_current_epsilon = _dp_epsilon_at_resume + _dp_accountant.get_epsilon(args.dp_delta)
-
-            # PLD epsilon (tighter)
-            if _dp_pld_accountant is not None:
-                try:
-                    _dp_current_epsilon_pld = _dp_epsilon_at_resume + _dp_pld_accountant.get_epsilon(args.dp_delta)
-                except Exception:
-                    _dp_current_epsilon_pld = float('inf')
-            else:
-                _dp_current_epsilon_pld = float('inf')
-
-            # PRV epsilon (tightest) — computed from step count
-            if _dp_prv_accountant is not None:
-                try:
-                    _step_count = iteration - getattr(args, '_dp_resume_iteration', 0)
-                    _prv_eps_low, _prv_eps_est, _prv_eps_high = _dp_prv_accountant.compute_epsilon(_step_count)
-                    _dp_current_epsilon_prv = _dp_epsilon_at_resume + _prv_eps_est
-                except Exception:
-                    _dp_current_epsilon_prv = float('inf')
-            else:
-                _dp_current_epsilon_prv = float('inf')
-
-            # Dual privacy analysis: compute epsilon separately for clinical and literature.
-            # Same noisy mechanism, different N → different q → different epsilon.
+            # Dual privacy analysis: same mechanism, population restricted to
+            # one source (clinical / literature). Evaluated at log intervals
+            # only (each evaluation costs a fraction of a second).
             N_clinical = getattr(args, 'dp_num_clinical_examples', 0)
             N_literature = getattr(args, 'dp_num_literature_examples', 0)
             if N_clinical > 0:
                 _dp_clinical_steps += 1
-                q_clin = global_batch_size / N_clinical
-                _dp_epsilon_clinical = _compute_epsilon_for_steps(
-                    _dp_clinical_steps, q_clin, args.dp_noise_multiplier, args.dp_delta)
             if N_literature > 0:
                 _dp_literature_steps += 1
-                q_lit = global_batch_size / N_literature
-                _dp_epsilon_literature = _compute_epsilon_for_steps(
-                    _dp_literature_steps, q_lit, args.dp_noise_multiplier, args.dp_delta)
-
-            if args.rank == 0 and iteration % args.log_interval == 0:
-                eps_str = f'DP-SGD: step={iteration}, eps_rdp={_dp_current_epsilon:.4f}'
-                if _dp_current_epsilon_pld < float('inf'):
-                    eps_str += f', eps_pld={_dp_current_epsilon_pld:.4f}'
-                    _gap_pct = (_dp_current_epsilon / _dp_current_epsilon_pld - 1) * 100 if _dp_current_epsilon_pld > 0 else 0
-                    eps_str += f' (RDP {_gap_pct:+.1f}% vs PLD)'
-                if _dp_current_epsilon_prv < float('inf'):
-                    eps_str += f', eps_prv={_dp_current_epsilon_prv:.4f}'
-                if N_clinical > 0:
-                    eps_str += f', eps_clinical={_dp_epsilon_clinical:.4f}'
-                if N_literature > 0:
-                    eps_str += f', eps_literature={_dp_epsilon_literature:.4f}'
-                eps_str += f', delta={args.dp_delta}'
-                print(eps_str)
+            _log_now = (iteration % args.log_interval == 0) or should_checkpoint or should_exit
+            if _log_now:
+                _dp_current_epsilon = _dp_accountant.epsilon(force=True)
+                for _N_src, _steps, _attr in (
+                        (N_clinical, _dp_clinical_steps, '_dp_epsilon_clinical'),
+                        (N_literature, _dp_literature_steps, '_dp_epsilon_literature')):
+                    if _N_src > 0:
+                        _q_src = min(1.0, _dp_accountant.q * _dp_accountant.N / _N_src)
+                        globals()[_attr] = _compute_epsilon_for_steps(
+                            _steps, _q_src, args.dp_noise_multiplier, args.dp_delta,
+                            _dp_accountant.sampling_method, _N_src, _dp_accountant.B)
+                if args.rank == 0:
+                    eps_str = (f'DP-SGD: step={iteration}, eps={_dp_current_epsilon:.4f} '
+                               f'[{_dp_accountant.certified_name}]')
+                    for _name, _val in _dp_accountant.proxy_epsilons().items():
+                        eps_str += f', {_name}={_val:.4f}'
+                    if N_clinical > 0:
+                        eps_str += f', eps_clinical={_dp_epsilon_clinical:.4f}'
+                    if N_literature > 0:
+                        eps_str += f', eps_literature={_dp_epsilon_literature:.4f}'
+                    eps_str += f', delta={args.dp_delta}'
+                    print(eps_str)
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
