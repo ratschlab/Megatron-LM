@@ -691,14 +691,16 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
         if _dp_accountant is not None:
             # Force an exact evaluation so the stored epsilon is certified, not a bound.
             state_dict['dp_sgd_epsilon'] = _dp_accountant.epsilon(force=True)
+            # The event history lets a resumed run recompose exactly at delta.
             state_dict['dp_sgd_accounting'] = {
                 'sampling_method': _dp_accountant.sampling_method,
                 'dataset_size': _dp_accountant.N,
                 'physical_batch': _dp_accountant.B,
                 'sampling_probability': _dp_accountant.q,
                 'delta': _dp_accountant.delta,
+                'delta_total': _dp_accountant.delta_total,
                 'total_steps': _dp_accountant.total_steps,
-                'last_increment': _dp_accountant.last_increment,
+                'history': _dp_accountant.history(),
             }
             state_dict['dp_sgd_clinical_steps'] = training_module._dp_clinical_steps
             state_dict['dp_sgd_literature_steps'] = training_module._dp_literature_steps
@@ -1359,10 +1361,18 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         print_rank_0('DP-SGD: Restored sampler state from checkpoint '
                      f'(steps_completed={state_dict["dp_dataloader_state"].get("steps_completed")})')
     elif getattr(args, 'dp_sgd', False) and getattr(args, 'dp_data_path', None) \
-            and not args.finetune:
-        print_rank_0('WARNING: DP-SGD checkpoint has no sampler state; the dataloader '
-                     'restarts its sampling sequence. Repeated batches are charged '
-                     'as independent steps, which under-states epsilon.')
+            and not args.finetune and 'dp_sgd_epsilon' in state_dict:
+        # A DP run with accounting but no sampler state: restarting the
+        # sampling sequence repeats batches that the accountant charges as
+        # independent steps, which under-states epsilon.
+        if not getattr(args, 'dp_allow_legacy_resume', False):
+            raise RuntimeError(
+                'DP-SGD: checkpoint has no sampler state (dp_dataloader_state); the '
+                'dataloader would restart its sampling sequence and the reported '
+                'epsilon would be invalid. Pass --dp-allow-legacy-resume to continue '
+                'anyway (synthetic data only).')
+        print_rank_0('WARNING: DP-SGD legacy resume without sampler state; the '
+                     'reported epsilon is NOT a certificate for this run.')
         # Restore dual analysis state
         if 'dp_sgd_clinical_steps' in state_dict:
             training_module._dp_clinical_steps = state_dict['dp_sgd_clinical_steps']
@@ -1379,7 +1389,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         # A user-specified --dp-noise-seed on the command line takes precedence.
         if getattr(args, 'dp_noise_seed', None) is None:
             args.dp_noise_seed = state_dict['dp_sgd_noise_seed']
-            print_rank_0(f'DP-SGD: Restored noise seed = {args.dp_noise_seed} from checkpoint')
+            print_rank_0('DP-SGD: Restored noise seed from checkpoint (value not logged)')
         # Restore adaptive clipping C (adaptive mode only). In fixed-C mode the
         # clipping norm is always the command-line value so that clipping and
         # noise calibration agree; a changed C on resume is reported, not mixed.

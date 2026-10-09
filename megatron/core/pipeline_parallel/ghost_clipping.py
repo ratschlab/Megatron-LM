@@ -1080,13 +1080,18 @@ def private_quantile_init(
 ) -> float:
     """Differentially private initialization of the clipping norm C.
 
-    Runs ``num_queries`` rounds of bisection in log space on the public
-    interval [c_min, c_max]. Each round releases the fraction of examples
-    whose gradient norm exceeds the candidate C with Gaussian noise of
-    standard deviation ``sigma_b / batch_size_global`` (the same noisy-count
-    query Andrew et al. 2021 use for the geometric update), so every query is
-    a Gaussian mechanism with noise multiplier ``sigma_b`` on the sampled
-    batch and must be charged to the accountant as such.
+    Releases, for ``num_queries`` PUBLIC thresholds spaced log-uniformly on
+    [c_min, c_max], the fraction of examples whose gradient norm exceeds the
+    threshold, each with independent Gaussian noise of standard deviation
+    ``sigma_b / batch_size_global`` (the noisy-count query of Andrew et al.
+    2021). The thresholds do not depend on the data, so the K releases
+    together with the step's noisy gradient form ONE Gaussian mechanism on
+    the sampled batch with joint noise multiplier
+    ``effective_sigma(sigma, sigma_b, K + 1)`` (the +1 is the regular
+    end-of-step fraction query). The batch is sampled once, so the step is
+    charged as a single sampled event; no per-query amplification is claimed.
+    C is then obtained from the released vector by post-processing
+    (isotonic smoothing and log-linear interpolation at the target fraction).
 
     ``raw_norms`` holds this rank's local per-example norms; fractions are
     averaged over the data-parallel group so all ranks obtain the same C.
@@ -1096,7 +1101,7 @@ def private_quantile_init(
     """
     assert 0.0 < target_quantile < 1.0, target_quantile
     assert 0.0 < c_min < c_max, (c_min, c_max)
-    assert num_queries >= 1, num_queries
+    assert num_queries >= 2, num_queries
 
     dp_ws = 1
     if dp_group is not None and torch.distributed.is_initialized():
@@ -1108,21 +1113,32 @@ def private_quantile_init(
     gen = torch.Generator()
     gen.manual_seed(int(seed) % (2 ** 31 - 1))
 
-    lo = math.log(c_min)
-    hi = math.log(c_max)
-    norms = raw_norms.detach().float()
-    for _ in range(num_queries):
-        mid = 0.5 * (lo + hi)
-        c_mid = math.exp(mid)
-        frac = (norms > c_mid).float().mean()
-        if dp_ws > 1:
-            torch.distributed.all_reduce(frac, group=dp_group)
-            frac = frac / dp_ws
-        noise = torch.randn(1, generator=gen).item() * sigma_b / batch_size_global
-        noisy_frac = frac.item() + noise
-        if noisy_frac > target_frac_above:
-            lo = mid  # too many above threshold: raise C
-        else:
-            hi = mid
-    c_init = math.exp(0.5 * (lo + hi))
+    log_t = torch.linspace(math.log(c_min), math.log(c_max), num_queries, dtype=torch.float64)
+    thresholds = torch.exp(log_t)
+    norms = raw_norms.detach().double().cpu()
+    fracs = (norms.unsqueeze(1) > thresholds.unsqueeze(0)).double().mean(dim=0)  # [K]
+    if dp_ws > 1:
+        fracs_dev = fracs.to(raw_norms.device)
+        torch.distributed.all_reduce(fracs_dev, group=dp_group)
+        fracs = (fracs_dev / dp_ws).cpu()
+    noise = torch.randn(num_queries, generator=gen, dtype=torch.float64) * sigma_b / batch_size_global
+    released = fracs + noise  # the only data-dependent quantity that leaves the batch
+
+    # Post-processing (no further privacy cost): the true curve is
+    # non-increasing in the threshold, so take the running minimum, then find
+    # where it crosses the target fraction and interpolate in log space.
+    smooth = torch.cummin(released, dim=0).values
+    below = (smooth <= target_frac_above).nonzero().flatten()
+    if below.numel() == 0:
+        return float(c_max)
+    j = int(below[0].item())
+    if j == 0:
+        return float(c_min)
+    f_lo, f_hi = smooth[j - 1].item(), smooth[j].item()
+    if f_lo - f_hi <= 1e-12:
+        c_init = math.exp(log_t[j].item())
+    else:
+        w = (f_lo - target_frac_above) / (f_lo - f_hi)
+        w = min(max(w, 0.0), 1.0)
+        c_init = math.exp(log_t[j - 1].item() + w * (log_t[j].item() - log_t[j - 1].item()))
     return float(min(max(c_init, c_min), c_max))

@@ -3083,17 +3083,18 @@ def forward_backward_pipelining_without_interleaving(
 def _private_init_C(args, raw_norms_local, C_max, num_microbatches):
     """Initialize the adaptive clipping norm privately on the first step.
 
-    Runs ``args.dp_clipping_init_queries`` noisy-fraction bisection queries on
-    the public interval [C_max * 1e-9, C_max] (see
+    Releases noisy clipped fractions at ``args.dp_clipping_init_queries``
+    public log-spaced thresholds on [C_max * 1e-9, C_max] (see
     ``ghost_clipping.private_quantile_init``). All data-parallel ranks obtain
     the same C from all-reduced fractions and a shared noise seed. The number
-    of queries is recorded in ``args._dp_extra_sigma_b_queries`` so that
-    ``train()`` charges them to the accountant.
+    of released fractions is recorded in ``args._dp_extra_sigma_b_queries`` so
+    that ``train()`` folds them into this step's joint noise multiplier
+    (``effective_sigma``); the batch is sampled once and charged once.
     """
     from megatron.core.pipeline_parallel.ghost_clipping import private_quantile_init
 
     pct = args.dp_clipping_percentile
-    num_queries = int(getattr(args, 'dp_clipping_init_queries', 12))
+    num_queries = int(getattr(args, 'dp_clipping_init_queries', 32))
     sigma_b = float(getattr(args, 'dp_adapt_sigma_b', 10.0))
     dp_ws = parallel_state.get_data_parallel_world_size()
     batch_global = args.micro_batch_size * dp_ws * num_microbatches
@@ -3115,6 +3116,6 @@ def _private_init_C(args, raw_norms_local, C_max, num_microbatches):
     args._dp_extra_sigma_b_queries = getattr(args, '_dp_extra_sigma_b_queries', 0) + num_queries
     if args.rank == 0:
         print(f'DP-SGD adaptive C: privately initialized C={C_init:.4f} '
-              f'(P{pct}, {num_queries} noisy-fraction queries at sigma_b={sigma_b}, '
-              f'charged to the accountant)')
+              f'(P{pct}, {num_queries} public thresholds, noisy fractions at '
+              f'sigma_b={sigma_b}, folded into this step\'s joint noise multiplier)')
     return C_init

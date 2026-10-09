@@ -333,17 +333,33 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         if os.path.isfile(args.dp_data_path) and args.dp_data_path.endswith('.jsonl'):
             tokenizer = get_tokenizer()
 
+        # Sampling randomness: secret per-run seed generated in pretrain() and
+        # shared by all ranks (never the public --seed). A checkpointed sampler
+        # state overrides it below.
+        sampling_seed = getattr(args, 'dp_sampling_seed', None)
+        if sampling_seed is None:
+            raise RuntimeError(
+                'DP-SGD: dp_sampling_seed not set; the DP external dataloader must '
+                'be built through pretrain() so that a secret seed is generated.')
+
+        # Public population bound n for truncated Poisson: q and the
+        # accountant's dataset_size are derived from n, not from the live row
+        # count, so neighbouring datasets run the same mechanism. n must be at
+        # least N+1 (the larger add/remove neighbour); larger is conservative.
+        _population = args.dp_num_dataset_examples if args.dp_num_dataset_examples > 0 else None
+
         train_ds = DPExternalDataloader(
             data_path=args.dp_data_path,
             micro_batch_size=args.micro_batch_size,
             seq_length=args.seq_length,
             sampling_method=getattr(args, 'dp_sampling_method', 'truncated_poisson'),
-            seed=args.seed,
+            seed=sampling_seed,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             num_microbatches=num_microbatches,
             tokenizer=tokenizer,
             poisson_expected_fraction=getattr(args, 'dp_poisson_expected_fraction', 0.85),
+            population_size=_population,
         )
 
         # Resume: continue the sampling sequence from the checkpointed state.
@@ -353,36 +369,25 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             print_rank_0(f"  Restored sampler state: epoch={train_ds._epoch}, "
                          f"steps_completed={train_ds._steps_completed}")
 
-        # N for privacy accounting is the number of records the sampler can
-        # actually draw. A larger "pool" N would understate the per-record
-        # sampling rate of the records that are trained on and is not valid.
-        if args.dp_num_dataset_examples == 0:
-            args.dp_num_dataset_examples = train_ds.N
-            print_rank_0(f"  Auto-detected N={train_ds.N} from dataloader")
-        elif args.dp_num_dataset_examples > train_ds.N:
-            raise ValueError(
-                f"--dp-num-dataset-examples ({args.dp_num_dataset_examples}) is larger than "
-                f"the number of records the dataloader can sample ({train_ds.N}). The "
-                f"accountant must use the sampled population; a larger pool understates "
-                f"epsilon. Set it to {train_ds.N} or omit it.")
-        elif args.dp_num_dataset_examples < train_ds.N:
-            print_rank_0(f"  WARNING: N for accounting ({args.dp_num_dataset_examples}) < "
-                         f"dataloader size ({train_ds.N}). Epsilon is overstated "
-                         f"(conservative).")
+        args.dp_num_dataset_examples = train_ds.population_size
+        if train_ds.population_size > 1.1 * train_ds.N + 1:
+            print_rank_0(f"  WARNING: population bound n={train_ds.population_size} is much "
+                         f"larger than the {train_ds.N} loaded records: valid, but the "
+                         f"expected draw is only {train_ds.q * train_ds.N:.1f} of "
+                         f"{train_ds.B_global_step} per step (rest is padding).")
 
         # Hand the sampler's exact parameters to the accountant so both describe
-        # the same mechanism (sampler, population, physical batch, inclusion rate).
+        # the same mechanism (sampler, population bound, physical batch, q).
         _acct = train_ds.accounting_params()
-        if args.dp_num_dataset_examples != train_ds.N:
-            # Conservative: smaller N means a larger assumed inclusion rate.
-            _acct['dataset_size'] = args.dp_num_dataset_examples
-            _acct['sampling_probability'] = min(
-                1.0, _acct['sampling_probability'] * train_ds.N / args.dp_num_dataset_examples)
         args.dp_accounting_params = _acct
+        if _acct['privacy_unit'] != 'unit':
+            print_rank_0("  WARNING: records carry no privacy_unit_id; the guarantee is "
+                         "per ROW, not per patient/document, unless preprocessing "
+                         "guarantees one row per unit.")
 
-        print_rank_0(f"  {train_ds.N} training records, N={args.dp_num_dataset_examples} for accounting, "
+        print_rank_0(f"  {train_ds.N} training records, n={train_ds.population_size} for accounting, "
                      f"sampling={train_ds.sampling_method}, q={_acct['sampling_probability']:.6g}, "
-                     f"physical batch={_acct['physical_batch']}")
+                     f"physical batch={_acct['physical_batch']}, privacy unit={_acct['privacy_unit']}")
         # Return train_ds as validation too (for --skip-train eval with same data).
         # The eval path is forward-only, so reusing train data is fine for loss comparison.
         return train_ds, train_ds, None

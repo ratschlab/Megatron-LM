@@ -74,6 +74,50 @@ def _compute_epsilon_for_steps(num_steps, q, sigma, delta, sampling_method,
     from megatron.training.dp_accounting_utils import epsilon_for_steps
     return epsilon_for_steps(sampling_method, dataset_size, physical_batch,
                              q, sigma, delta, num_steps)
+
+
+def _dp_step_sigma_eff(args, model, extra_count_queries=0):
+    """Joint per-step noise multiplier of everything released on one batch.
+
+    The noisy clipped gradient (sigma) plus K noisy count queries at sigma_b
+    whose thresholds were fixed before the batch was drawn: K = 1 for the
+    adaptive global C update, K = number of hooked modules for per-layer
+    thresholds, plus ``extra_count_queries`` public-threshold releases on the
+    step that initializes C privately. 1/sigma_eff^2 = 1/sigma^2 + K/sigma_b^2.
+    """
+    from megatron.training.dp_accounting_utils import effective_sigma
+    clipping_mode = getattr(args, 'dp_clipping_mode', 'global')
+    pct = getattr(args, 'dp_clipping_percentile', None)
+    sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
+    if clipping_mode == 'per_layer':
+        config = get_model_config(model[0])
+        K = len(getattr(config, '_dp_per_layer_thresholds', {})) or 320
+    elif pct is not None and pct != 0:
+        K = 1
+    else:
+        K = 0
+    K += int(extra_count_queries)
+    return effective_sigma(args.dp_noise_multiplier, sigma_b, K)
+
+
+def _dp_shared_secret_seed(user_seed, name):
+    """A seed shared by all ranks that is secret unless the user supplied one.
+
+    Sampling and noise randomness must be independent of the public run seed
+    (``--seed``): a predictable sampling schedule gets no subsampling
+    amplification and predictable noise is not a Gaussian mechanism.
+    """
+    import secrets
+    if user_seed is not None:
+        if torch.distributed.get_rank() == 0:
+            print(f'WARNING: DP-SGD {name} seed supplied on the command line is '
+                  f'public; use only for synthetic-data tests.')
+        return int(user_seed)
+    value = secrets.randbits(31) if torch.distributed.get_rank() == 0 else 0
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    t = torch.tensor([value], dtype=torch.long, device=device)
+    torch.distributed.broadcast(t, src=0)
+    return int(t.item())
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -395,6 +439,14 @@ def pretrain(
                     'scheduler are built')
         app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
         config = get_model_config(model[0])
+
+        # DP-SGD: the sampler's randomness must be secret and independent of
+        # the public --seed (a known sampling schedule gets no amplification).
+        # Generated here on all ranks (collective broadcast) before the DP
+        # external dataloader is built; a checkpointed sampler state overrides it.
+        if getattr(args, 'dp_sgd', False) and getattr(args, 'dp_data_path', None):
+            args.dp_sampling_seed = _dp_shared_secret_seed(
+                getattr(args, 'dp_sampling_seed', None), 'sampling')
 
         # Data stuff.
         app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -1650,15 +1702,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         args._dp_extra_sigma_b_queries = 0
 
         if args.dp_noise_seed is None:
-            args.dp_noise_seed = torch.randint(0, 2**31 - 1, (1,)).item()
-            # Broadcast from rank 0 to ensure all ranks use the same base seed.
-            seed_tensor = torch.tensor([args.dp_noise_seed], dtype=torch.long,
-                                       device='cuda' if torch.cuda.is_available() else 'cpu')
-            torch.distributed.broadcast(seed_tensor, src=0)
-            args.dp_noise_seed = seed_tensor.item()
+            # Secret entropy (os.urandom), NOT torch's global generator, which
+            # Megatron seeds from the public --seed. Shared across ranks.
+            args.dp_noise_seed = _dp_shared_secret_seed(None, 'noise')
         if args.rank == 0:
             _seed_src = ('user-specified' if '--dp-noise-seed' in sys.argv
-                         else 'random, stored in the checkpoint')
+                         else 'secret, stored in the checkpoint')
             # The seed value itself is deliberately not logged: with two
             # consecutive checkpoints it allows exact reconstruction of the
             # noise and therefore of the un-noised clipped gradient sum.
@@ -1713,15 +1762,31 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     print('WARNING: dp-accounting not installed; privacy accounting and '
                           'the epsilon budget are DISABLED (--dp-allow-no-accounting).')
             if _dp_accountant is not None:
-                _dp_accountant.epsilon_at_resume = _dp_epsilon_at_resume
+                # Resume: recompose the checkpointed event history at the
+                # target delta. A checkpoint that stored only an epsilon can be
+                # continued only by basic composition, which holds at 2*delta;
+                # that needs --dp-allow-legacy-resume and is reported as such.
                 _resume = getattr(args, '_dp_accounting_at_resume', None)
-                if _resume is not None:
-                    _dp_accountant.last_increment = float(_resume.get('last_increment', 0.0))
+                if _resume is not None and 'history' in _resume:
+                    _dp_accountant.load_history(_resume['history'])
+                    if args.rank == 0:
+                        print(f'DP-SGD: restored accounting history '
+                              f'({_dp_accountant.total_steps} steps) from checkpoint')
+                elif _dp_epsilon_at_resume > 0:
+                    if not getattr(args, 'dp_allow_legacy_resume', False):
+                        raise RuntimeError(
+                            'DP-SGD: checkpoint stores an epsilon but no event history; '
+                            'adding epsilons computed at the same delta only holds at '
+                            '2*delta. Pass --dp-allow-legacy-resume to continue with that '
+                            'weaker guarantee (reported as delta_total = 2*delta).')
+                    _dp_accountant.legacy_epsilon_at_resume = _dp_epsilon_at_resume
+                    if args.rank == 0:
+                        print(f'DP-SGD: WARNING legacy resume: pre-resume epsilon '
+                              f'{_dp_epsilon_at_resume:.4f} added by basic composition; '
+                              f'the reported epsilon holds at delta_total='
+                              f'{_dp_accountant.delta_total:g}, not delta.')
                 if args.rank == 0:
                     print(f'DP-SGD: Privacy accountant initialized ({_dp_accountant.describe()})')
-                    if _dp_epsilon_at_resume > 0:
-                        print(f'DP-SGD: pre-resume epsilon {_dp_epsilon_at_resume:.4f} is '
-                              f'added by basic composition (conservative).')
         elif args.rank == 0:
             print('DP-SGD: sigma=0, no privacy accounting (epsilon is infinite).')
 
@@ -1755,25 +1820,33 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
-        # DP-SGD: stop BEFORE a step that may exceed the epsilon budget. The
-        # check adds the last observed per-step increment to the certified
-        # epsilon (and forces an exact evaluation near the budget), so the
-        # budget is never crossed by the step that is about to run.
+        # DP-SGD: stop BEFORE a step that would exceed the epsilon budget. The
+        # prospective epsilon of the complete next step (including the
+        # public-threshold releases of a first-step C initialization) is
+        # evaluated exactly; per-step increments are not monotone, so no
+        # extrapolation from past increments is used.
         if (_dp_accountant is not None
                 and args.dp_noise_multiplier > 0
-                and _dp_accountant.would_exceed(args.dp_epsilon_budget)):
-            _dp_current_epsilon = _dp_accountant.epsilon(force=True)
-            if args.rank == 0:
-                msg = f'DP-SGD: Epsilon budget reached (current={_dp_current_epsilon:.4f}'
-                if _dp_epsilon_clinical > 0:
-                    msg += f', clinical={_dp_epsilon_clinical:.4f}'
-                if _dp_epsilon_literature > 0:
-                    msg += f', literature={_dp_epsilon_literature:.4f}'
-                msg += (f', next step would add up to {_dp_accountant.last_increment:.4f}'
-                        f', budget={args.dp_epsilon_budget}). Stopping training.')
-                print(msg)
-            should_exit = True
-            break
+                and args.dp_epsilon_budget != float('inf')):
+            _pct = getattr(args, 'dp_clipping_percentile', None)
+            _will_init = (_pct is not None and _pct != 0
+                          and getattr(args, 'dp_clipping_norm_current', 0.0) == float('inf'))
+            _extra_next = int(getattr(args, 'dp_clipping_init_queries', 32)) if _will_init else 0
+            _sigma_next = _dp_step_sigma_eff(args, model, _extra_next)
+            _prospective = _dp_accountant.prospective_epsilon(_sigma_next)
+            if _prospective > args.dp_epsilon_budget:
+                _dp_current_epsilon = _dp_accountant.epsilon(force=True)
+                if args.rank == 0:
+                    msg = f'DP-SGD: Epsilon budget reached (current={_dp_current_epsilon:.4f}'
+                    if _dp_epsilon_clinical > 0:
+                        msg += f', clinical={_dp_epsilon_clinical:.4f}'
+                    if _dp_epsilon_literature > 0:
+                        msg += f', literature={_dp_epsilon_literature:.4f}'
+                    msg += (f', next step would give {_prospective:.4f}'
+                            f', budget={args.dp_epsilon_budget}). Stopping training.')
+                    print(msg)
+                should_exit = True
+                break
 
         # Run training step.
         args.curr_iteration = iteration
@@ -1796,35 +1869,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 and hasattr(args, '_dp_C_prev_step')):
             args.dp_clipping_norm_current = args._dp_C_prev_step
         if _dp_accountant is not None and args.dp_noise_multiplier > 0:
-            from megatron.training.dp_accounting_utils import effective_sigma
-
-            # Per-step noise multiplier of the joint mechanism. Adaptive
-            # thresholds release K noisy clipped-fraction counts per step on
-            # the same batch: 1/sigma_eff^2 = 1/sigma^2 + K/sigma_b^2.
-            _clipping_mode = getattr(args, 'dp_clipping_mode', 'global')
-            _dp_pct = getattr(args, 'dp_clipping_percentile', None)
-            _has_adaptive = (
-                _clipping_mode == 'per_layer'  # per-layer always uses adaptive
-                or (_dp_pct is not None and _dp_pct != 0)  # global with percentile
-            )
-            _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
-            if _has_adaptive:
-                if _clipping_mode == 'per_layer':
-                    _config = get_model_config(model[0])
-                    _K = len(getattr(_config, '_dp_per_layer_thresholds', {})) or 320
-                else:
-                    _K = 1
-                _sigma_eff = effective_sigma(args.dp_noise_multiplier, _sigma_b, _K)
-            else:
-                _sigma_eff = args.dp_noise_multiplier
+            # One sampled event per step with the joint noise multiplier of
+            # everything released on this batch: the noisy clipped gradient,
+            # the adaptive-threshold count queries and, on the step that
+            # initialized C privately, its public-threshold releases.
+            _extra_queries = int(getattr(args, '_dp_extra_sigma_b_queries', 0))
+            args._dp_extra_sigma_b_queries = 0
+            _sigma_eff = _dp_step_sigma_eff(args, model, _extra_queries)
             _dp_accountant.compose_step(_sigma_eff)
-
-            # Private initialization of the adaptive clipping norm (first step):
-            # each bisection query is a sampled Gaussian mechanism at sigma_b.
-            _extra_queries = getattr(args, '_dp_extra_sigma_b_queries', 0)
-            if _extra_queries:
-                _dp_accountant.compose_queries(_sigma_b, _extra_queries)
-                args._dp_extra_sigma_b_queries = 0
 
             _dp_current_epsilon = _dp_accountant.epsilon()
 

@@ -2563,8 +2563,13 @@ def _add_dp_sgd_args(parser):
                        help='Per-example loss aggregation over tokens. '
                        'Mean keeps gradient norms length-invariant.')
     group.add_argument('--dp-num-dataset-examples', type=int, default=0,
-                       help='Total number of privacy units N in the dataset '
-                       '(for DP accounting). Required when --dp-sgd is set.')
+                       help='Public population bound n for DP accounting. With '
+                       '--dp-data-path and truncated_poisson it must be at least the '
+                       'number of loaded records plus one (default: exactly that); '
+                       'the sampling probability q and the certified event are '
+                       'derived from n, never from the live row count. A larger n '
+                       'is conservative but wastes batch capacity on padding. '
+                       'Required when --dp-sgd is set without --dp-data-path.')
     group.add_argument('--dp-num-clinical-examples', type=int, default=0,
                        help='Number of clinical privacy units (episodes). '
                        'For dual accountant. If 0, uses dp-num-dataset-examples.')
@@ -2606,11 +2611,23 @@ def _add_dp_sgd_args(parser):
     group.add_argument('--dp-allow-no-accounting', action='store_true', default=False,
                        help='Permit DP training without dp-accounting installed '
                        '(no epsilon, no budget gate). For synthetic-data tests only.')
-    group.add_argument('--dp-clipping-init-queries', type=int, default=12,
-                       help='Adaptive clipping only: number of noisy-fraction bisection '
-                       'queries used to initialize C privately on the first step. Each '
-                       'query is a Gaussian mechanism with --dp-adapt-sigma-b on the '
-                       'sampled batch and is charged to the accountant.')
+    group.add_argument('--dp-clipping-init-queries', type=int, default=32,
+                       help='Adaptive clipping only: number of PUBLIC log-spaced '
+                       'thresholds at which noisy clipped fractions are released on '
+                       'the first step to initialize C privately. The releases are '
+                       'folded into that step\'s joint noise multiplier '
+                       '(1/sigma_eff^2 = 1/sigma^2 + (K+1)/sigma_b^2); the batch is '
+                       'sampled once and charged once.')
+    group.add_argument('--dp-sampling-seed', type=int, default=None,
+                       help='Seed of the DP dataloader sampler. Default: a secret seed '
+                       'from os.urandom, shared by all ranks and carried in the '
+                       'checkpoint sampler state. A command-line value is public: '
+                       'synthetic-data tests only.')
+    group.add_argument('--dp-allow-legacy-resume', action='store_true', default=False,
+                       help='Allow resuming from a checkpoint without sampler state or '
+                       'accounting history. The reported epsilon is then NOT a '
+                       'certificate (basic composition at 2*delta, repeated batches). '
+                       'Synthetic data only.')
     group.add_argument('--dp-log-clip-stats', action='store_true', default=False,
                        help='Log per-step clipping norm C, the privately released '
                        'clipped fraction (adaptive mode) and epsilon. Prints only '
