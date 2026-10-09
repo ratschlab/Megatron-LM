@@ -49,11 +49,47 @@ event one step at a time is far too slow for a training loop.  The event
 history is what a checkpoint stores, so a resumed run recomposes exactly at
 the target delta instead of adding two epsilons (which would hold only at
 ``2 * delta``).
+
+Public stop schedule and range certificate
+    Under add/remove adjacency the record count ``N`` itself is protected,
+    so no decision that is visible in the output (in particular *whether a
+    step is taken*) may depend on it.  The epsilon of the actual neighbour
+    pairs (``epsilon()``) is therefore informational.  The certificate and
+    the stop rule use ``range_epsilon()``: a rigorous worst case over a
+    public range of record counts ``[N_lo, N_hi]`` (``records_range``),
+    which is valid for every dataset whose record count lies in the range
+    and depends on public quantities only.  ``public_step_limit()`` turns a
+    finite epsilon budget into a public step count before training starts.
+
+    The worst case is computed as follows (truncated Poisson).  The library
+    represents one step on a dataset of size ``m`` as the unrevealed mixture,
+    with truncation probability ``p(m) = P[Binom(m-1, q) >= B]``, of a
+    Poisson-subsampled Gaussian (rate ``q``, noise ``sigma``) and a
+    replace-one subsampled Gaussian (rate ``c(m)``, noise ``sigma/2``).
+    Revealing the truncation coin can only increase the divergence, so the
+    revealed mixture dominates.  Over ``T`` steps the revealed mixture is a
+    Binomial(T, p) number ``k`` of replace-one steps, and its delta at any
+    epsilon is ``E_k[delta_k(eps)]`` with ``delta_k`` the delta of the
+    untruncated composition of all ``T`` steps composed with ``k`` further
+    replace-one steps (keeping all ``T`` Poisson steps instead of ``T-k`` is
+    a further domination).  ``delta_k`` is non-decreasing in ``k``
+    (composition dominates), so ``E_k`` is non-decreasing in ``p`` and the
+    worst ``p`` is ``max_m p(m)`` (``p`` is increasing in ``m``).  The
+    replace-one subsampled pair ``((1-c)R + cP, (1-c)R + cQ)`` is monotone
+    in ``c`` in the hockey-stick order (for ``alpha >= 1`` the integrand
+    ``c (p - alpha q) - (alpha-1)(1-c) r`` grows with ``c``; ``alpha < 1``
+    follows by the symmetry of the pair), so the worst ``c`` is
+    ``max_m c(m)``, enumerated exactly over the range.  The Binomial sum is
+    cut at ``k_max`` with the tail mass added to delta.  In the production
+    regime (``q N_hi`` well below ``B``) ``p`` is negligible and the bound
+    coincides with the untruncated Poisson composition; the bound therefore
+    also shows that the population bound ``n`` must be the *top* of the
+    public range, otherwise truncation at the top of the range dominates.
 """
 
 import math
 from collections import OrderedDict
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 RDP_ORDERS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
 
@@ -90,12 +126,16 @@ class DPAccountantBundle:
         eval_interval: int = 1,
         pld_discretization: float = 1e-3,
         population_bound: Optional[int] = None,
+        records_range: Optional[Tuple[int, int]] = None,
     ):
         """``num_records`` is the number of records in the training set (the
         smaller neighbour of the addition pair and the larger of the removal
         pair); ``population_bound`` is the public constant ``n`` from which
         ``sampling_probability`` was derived (informational: it never enters
-        an event)."""
+        an event); ``records_range`` is the public range ``[N_lo, N_hi]`` of
+        record counts that the certificate and the stop schedule cover
+        (default: ``[n, n]``, i.e. the record count is assumed to equal the
+        public bound)."""
         assert sampling_method in SAMPLING_METHODS, sampling_method
         assert num_records > 0 and physical_batch > 0
         assert 0.0 < sampling_probability <= 1.0, sampling_probability
@@ -106,6 +146,13 @@ class DPAccountantBundle:
         self.sampling_method = sampling_method
         self.N = int(num_records)
         self.population_bound = None if population_bound is None else int(population_bound)
+        if records_range is None:
+            lo = hi = self.N if population_bound is None else int(population_bound)
+        else:
+            lo, hi = int(records_range[0]), int(records_range[1])
+        assert 1 <= lo <= hi, records_range
+        self.records_range = (lo, hi)
+        self._range_cache: Dict[tuple, float] = {}
         self.B = int(physical_batch)
         self.q = float(sampling_probability)
         self.delta = float(delta)
@@ -134,22 +181,28 @@ class DPAccountantBundle:
             from dp_accounting.pld import pld_privacy_accountant
             self._pld_cls = pld_privacy_accountant.PLDAccountant
             self.certified_name = 'PLD truncated-Poisson add/remove'
+            self.range_certificate_name = (
+                'PLD truncated-Poisson add/remove, worst case over public record-count '
+                'range (revealed-truncation bound)')
             self.proxy_names = ['RDP untruncated-Poisson proxy']
+            self._prv_cls = None
+            self._prv_sigma = None
+            self._prv_max_compositions = max(int(train_iters), 1)
             if enable_prv:
                 try:
                     from prv_accountant import Accountant as PRVAccountant
-                    self._prv = PRVAccountant(
-                        noise_multiplier=self.sigma,
-                        sampling_probability=self.q,
-                        delta=self.delta,
-                        max_compositions=max(int(train_iters), 1),
-                        eps_error=0.1,
-                    )
-                    self.proxy_names.append('PRV untruncated-Poisson proxy')
+                    self._prv_cls = PRVAccountant
+                    # Built lazily at the most frequent per-step joint noise
+                    # multiplier of the history (so count queries are included).
+                    self.proxy_names.append(
+                        'PRV untruncated-Poisson proxy (most frequent sigma_eff)')
                 except ImportError:
-                    self._prv = None
+                    self._prv_cls = None
         else:
             self.certified_name = 'RDP without-replacement replace-one (sigma/2), heuristic'
+            self.range_certificate_name = (
+                'RDP without-replacement replace-one (sigma/2) at the smallest record '
+                'count of the public range, heuristic')
             self.proxy_names = []
 
     # ------------------------------------------------------------------
@@ -266,8 +319,18 @@ class DPAccountantBundle:
                 if count > 0:
                     rdp.compose(self.step_event(sigma, certified=False), count)
             proxies[self.proxy_names[0]] = rdp.get_epsilon(self.delta)
-            if self._prv is not None:
+            if self._prv_cls is not None and self._step_counts:
+                sigma_prv = max(self._step_counts, key=self._step_counts.get)
                 try:
+                    if self._prv is None or self._prv_sigma != sigma_prv:
+                        self._prv = self._prv_cls(
+                            noise_multiplier=float(sigma_prv),
+                            sampling_probability=self.q,
+                            delta=self.delta,
+                            max_compositions=max(self._prv_max_compositions, self.total_steps),
+                            eps_error=0.1,
+                        )
+                        self._prv_sigma = sigma_prv
                     _, est, _ = self._prv.compute_epsilon(max(self.total_steps, 1))
                     proxies[self.proxy_names[1]] = est
                 except Exception:
@@ -305,24 +368,123 @@ class DPAccountantBundle:
         return self.legacy_epsilon_at_resume + self._certified_epsilon_of(
             self._prospective_counts(sigma_next, count))
 
-    def would_exceed(self, budget: float, sigma_next: float) -> bool:
-        """Whether running one more step at ``sigma_next`` would push the
-        certified epsilon above ``budget``.
+    # ------------------------------------------------------------------
+    # Public worst case over a range of record counts (the certificate)
+    # ------------------------------------------------------------------
+    def range_pair_sizes(self) -> Tuple[int, int]:
+        """Range of event ``dataset_size`` values (larger neighbour of each
+        pair) that covers every record count in ``records_range``."""
+        lo, hi = self.records_range
+        if self.sampling_method == TRUNCATED_POISSON:
+            return lo, hi + 1
+        return lo, hi
 
-        Evaluates the prospective complete step, never an extrapolation from
-        past increments (which are not monotone). A coarse-discretization
-        PLD evaluation (a valid, looser upper bound, ~10x cheaper) is tried
-        first; only when it exceeds the budget is the exact evaluation run.
-        """
-        if math.isinf(budget):
-            return False
-        counts = self._prospective_counts(sigma_next)
-        if self.sampling_method == TRUNCATED_POISSON and self.pld_discretization < 1e-2:
-            coarse = self.legacy_epsilon_at_resume + self._certified_epsilon_of(counts, 1e-2)
-            if coarse <= budget:
-                return False
-        exact = self.legacy_epsilon_at_resume + self._certified_epsilon_of(counts)
-        return exact > budget
+    def _truncated_range_epsilon(self, counts: Dict[float, int], tail_frac: float = 1e-3) -> float:
+        import numpy as np
+        from scipy import stats
+        from dp_accounting.pld import privacy_loss_distribution as pldist
+        disc = self.pld_discretization
+        T = sum(counts.values())
+        m_lo, m_hi = self.range_pair_sizes()
+        ms = np.arange(m_lo, m_hi + 1, dtype=np.int64)
+        p = stats.binom.sf(self.B - 1, ms - 1, self.q)  # P[Binom(m-1, q) >= B]
+        p_hi = float(p.max())
+        pld_hist = None
+        for sigma, cnt in counts.items():
+            pl = pldist.from_gaussian_mechanism(
+                float(sigma), sampling_prob=self.q, value_discretization_interval=disc,
+                neighboring_relation=self._rel_add_remove).self_compose(int(cnt))
+            pld_hist = pl if pld_hist is None else pld_hist.compose(pl)
+        if p_hi <= 0.0:
+            return pld_hist.get_epsilon_for_delta(self.delta)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            c = np.where(p > 0, stats.binom.sf(self.B, ms, self.q) * self.B / (p * ms), 0.0)
+        c_hi = float(np.nanmax(c))
+        sigma_min = min(float(s) for s in counts)
+        pld2 = pldist.from_gaussian_mechanism(
+            sigma_min / 2.0, sampling_prob=c_hi, value_discretization_interval=disc,
+            neighboring_relation=self._rel_replace)
+        k_max = 0
+        while stats.binom.sf(k_max, T, p_hi) > tail_frac * self.delta:
+            k_max += 1
+        tail = float(stats.binom.sf(k_max, T, p_hi))
+        weights = stats.binom.pmf(np.arange(k_max + 1), T, p_hi)
+        plds = [pld_hist]
+        for _ in range(k_max):
+            plds.append(plds[-1].compose(pld2))
+        target = self.delta - tail
+
+        def total_delta(eps):
+            return sum(w * pl.get_delta_for_epsilon(eps) for w, pl in zip(weights, plds))
+
+        lo = plds[0].get_epsilon_for_delta(target)
+        hi = plds[-1].get_epsilon_for_delta(target)
+        if total_delta(lo) <= target:
+            return lo
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            if total_delta(mid) <= target:
+                hi = mid
+            else:
+                lo = mid
+            if hi - lo < 1e-6:
+                break
+        return hi
+
+    def max_truncation_probability(self) -> Optional[float]:
+        """Per-step probability that a draw is truncated, at the top of the
+        public range (``None`` for samplers without truncation). Each
+        truncated step is charged at ``sigma/2``, so this times the number of
+        steps must be well below one for the certificate to stay close to
+        the untruncated value."""
+        if self.sampling_method != TRUNCATED_POISSON:
+            return None
+        from scipy import stats
+        _, m_hi = self.range_pair_sizes()
+        return float(stats.binom.sf(self.B - 1, m_hi - 1, self.q))
+
+    def range_epsilon(self, counts: Optional[Dict[float, int]] = None) -> float:
+        """Certified epsilon valid for every dataset whose record count lies
+        in the public ``records_range`` (see the module docstring). This is
+        the certificate and the only epsilon a stop decision may use; it
+        depends on public quantities only. Default ``counts``: the composed
+        history."""
+        counts = self._step_counts if counts is None else counts
+        key = tuple(sorted((float(s), int(c)) for s, c in counts.items() if c > 0))
+        if key not in self._range_cache:
+            if not key:
+                eps = 0.0
+            elif self.sampling_method == TRUNCATED_POISSON:
+                eps = self._truncated_range_epsilon(dict(key))
+            else:
+                # Sampling without replacement: amplification is monotone in
+                # B/m, so the smallest record count of the range is the worst.
+                eps = self._certified_epsilon_of(dict(key), num_records=self.records_range[0])
+            self._range_cache[key] = eps
+        return self.legacy_epsilon_at_resume + self._range_cache[key]
+
+    def public_step_limit(self, budget: float, schedule: Callable[[int], Dict[float, int]],
+                          max_steps: int) -> int:
+        """Largest ``T <= max_steps`` with ``range_epsilon(schedule(T)) <=
+        budget``. ``schedule(T)`` maps a step count to the public per-step
+        noise-multiplier counts of the first ``T`` steps. The result depends
+        on public quantities only, so stopping at it reveals nothing about
+        the data (``range_epsilon`` is non-decreasing in ``T``)."""
+        max_steps = int(max_steps)
+        if math.isinf(budget) or max_steps <= 0:
+            return max_steps
+        if self.range_epsilon(schedule(max_steps)) <= budget:
+            return max_steps
+        if self.range_epsilon(schedule(0)) > budget:
+            return 0
+        lo, hi = 0, max_steps  # invariant: eps(lo) <= budget < eps(hi)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if self.range_epsilon(schedule(mid)) <= budget:
+                lo = mid
+            else:
+                hi = mid
+        return lo
 
     def proxy_epsilons(self) -> Dict[str, float]:
         if self._cached_eps is None or self._dirty:
@@ -335,10 +497,12 @@ class DPAccountantBundle:
             f'N={self.N}',
             f'pairs={"/".join(str(m) for m in self.pair_sizes())}',
             f'n_bound={self.population_bound}',
+            f'records_range=[{self.records_range[0]}, {self.records_range[1]}]',
             f'B={self.B}',
             f'q={self.q:.6g}',
             f'delta={self.delta:g}',
-            f'certified={self.certified_name}',
+            f'certificate={self.range_certificate_name}',
+            f'this_dataset={self.certified_name}',
         ]
         if self.proxy_names:
             parts.append('proxies=' + ', '.join(self.proxy_names))

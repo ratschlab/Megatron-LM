@@ -1129,8 +1129,10 @@ class TestNoiseCalibration:
         step = 5
         noise_std = 1.0
 
+        from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
+
         def _generate_noise(base_seed):
-            seed = (base_seed + step * 1000003 + 7) % (2**31 - 1)
+            seed = dp_noise_generator_seed(base_seed, step, 'replicated', 0)
             gen = torch.Generator()
             gen.manual_seed(seed)
             return torch.normal(0.0, noise_std, size=shape, generator=gen)
@@ -1147,26 +1149,23 @@ class TestNoiseCalibration:
         assert not torch.allclose(noise_a, noise_b, atol=1e-4), \
             "Different base seeds must produce different noise"
 
-    def test_noise_seed_zero_matches_legacy(self):
-        """base_seed=0 should reproduce the old (pre-random-seed) behavior."""
-        shape = (16, 16)
-        step = 10
-        noise_std = 1.0
-
-        # Legacy formula: (step * 1000003 + 7) % (2**31 - 1)
-        legacy_seed = (step * 1000003 + 7) % (2**31 - 1)
-        gen_legacy = torch.Generator()
-        gen_legacy.manual_seed(legacy_seed)
-        noise_legacy = torch.normal(0.0, noise_std, size=shape, generator=gen_legacy)
-
-        # New formula with base=0: (0 + step * 1000003 + 7) % (2**31 - 1)
-        new_seed = (0 + step * 1000003 + 7) % (2**31 - 1)
-        gen_new = torch.Generator()
-        gen_new.manual_seed(new_seed)
-        noise_new = torch.normal(0.0, noise_std, size=shape, generator=gen_new)
-
-        torch.testing.assert_close(noise_legacy, noise_new,
-            msg="base_seed=0 must match legacy (no base seed) behavior")
+    def test_noise_generator_seeds_are_distinct_per_stream_and_shared_when_required(self):
+        """Sharded parameters need independent streams per TP rank (and per
+        DP rank with the distributed optimizer); replicated parameters need
+        the same stream on every TP rank; every step needs new streams; the
+        seeds are 63-bit values derived by hashing the secret base seed."""
+        from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
+        base, step = 2 ** 62 + 12345, 7
+        shards = [dp_noise_generator_seed(base, step, 'sharded', tp, 0) for tp in range(4)]
+        assert len(set(shards)) == 4
+        assert all(0 <= v < 2 ** 63 for v in shards)
+        rep0 = dp_noise_generator_seed(base, step, 'replicated', 0)
+        assert rep0 == dp_noise_generator_seed(base, step, 'replicated', 0)
+        assert rep0 not in shards
+        assert dp_noise_generator_seed(base, step + 1, 'replicated', 0) != rep0
+        assert dp_noise_generator_seed(base + 1, step, 'replicated', 0) != rep0
+        assert dp_noise_generator_seed(base, step, 'sharded', 1, 0, 0) != \
+            dp_noise_generator_seed(base, step, 'sharded', 1, 1, 0)
 
 
 class TestSensitivityBoundEmpirical:

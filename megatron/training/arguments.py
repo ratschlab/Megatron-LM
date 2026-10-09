@@ -270,6 +270,10 @@ def validate_args(args, defaults={}):
 
     # DP-SGD validation and auto-configuration.
     if args.dp_sgd:
+        if getattr(args, 'dp_num_records_range', None) is not None:
+            _lo, _hi = args.dp_num_records_range
+            assert 1 <= _lo <= _hi, \
+                f'--dp-num-records-range must satisfy 1 <= LO <= HI, got {_lo} {_hi}'
         if not getattr(args, 'dp_data_path', None):
             assert args.dp_num_dataset_examples > 0, \
                 '--dp-num-dataset-examples must be set when --dp-sgd is enabled ' \
@@ -284,6 +288,26 @@ def validate_args(args, defaults={}):
             )
         assert args.context_parallel_size == 1, \
             'DP-SGD requires context_parallel_size=1'
+        # Configurations that break the clipping or noise assumptions (review 6):
+        # the noise is calibrated to sigma*C/(D*K) for a gradient that DDP
+        # divides by D and that is accumulated over the K microbatches of the
+        # target global batch, measured by an unscaled Pass-1 backward.
+        assert not getattr(args, 'calculate_per_token_loss', False), \
+            'DP-SGD does not support --calculate-per-token-loss: DDP then stops ' \
+            'dividing the clipped gradient sum by the data-parallel size while the ' \
+            'noise keeps that factor (under-noised by D).'
+        assert getattr(args, 'rampup_batch_size', None) is None, \
+            'DP-SGD does not support --rampup-batch-size: clipping uses the current ' \
+            'number of microbatches while the noise and the sampler use the target ' \
+            'global batch (under-noised early steps, one-draw-per-step broken).'
+        assert not args.fp16, \
+            'DP-SGD requires BF16 (or FP32): with FP16 the unscaled Pass-1 backward ' \
+            'can underflow a per-example norm to zero while the loss-scaled Pass-2 ' \
+            'gradient is non-zero, which invalidates the clipping bound.'
+        assert args.perform_initialization or args.tensor_model_parallel_size == 1, \
+            'DP-SGD with tensor parallelism requires parameter initialization ' \
+            '(--no-initialization skips the tensor_model_parallel attribute stamping, ' \
+            'so TP shards would receive identical noise).'
         assert not getattr(args, 'num_experts', None), \
             'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
         # Tied input embedding / output projection share one weight, but ghost
@@ -2573,8 +2597,24 @@ def _add_dp_sgd_args(parser):
     group.add_argument('--dp-delta', type=float, default=1e-7,
                        help='Target delta for (epsilon, delta)-DP guarantee.')
     group.add_argument('--dp-epsilon-budget', type=float, default=float('inf'),
-                       help='Maximum epsilon budget. Training halts before the step '
-                       'that would exceed this.')
+                       help='Maximum epsilon budget. Before training starts, the largest '
+                       'public step count whose certificate (worst case over '
+                       '--dp-num-records-range) fits the budget is computed from public '
+                       'quantities only, and training stops at that step. No stop '
+                       'decision depends on the data or its record count.')
+    group.add_argument('--dp-allow-row-level-privacy', action='store_true',
+                       help='Allow training on records without privacy_unit_id. The '
+                       'guarantee is then per ROW, not per patient/document, and is '
+                       'reported as such. Synthetic data only.')
+    group.add_argument('--dp-num-records-range', type=int, nargs=2, default=None,
+                       metavar=('LO', 'HI'),
+                       help='Public range [LO, HI] of record counts that the epsilon '
+                       'certificate and the stop schedule cover (worst case over the '
+                       'range, independent of the actual count). Default: '
+                       '[n, n] with n = --dp-num-dataset-examples, i.e. the record '
+                       'count is assumed to equal the public bound. n should be the '
+                       'top of the range: above n the expected draw approaches the '
+                       'physical batch and truncation dominates the certificate.')
     group.add_argument('--dp-loss-aggregation', type=str, default='mean',
                        choices=['mean', 'sum'],
                        help='Per-example loss aggregation over tokens. '

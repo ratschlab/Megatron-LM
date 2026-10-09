@@ -161,24 +161,61 @@ class TestSamplerAccountantConsistency:
         b.compose_step(0.8)
         assert b.epsilon(force=True) == pytest.approx(p)
 
-    def test_budget_gate_never_crosses(self):
-        """Per-step increments are not monotone (the first truncated step is
-        the most expensive), so the gate must evaluate the complete next step."""
+    def test_range_certificate_dominates_every_record_count_in_range(self):
+        """The certificate is a rigorous worst case over the public range:
+        it is at least the exact per-pair epsilon of every record count in
+        the range (checked on a grid), and tight at the top of the range."""
+        q = 0.85 * B / N_BOUND
+        b = DPAccountantBundle('truncated_poisson', N, B, q, DELTA, 0.8, enable_prv=False,
+                               pld_discretization=1e-2, population_bound=N_BOUND,
+                               records_range=(900, 1100))
+        b.compose_step(0.8, 30)
+        cert = b.range_epsilon()
+        exact = [max(_library_epsilon(m, q, 0.8, 30), _library_epsilon(m + 1, q, 0.8, 30))
+                 for m in (900, 950, 1000, 1050, 1100)]
+        assert cert >= max(exact) - 1e-9
+        assert cert <= 1.1 * max(exact)
+        # Without truncation (every record count in the range below B) the
+        # certificate is the untruncated Poisson composition.
+        b2 = DPAccountantBundle('truncated_poisson', 10, B, 0.5, DELTA, 0.8, enable_prv=False,
+                                pld_discretization=1e-2, records_range=(5, 12))
+        b2.compose_step(0.8, 5)
+        assert b2.max_truncation_probability() == 0.0
+        assert b2.range_epsilon() == pytest.approx(b2.epsilon(force=True), rel=1e-6)
+
+    def test_range_certificate_is_independent_of_the_record_count(self):
+        """Two datasets with different record counts and the same public
+        range get the same certificate and the same public step limit (the
+        reviewer's example: a four-row dataset and its five-row neighbour)."""
+        q = 0.17
+        limits, certs = [], []
+        for n_rec in (4, 5):
+            b = DPAccountantBundle('truncated_poisson', n_rec, 1, q, DELTA, 4.0, enable_prv=False,
+                                   pld_discretization=1e-2, records_range=(3, 8))
+            schedule = lambda T: {4.0: T} if T > 0 else {}
+            limits.append(b.public_step_limit(0.327, schedule, 10))
+            b.compose_step(4.0, 1)
+            certs.append(b.range_epsilon())
+        assert limits[0] == limits[1]
+        assert certs[0] == certs[1]
+
+    def test_public_step_limit_is_the_largest_step_count_within_budget(self):
         b = _bundle('truncated_poisson')
-        first = b.prospective_epsilon(0.8)
-        assert first > 1.0  # a single step already exceeds a budget of 1.0
-        assert b.would_exceed(1.0, 0.8)  # step 1 is refused
-        assert not b.would_exceed(float('inf'), 0.8)
-        b.compose_step(0.8, 20)
-        budget = b.epsilon(force=True) * 1.02
-        for _ in range(200):
-            if b.would_exceed(budget, 0.8):
-                break
-            b.compose_step(0.8)
-        else:
-            pytest.fail('budget gate never triggered')
-        assert b.epsilon(force=True) <= budget
-        assert b.prospective_epsilon(0.8) > budget
+        schedule = lambda T: {0.8: T} if T > 0 else {}
+        assert b.public_step_limit(float('inf'), schedule, 50) == 50
+        eps30 = b.range_epsilon(schedule(30))
+        limit = b.public_step_limit(eps30, schedule, 50)
+        assert limit >= 30
+        assert b.range_epsilon(schedule(limit)) <= eps30
+        assert b.range_epsilon(schedule(limit + 1)) > eps30
+        assert b.public_step_limit(0.5 * b.range_epsilon(schedule(1)), schedule, 50) == 0
+
+    def test_range_epsilon_is_monotone_in_steps_and_charges_the_init_step(self):
+        b = _bundle('truncated_poisson')
+        e1 = b.range_epsilon({0.8: 10})
+        e2 = b.range_epsilon({0.8: 20})
+        e3 = b.range_epsilon({effective_sigma(0.8, 10.0, 33): 1, 0.8: 19})
+        assert e1 < e2 < e3
 
     def test_history_round_trip_recomposes_at_delta(self):
         """Resume must recompose the event history (exact at delta), not add
@@ -307,11 +344,13 @@ class TestResumeParameterLock:
         b = _bundle('truncated_poisson')
         stored = dict(sampling_method='truncated_poisson', num_records=N,
                       population_bound=N_BOUND, physical_batch=B,
-                      sampling_probability=b.q, delta=DELTA)
+                      sampling_probability=b.q, delta=DELTA,
+                      records_range=[N_BOUND, N_BOUND])
         training._dp_check_resume_params(b, stored)  # identical: accepted
         for key, bad in (('num_records', N + 10), ('population_bound', 2 * N_BOUND),
                          ('physical_batch', B + 1), ('sampling_probability', b.q * 1.01),
-                         ('delta', DELTA / 2), ('sampling_method', 'shuffle_wor')):
+                         ('delta', DELTA / 2), ('sampling_method', 'shuffle_wor'),
+                         ('records_range', [N_BOUND, 2 * N_BOUND])):
             with pytest.raises(RuntimeError, match=key):
                 training._dp_check_resume_params(b, {**stored, key: bad})
         with pytest.raises(RuntimeError, match='num_records'):

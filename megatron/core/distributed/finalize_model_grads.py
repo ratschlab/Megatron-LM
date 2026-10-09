@@ -236,6 +236,21 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         expert_bias.copy_(updated_expert_bias)
 
 
+
+def dp_noise_generator_seed(base, step, kind, *ranks):
+    """Generator seed for one noise stream: a 63-bit blake2b digest of the
+    secret base seed (63 bits of os.urandom entropy), the step, the stream
+    kind ('replicated' or 'sharded') and the rank coordinates that must get
+    independent streams. Distinct inputs give (with overwhelming probability)
+    distinct seeds; identical inputs give identical seeds, which is what keeps
+    replicated parameters in sync across TP ranks. Limitation: the generator
+    seeded with it is torch's deterministic Philox, not a cryptographic RNG.
+    """
+    import hashlib
+    msg = f'{int(base)}|{int(step)}|{kind}|' + '|'.join(str(int(r)) for r in ranks)
+    digest = hashlib.blake2b(msg.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, 'big') & ((1 << 63) - 1)
+
 def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig):
     """Inject Gaussian noise into gradients for DP-SGD.
 
@@ -306,13 +321,17 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
         "This is normally done in train() or restored from checkpoint."
     )
 
-    # Per-step seeds derived from base seed + step + rank.
+    # Per-step, per-rank generator seeds derived from the secret base seed by
+    # hashing. Replicated parameters share one stream across TP ranks (they
+    # must stay identical), sharded parameters get a TP-rank-specific stream;
+    # with the distributed optimizer each DP rank noises its own shard
+    # independently.
     if use_dist_opt:
-        replicated_seed = (base + step * 1000003 + dp_rank * 1000011 + pp_rank * 1000019 + 7) % (2**31 - 1)
-        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + dp_rank * 1000011 + pp_rank * 1000019 + 13) % (2**31 - 1)
+        replicated_seed = dp_noise_generator_seed(base, step, 'replicated', dp_rank, pp_rank)
+        sharded_seed = dp_noise_generator_seed(base, step, 'sharded', tp_rank, dp_rank, pp_rank)
     else:
-        replicated_seed = (base + step * 1000003 + pp_rank * 1000019 + 7) % (2**31 - 1)
-        sharded_seed = (base + step * 1000003 + tp_rank * 1000007 + pp_rank * 1000019 + 13) % (2**31 - 1)
+        replicated_seed = dp_noise_generator_seed(base, step, 'replicated', pp_rank)
+        sharded_seed = dp_noise_generator_seed(base, step, 'sharded', tp_rank, pp_rank)
 
     device = next(model[0].parameters()).device
     gen_replicated = torch.Generator(device=device)

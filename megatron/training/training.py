@@ -53,6 +53,7 @@ from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
 #   _dp_pld_accountant: PLD-based via FFT (tighter, Koskela et al. 2020)
 #   _dp_prv_accountant: PRV-based (tightest, Gopi et al. 2021)
 _dp_accountant = None
+_dp_step_limit = None  # public stop step (from the budget and the public record-count range)
 _dp_pld_accountant = None
 _dp_prv_accountant = None
 _dp_current_epsilon = 0.0
@@ -85,10 +86,13 @@ def _dp_check_resume_params(bundle, stored):
         ('sampling_probability', bundle.q),
         ('delta', bundle.delta),
         ('population_bound', bundle.population_bound),
+        ('records_range', tuple(bundle.records_range)),
     )
     for key, live in checks:
         old = stored.get(key)
-        if isinstance(live, float):
+        if isinstance(live, tuple):
+            same = old is not None and tuple(old) == live
+        elif isinstance(live, float):
             same = old is not None and abs(float(old) - live) <= 1e-12 * max(1.0, abs(live))
         else:
             same = old == live
@@ -124,6 +128,75 @@ def _dp_step_sigma_eff(args, model, extra_count_queries=0):
     return effective_sigma(args.dp_noise_multiplier, sigma_b, K)
 
 
+def _dp_verify_tp_noise_attributes(model, args):
+    """Independent noise across tensor-parallel shards relies on the
+    ``tensor_model_parallel`` attribute of every parameter: sharded
+    parameters get a TP-rank-specific noise stream, replicated ones a shared
+    stream (they must stay identical across TP ranks). A sharded parameter
+    that is marked replicated (an externally built layer, or weights built
+    without the attribute stamping) would receive identical noise on every
+    shard, which is not independent Gaussian noise on the full parameter
+    vector. Check the attribute against the data after the checkpoint is
+    loaded: a parameter marked replicated must be identical on all TP ranks
+    (error otherwise); a parameter marked sharded that is identical on all
+    TP ranks is reported (it may legitimately be zero-initialized)."""
+    world = mpu.get_tensor_model_parallel_world_size()
+    if world == 1:
+        return
+    group = mpu.get_tensor_model_parallel_group()
+    bad, suspicious = [], []
+    for chunk in model:
+        for name, param in chunk.named_parameters():
+            if not param.requires_grad or param.numel() == 0:
+                continue
+            p = param.detach().float()
+            flat = p.flatten()
+            local = torch.stack([p.sum(), (p * p).sum(), flat[0], flat[-1],
+                                 torch.tensor(float(p.numel()), device=p.device)])
+            gathered = [torch.empty_like(local) for _ in range(world)]
+            torch.distributed.all_gather(gathered, local, group=group)
+            same = all(torch.equal(g, gathered[0]) for g in gathered[1:])
+            if getattr(param, 'tensor_model_parallel', False):
+                if same:
+                    suspicious.append(name)
+            elif not same:
+                bad.append(name)
+    if bad:
+        raise RuntimeError(
+            f'DP-SGD: {len(bad)} parameter(s) differ across tensor-parallel ranks but are '
+            f'marked replicated (tensor_model_parallel=False), e.g. {bad[:3]}; they would '
+            f'receive identical noise on every shard. Fix the attribute stamping of these '
+            f'layers (or do not use --no-initialization / CPU-initialized external layers).')
+    if suspicious and args.rank == 0:
+        print(f'DP-SGD: NOTE {len(suspicious)} parameter(s) marked tensor-parallel are '
+              f'identical on all TP ranks (e.g. {suspicious[:3]}); fine if zero-initialized, '
+              f'otherwise check their attributes.')
+
+
+def _dp_public_schedule(args, model):
+    """Public per-step noise schedule: ``schedule(T)`` gives the joint noise
+    multipliers of the first ``T`` steps as counts, from the configuration
+    only. Step 1 of an adaptive run carries the public-threshold
+    initialization queries; every step carries the K count queries."""
+    from collections import OrderedDict
+    pct = getattr(args, 'dp_clipping_percentile', None)
+    adaptive = pct is not None and pct != 0
+    init_extra = int(getattr(args, 'dp_clipping_init_queries', 32)) if adaptive else 0
+    sigma_reg = float(_dp_step_sigma_eff(args, model, 0))
+    sigma_init = float(_dp_step_sigma_eff(args, model, init_extra)) if adaptive else sigma_reg
+
+    def schedule(T):
+        T = int(T)
+        counts = OrderedDict()
+        if T <= 0:
+            return counts
+        counts[sigma_init] = 1
+        if T > 1:
+            counts[sigma_reg] = counts.get(sigma_reg, 0) + T - 1
+        return counts
+    return schedule
+
+
 def _dp_shared_secret_seed(user_seed, name):
     """A seed shared by all ranks that is secret unless the user supplied one.
 
@@ -132,12 +205,15 @@ def _dp_shared_secret_seed(user_seed, name):
     amplification and predictable noise is not a Gaussian mechanism.
     """
     import secrets
+    args = get_args()
     if user_seed is not None:
         if torch.distributed.get_rank() == 0:
             print(f'WARNING: DP-SGD {name} seed supplied on the command line is '
-                  f'public; use only for synthetic-data tests.')
+                  f'public; the reported epsilon is then NOT a certificate '
+                  f'(synthetic-data tests only).')
+        args._dp_public_seeds = True
         return int(user_seed)
-    value = secrets.randbits(31) if torch.distributed.get_rank() == 0 else 0
+    value = secrets.randbits(63) if torch.distributed.get_rank() == 0 else 0
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     t = torch.tensor([value], dtype=torch.long, device=device)
     torch.distributed.broadcast(t, src=0)
@@ -1707,7 +1783,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # DP-SGD: Initialize privacy accountant and noise seed.
-    global _dp_accountant, _dp_pld_accountant, _dp_prv_accountant
+    global _dp_accountant, _dp_pld_accountant, _dp_prv_accountant, _dp_step_limit
     global _dp_current_epsilon, _dp_current_epsilon_pld, _dp_current_epsilon_prv
     global _dp_epsilon_at_resume
     global _dp_clinical_steps, _dp_literature_steps
@@ -1724,6 +1800,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             else:
                 args.dp_clipping_norm_current = args.dp_clipping_norm
         args._dp_extra_sigma_b_queries = 0
+
+        # Noise independence across TP shards depends on parameter attributes;
+        # verify them against the loaded weights before any noise is drawn.
+        if args.dp_noise_multiplier > 0:
+            _dp_verify_tp_noise_attributes(model, args)
 
         if args.dp_noise_seed is None:
             # Secret entropy (os.urandom), NOT torch's global generator, which
@@ -1769,6 +1850,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     sampling_method=_acct_params['sampling_method'],
                     num_records=_acct_params['num_records'],
                     population_bound=_acct_params.get('population_bound'),
+                    records_range=getattr(args, 'dp_num_records_range', None),
                     physical_batch=_acct_params['physical_batch'],
                     sampling_probability=_acct_params['sampling_probability'],
                     delta=args.dp_delta,
@@ -1814,6 +1896,51 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                               f'{_dp_accountant.delta_total:g}, not delta.')
                 if args.rank == 0:
                     print(f'DP-SGD: Privacy accountant initialized ({_dp_accountant.describe()})')
+                    if getattr(args, '_dp_public_seeds', False):
+                        print('DP-SGD: WARNING public sampling/noise seed(s) supplied; the '
+                              'reported epsilon is NOT a certificate for this run.')
+                    _lo, _hi = _dp_accountant.records_range
+                    if getattr(args, 'dp_num_records_range', None) is None:
+                        print(f'DP-SGD: NOTE --dp-num-records-range not given; the certificate '
+                              f'assumes the record count equals the public bound n={_lo} '
+                              f'(range [{_lo}, {_hi}]).')
+                    if not (_lo <= _dp_accountant.N <= _hi):
+                        print(f'DP-SGD: WARNING the loaded record count lies outside the public '
+                              f'range [{_lo}, {_hi}]; the certificate does not cover this '
+                              f'dataset (the mechanism itself is unchanged).')
+                    _p_tr = _dp_accountant.max_truncation_probability()
+                    if _p_tr is not None:
+                        _exp_tr = _p_tr * args.train_iters
+                        _msg = (f'DP-SGD: truncation probability per step at the top of the '
+                                f'range p={_p_tr:.3g}; expected truncated steps over '
+                                f'{args.train_iters} steps = {_exp_tr:.3g}.')
+                        if _exp_tr > 0.01:
+                            _msg += (' WARNING: each truncated step is charged at sigma/2, so '
+                                     'the certificate will be far above the untruncated '
+                                     'value; lower --dp-poisson-expected-fraction (about '
+                                     '1 - 5/sqrt(B)) or raise the batch size.')
+                        print(_msg)
+                # Public stop schedule: the largest step count whose certificate
+                # (worst case over the public record-count range) fits the
+                # budget, computed from public quantities only. The stop
+                # decision therefore reveals nothing about the data; a gate
+                # that compared the epsilon of the actual record count against
+                # the budget would (the neighbour with one more record could
+                # take a step that this dataset refuses).
+                _dp_step_limit = None
+                if args.dp_epsilon_budget != float('inf'):
+                    _schedule = _dp_public_schedule(args, model)
+                    _dp_step_limit = _dp_accountant.public_step_limit(
+                        args.dp_epsilon_budget, _schedule, args.train_iters)
+                    if args.rank == 0:
+                        _eps_limit = _dp_accountant.range_epsilon(_schedule(_dp_step_limit))
+                        print(f'DP-SGD: public stop schedule: {_dp_step_limit} of '
+                              f'{args.train_iters} steps fit the budget '
+                              f'{args.dp_epsilon_budget} (certificate at the limit '
+                              f'eps={_eps_limit:.4f} for record counts in '
+                              f'[{_dp_accountant.records_range[0]}, '
+                              f'{_dp_accountant.records_range[1]}]).')
+                if args.rank == 0:
                     if getattr(args, 'dp_num_clinical_examples', 0) > 0 or \
                             getattr(args, 'dp_num_literature_examples', 0) > 0:
                         print('DP-SGD: eps_clinical / eps_literature are informational '
@@ -1852,33 +1979,19 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
-        # DP-SGD: stop BEFORE a step that would exceed the epsilon budget. The
-        # prospective epsilon of the complete next step (including the
-        # public-threshold releases of a first-step C initialization) is
-        # evaluated exactly; per-step increments are not monotone, so no
-        # extrapolation from past increments is used.
-        if (_dp_accountant is not None
-                and args.dp_noise_multiplier > 0
-                and args.dp_epsilon_budget != float('inf')):
-            _pct = getattr(args, 'dp_clipping_percentile', None)
-            _will_init = (_pct is not None and _pct != 0
-                          and getattr(args, 'dp_clipping_norm_current', 0.0) == float('inf'))
-            _extra_next = int(getattr(args, 'dp_clipping_init_queries', 32)) if _will_init else 0
-            _sigma_next = _dp_step_sigma_eff(args, model, _extra_next)
-            _prospective = _dp_accountant.prospective_epsilon(_sigma_next)
-            if _prospective > args.dp_epsilon_budget:
-                _dp_current_epsilon = _dp_accountant.epsilon(force=True)
-                if args.rank == 0:
-                    msg = f'DP-SGD: Epsilon budget reached (current={_dp_current_epsilon:.4f}'
-                    if _dp_epsilon_clinical > 0:
-                        msg += f', clinical={_dp_epsilon_clinical:.4f}'
-                    if _dp_epsilon_literature > 0:
-                        msg += f', literature={_dp_epsilon_literature:.4f}'
-                    msg += (f', next step would give {_prospective:.4f}'
-                            f', budget={args.dp_epsilon_budget}). Stopping training.')
-                    print(msg)
-                should_exit = True
-                break
+        # DP-SGD: public stop schedule. The stop step was computed before
+        # training from public quantities only (budget, public record-count
+        # range, noise schedule); no decision visible in the output depends on
+        # the data or its record count.
+        if _dp_step_limit is not None and iteration >= _dp_step_limit:
+            if args.rank == 0:
+                print(f'DP-SGD: public step limit reached ({_dp_step_limit} steps; '
+                      f'certificate eps={_dp_accountant.range_epsilon():.4f} for record '
+                      f'counts in [{_dp_accountant.records_range[0]}, '
+                      f'{_dp_accountant.records_range[1]}], budget='
+                      f'{args.dp_epsilon_budget}). Stopping training.')
+            should_exit = True
+            break
 
         # Run training step.
         args.curr_iteration = iteration
@@ -1932,8 +2045,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 if N_literature > 0:
                     _dp_epsilon_literature = _dp_accountant.epsilon_for_population(N_literature)
                 if args.rank == 0:
-                    eps_str = (f'DP-SGD: step={iteration}, eps={_dp_current_epsilon:.4f} '
-                               f'[{_dp_accountant.certified_name}]')
+                    _lo, _hi = _dp_accountant.records_range
+                    eps_str = (f'DP-SGD: step={iteration}, eps={_dp_accountant.range_epsilon():.4f} '
+                               f'[certificate for record counts in [{_lo}, {_hi}]: '
+                               f'{_dp_accountant.range_certificate_name}], '
+                               f'eps_pairs_N={_dp_current_epsilon:.4f} '
+                               f'[this dataset, informational: {_dp_accountant.certified_name}]')
                     for _name, _val in _dp_accountant.proxy_epsilons().items():
                         eps_str += f', {_name}={_val:.4f}'
                     if N_clinical > 0:

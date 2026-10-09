@@ -689,13 +689,17 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
         import megatron.training.training as training_module
         _dp_accountant = training_module._dp_accountant
         if _dp_accountant is not None:
-            # Force an exact evaluation so the stored epsilon is certified, not a bound.
-            state_dict['dp_sgd_epsilon'] = _dp_accountant.epsilon(force=True)
+            # The certificate: worst case over the public record-count range
+            # (independent of the actual count). The exact value for this
+            # dataset's neighbour pairs is stored separately (informational).
+            state_dict['dp_sgd_epsilon'] = _dp_accountant.range_epsilon()
+            state_dict['dp_sgd_epsilon_pairs'] = _dp_accountant.epsilon(force=True)
             # The event history lets a resumed run recompose exactly at delta.
             state_dict['dp_sgd_accounting'] = {
                 'sampling_method': _dp_accountant.sampling_method,
                 'num_records': _dp_accountant.N,
                 'population_bound': _dp_accountant.population_bound,
+                'records_range': list(_dp_accountant.records_range),
                 'physical_batch': _dp_accountant.B,
                 'sampling_probability': _dp_accountant.q,
                 'delta': _dp_accountant.delta,

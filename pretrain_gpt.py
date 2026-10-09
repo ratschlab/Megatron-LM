@@ -395,9 +395,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         _acct = train_ds.accounting_params()
         args.dp_accounting_params = _acct
         if _acct['privacy_unit'] != 'unit':
+            if not getattr(args, 'dp_allow_row_level_privacy', False):
+                raise RuntimeError(
+                    'DP-SGD: records carry no privacy_unit_id, so the guarantee would be '
+                    'per ROW, not per patient/document. Provide genuine unit ids (one row '
+                    'per unit; the tokenizer no longer invents them) or pass '
+                    '--dp-allow-row-level-privacy (synthetic data only).')
             print_rank_0("  WARNING: records carry no privacy_unit_id; the guarantee is "
-                         "per ROW, not per patient/document, unless preprocessing "
-                         "guarantees one row per unit.")
+                         "per ROW, not per patient/document (--dp-allow-row-level-privacy).")
 
         print_rank_0(f"  {train_ds.N} training records, public population bound "
                      f"n={train_ds.population_size}, sampling={train_ds.sampling_method}, "

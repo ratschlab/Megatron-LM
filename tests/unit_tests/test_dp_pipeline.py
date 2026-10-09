@@ -1468,7 +1468,11 @@ class TestActualNoiseSeedFormula:
 
         assert 'pp_rank' in src, "Noise seed must include pp_rank for PP>1"
         assert 'get_pipeline_model_parallel_rank' in src, "Must call get_pipeline_model_parallel_rank"
-        assert '1000019' in src, "pp_rank multiplier should be 1000019"
+        assert 'dp_noise_generator_seed(base, step, \'sharded\', tp_rank, pp_rank)' in src, \
+            "sharded seeds must be derived from (base, step, tp_rank, pp_rank)"
+        from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
+        assert dp_noise_generator_seed(1, 1, 'sharded', 0, 0) != \
+            dp_noise_generator_seed(1, 1, 'sharded', 0, 1), "pp ranks must get distinct streams"
 
     def test_pp_rank_0_backward_compatible(self):
         """With pp_rank=0, the + 0 * 1000019 term vanishes."""
