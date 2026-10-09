@@ -467,6 +467,15 @@ def _dp_sgd_perlayer_forward_backward(
     IMPORTANT: This is completely independent of _dp_sgd_ghost_forward_backward.
     Changes here must NOT modify any shared code. See per-layer-clipping-plan.md.
     """
+    if forward_only:
+        # Evaluation: no clipping, no backward (the per-layer schedule always
+        # ran a backward, which fails under torch.no_grad()).
+        return forward_backward_no_pipelining(
+            forward_step_func=forward_step_func, data_iterator=data_iterator, model=model,
+            num_microbatches=num_microbatches, seq_length=seq_length,
+            micro_batch_size=micro_batch_size, decoder_seq_length=decoder_seq_length,
+            forward_only=True, collect_non_loss_data=collect_non_loss_data,
+            first_val_step=first_val_step)
     from megatron.core.pipeline_parallel.per_layer_clipping import PerLayerClippingContext
     from megatron.training import get_args
 
@@ -720,6 +729,7 @@ def _dp_sgd_ghost_forward_backward(
             # Read one microbatch and cache it. Only consume from data_iterator
             # on TP rank 0 (other ranks receive via broadcast in get_batch).
             # This mirrors get_batch_on_this_tp_rank's consumption pattern.
+            _batch = None  # placeholder on TP rank > 0 (get_batch broadcasts from rank 0)
             if _tp_rank == 0:
                 _batch = next(data_iterator)
                 _init_batches.append(_batch)
@@ -991,9 +1001,11 @@ def _dp_sgd_ghost_forward_backward(
         _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
         _B_global = args.micro_batch_size * dp_ws * num_microbatches
         # Seed from dp_noise_seed + step (secret, cross-rank consistent, different per step)
+        from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
         _noise_rng = torch.Generator()
-        _noise_seed = getattr(args, 'dp_noise_seed', 0) * 1000003 + getattr(args, 'curr_iteration', 0) + 7
-        _noise_rng.manual_seed(_noise_seed % (2**31 - 1))
+        _noise_rng.manual_seed(dp_noise_generator_seed(
+            getattr(args, 'dp_noise_seed', 0), getattr(args, 'dp_noise_steps_taken', 0),
+            'count_update'))
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
         _released_frac = _frac + noise  # the only quantity that leaves the batch
@@ -1516,9 +1528,11 @@ def _dp_sgd_pipeline_forward_backward(
         _sigma_b = getattr(args, 'dp_adapt_sigma_b', 10.0)
         _B_global = args.micro_batch_size * dp_ws * num_microbatches
         # Seed from dp_noise_seed + step (secret, cross-rank consistent, different per step)
+        from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
         _noise_rng = torch.Generator()
-        _noise_seed = getattr(args, 'dp_noise_seed', 0) * 1000003 + getattr(args, 'curr_iteration', 0) + 7
-        _noise_rng.manual_seed(_noise_seed % (2**31 - 1))
+        _noise_rng.manual_seed(dp_noise_generator_seed(
+            getattr(args, 'dp_noise_seed', 0), getattr(args, 'dp_noise_steps_taken', 0),
+            'count_update'))
         noise = torch.randn(1, generator=_noise_rng).item() * _sigma_b / _B_global
         _adapt_lr = getattr(args, 'dp_clipping_adapt_lr', 0.2)
         _released_frac = _frac + noise  # the only quantity that leaves the batch
@@ -3098,8 +3112,9 @@ def _private_init_C(args, raw_norms_local, C_max, num_microbatches):
     sigma_b = float(getattr(args, 'dp_adapt_sigma_b', 10.0))
     dp_ws = parallel_state.get_data_parallel_world_size()
     batch_global = args.micro_batch_size * dp_ws * num_microbatches
-    seed = (int(getattr(args, 'dp_noise_seed', 0)) * 1000003
-            + int(getattr(args, 'curr_iteration', 0)) + 101)
+    from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
+    seed = dp_noise_generator_seed(getattr(args, 'dp_noise_seed', 0),
+                                   getattr(args, 'dp_noise_steps_taken', 0), 'count_init')
     c_min = max(C_max * 1e-9, 1e-9)
     C_init = private_quantile_init(
         raw_norms=raw_norms_local,

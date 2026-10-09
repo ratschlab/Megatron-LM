@@ -1111,7 +1111,7 @@ def private_quantile_init(
     target_frac_above = 1.0 - target_quantile
 
     gen = torch.Generator()
-    gen.manual_seed(int(seed) % (2 ** 31 - 1))
+    gen.manual_seed(int(seed))
 
     log_t = torch.linspace(math.log(c_min), math.log(c_max), num_queries, dtype=torch.float64)
     thresholds = torch.exp(log_t)

@@ -416,7 +416,7 @@ class PerLayerClippingContext:
         from megatron.training import get_args
         _args = get_args()
         _base_seed = getattr(_args, 'dp_noise_seed', 0)
-        _step = getattr(_args, 'curr_iteration', 0)
+        _step = getattr(_args, 'dp_noise_steps_taken', 0)
 
         for idx, mid in enumerate(self._clip_counts):
             # All-reduce local clip count to get global fraction
@@ -428,7 +428,8 @@ class PerLayerClippingContext:
 
             # Private quantile estimation: add noise scaled by global batch size.
             _rng = torch.Generator()
-            _rng.manual_seed((_base_seed * 1000003 + _step * 997 + idx) % (2**31 - 1))
+            from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
+            _rng.manual_seed(dp_noise_generator_seed(_base_seed, _step, 'layer_count', idx))
             noise = torch.randn(1, generator=_rng).item() * self.sigma_b / global_batch_size
             noisy_frac = frac_clipped + noise
 

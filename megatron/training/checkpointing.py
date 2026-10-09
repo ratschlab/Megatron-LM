@@ -713,6 +713,7 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
             state_dict['dp_sgd_epsilon_literature'] = training_module._dp_epsilon_literature
         if getattr(args, 'dp_noise_seed', None) is not None:
             state_dict['dp_sgd_noise_seed'] = args.dp_noise_seed
+        state_dict['dp_sgd_noise_steps_taken'] = int(getattr(args, 'dp_noise_steps_taken', 0))
         state_dict['dp_sgd_noise_multiplier'] = args.dp_noise_multiplier
         state_dict['dp_sgd_clipping_norm_cli'] = args.dp_clipping_norm
         # Adaptive clipping state only: in fixed-C mode the clipping norm is the
@@ -1392,7 +1393,14 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         # Restore the noise base seed so resumed training continues with the
         # same seed (deterministic per-step noise derivation from base + step).
         # A user-specified --dp-noise-seed on the command line takes precedence.
-        if getattr(args, 'dp_noise_seed', None) is None:
+        # The lifetime noise counter continues regardless of the iteration
+        # (--finetune resets the iteration to zero).
+        args.dp_noise_steps_taken = int(state_dict.get('dp_sgd_noise_steps_taken',
+                                                       state_dict.get('iteration', 0)))
+        if args.finetune:
+            print_rank_0('DP-SGD: --finetune: a fresh secret noise seed is generated; the '
+                         'checkpointed seed is not reused (the privacy history is kept).')
+        elif getattr(args, 'dp_noise_seed', None) is None:
             args.dp_noise_seed = state_dict['dp_sgd_noise_seed']
             print_rank_0('DP-SGD: Restored noise seed from checkpoint (value not logged)')
         # Restore adaptive clipping C (adaptive mode only). In fixed-C mode the

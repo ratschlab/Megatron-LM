@@ -173,26 +173,33 @@ def _dp_verify_tp_noise_attributes(model, args):
               f'otherwise check their attributes.')
 
 
-def _dp_public_schedule(args, model):
-    """Public per-step noise schedule: ``schedule(T)`` gives the joint noise
-    multipliers of the first ``T`` steps as counts, from the configuration
-    only. Step 1 of an adaptive run carries the public-threshold
-    initialization queries; every step carries the K count queries."""
+def _dp_public_schedule(args, model, history, iteration_start):
+    """Public noise schedule: ``schedule(T)`` gives the per-step joint noise
+    multipliers (as counts) of the run up to loop iteration ``T``: the
+    restored event history (steps already taken, possibly at other noise
+    settings) plus ``T - iteration_start`` future steps at the current
+    configuration. The first future step of an adaptive run whose C is not
+    yet initialized carries the public-threshold initialization queries;
+    every step carries the K count queries. Everything here is public."""
     from collections import OrderedDict
     pct = getattr(args, 'dp_clipping_percentile', None)
     adaptive = pct is not None and pct != 0
-    init_extra = int(getattr(args, 'dp_clipping_init_queries', 32)) if adaptive else 0
+    will_init = adaptive and getattr(args, 'dp_clipping_norm_current', 0.0) == float('inf')
+    init_extra = int(getattr(args, 'dp_clipping_init_queries', 32)) if will_init else 0
     sigma_reg = float(_dp_step_sigma_eff(args, model, 0))
-    sigma_init = float(_dp_step_sigma_eff(args, model, init_extra)) if adaptive else sigma_reg
+    sigma_init = float(_dp_step_sigma_eff(args, model, init_extra)) if will_init else sigma_reg
+    history = OrderedDict((float(k), int(v)) for k, v in history.items() if v > 0)
 
     def schedule(T):
-        T = int(T)
-        counts = OrderedDict()
-        if T <= 0:
+        counts = OrderedDict(history)
+        future = int(T) - int(iteration_start)
+        if future <= 0:
             return counts
-        counts[sigma_init] = 1
-        if T > 1:
-            counts[sigma_reg] = counts.get(sigma_reg, 0) + T - 1
+        if will_init:
+            counts[sigma_init] = counts.get(sigma_init, 0) + 1
+            future -= 1
+        if future > 0:
+            counts[sigma_reg] = counts.get(sigma_reg, 0) + future
         return counts
     return schedule
 
@@ -1929,7 +1936,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 # take a step that this dataset refuses).
                 _dp_step_limit = None
                 if args.dp_epsilon_budget != float('inf'):
-                    _schedule = _dp_public_schedule(args, model)
+                    # The schedule starts from the restored history (its own
+                    # noise settings), never from the current settings applied
+                    # to past steps: 10 steps at sigma 0.5 resumed at sigma 2
+                    # would otherwise be scheduled as if all were at sigma 2.
+                    _schedule = _dp_public_schedule(
+                        args, model, dict(_dp_accountant._step_counts), iteration)
                     _dp_step_limit = _dp_accountant.public_step_limit(
                         args.dp_epsilon_budget, _schedule, args.train_iters)
                     if args.rank == 0:

@@ -309,7 +309,9 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
             torch.tensor(1.0, dtype=torch.float32, device='cuda')
         ).item()
 
-    step = getattr(args, 'curr_iteration', 0)
+    # Lifetime noise counter, not the iteration: --finetune resets the
+    # iteration to zero while the restored seed would repeat earlier noise.
+    step = int(getattr(args, 'dp_noise_steps_taken', 0))
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     dp_rank = parallel_state.get_data_parallel_rank()
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -362,6 +364,9 @@ def _dp_sgd_inject_noise(model: List[torch.nn.Module], config: TransformerConfig
                 generator=gen,
             )
             param.main_grad.add_(noise)
+
+    # Every noise stream of the next step is derived from a new counter value.
+    args.dp_noise_steps_taken = step + 1
 
 
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):

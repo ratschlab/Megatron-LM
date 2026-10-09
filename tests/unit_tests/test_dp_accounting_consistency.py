@@ -371,3 +371,54 @@ class TestArgumentDumpsHideSecrets:
         )
         public = dict(arguments.public_args_items(args))
         assert set(public) == {'seed', 'dp_noise_multiplier', 'dp_accounting_params'}
+
+
+class TestScheduleFromHistory:
+    def test_public_step_limit_uses_the_restored_history(self):
+        """Resuming with other noise settings: the stop schedule must compose
+        the restored history at its own noise multipliers plus the future
+        steps at the current one, never the current one for all steps
+        (reviewer: 10 steps at sigma 0.5 then sigma 2 with budget 4.363 gave
+        100 steps instead of 54)."""
+        b = _bundle('truncated_poisson')
+        history = {0.5: 10}
+        b.load_history({'step_counts': {repr(0.5): 10}})
+        iteration_start = 10
+
+        def schedule(T):
+            counts = dict(history)
+            future = int(T) - iteration_start
+            if future > 0:
+                counts[2.0] = future
+            return counts
+
+        def wrong_schedule(T):  # current sigma applied to the past as well
+            return {2.0: int(T)} if T > 0 else {}
+
+        budget = b.range_epsilon(schedule(40))
+        limit = b.public_step_limit(budget, schedule, 100)
+        assert 40 <= limit < 100
+        assert b.range_epsilon(schedule(limit)) <= budget < b.range_epsilon(schedule(limit + 1))
+        assert b.public_step_limit(budget, wrong_schedule, 100) > limit
+        # A history that already exceeds the budget stops the run at once.
+        assert b.public_step_limit(0.5 * b.range_epsilon(schedule(10)), schedule, 100) == 0
+
+
+class TestNoiseStreamsDoNotCollide:
+    def test_count_query_streams_are_distinct_from_gradient_streams_and_each_other(self):
+        """Every release on a step draws from its own hashed stream: the
+        gradient noise, the adaptive-C update, the initialization queries and
+        each per-layer count (the old offsets let initialization at step 0
+        reuse the update seed of step 94 and module 997 at step t reuse
+        module 0 at step t+1)."""
+        from megatron.core.distributed.finalize_model_grads import dp_noise_generator_seed
+        base = 2 ** 62 + 99
+        seeds = {
+            'grad': dp_noise_generator_seed(base, 0, 'replicated', 0),
+            'init0': dp_noise_generator_seed(base, 0, 'count_init'),
+            'upd0': dp_noise_generator_seed(base, 0, 'count_update'),
+            'upd94': dp_noise_generator_seed(base, 94, 'count_update'),
+            'layer997_t': dp_noise_generator_seed(base, 5, 'layer_count', 997),
+            'layer0_t1': dp_noise_generator_seed(base, 6, 'layer_count', 0),
+        }
+        assert len(set(seeds.values())) == len(seeds)

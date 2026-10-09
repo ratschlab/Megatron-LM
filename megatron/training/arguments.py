@@ -308,6 +308,19 @@ def validate_args(args, defaults={}):
             'DP-SGD with tensor parallelism requires parameter initialization ' \
             '(--no-initialization skips the tensor_model_parallel attribute stamping, ' \
             'so TP shards would receive identical noise).'
+        assert not (getattr(args, 'qk_layernorm', False)
+                    and args.transformer_impl != 'transformer_engine'), \
+            'DP-SGD with --qk-layernorm requires --transformer-impl transformer_engine: ' \
+            'the local implementation produces per-head norm contributions that the ' \
+            'ghost-clipping aggregation does not handle.'
+        if getattr(args, 'dp_clipping_mode', 'global') == 'per_layer':
+            assert args.pipeline_model_parallel_size == 1, \
+                '--dp-clipping-mode per_layer does not support pipeline parallelism.'
+            assert args.dp_noise_multiplier <= 0 or getattr(args, 'dp_allow_experimental', False), \
+                '--dp-clipping-mode per_layer has open privacy findings (un-noised quantile ' \
+                'initialization, backward-hook arity, deferred bias handling, module count ' \
+                'fixed before discovery) and gives no certificate; pass ' \
+                '--dp-allow-experimental to run it with noise on synthetic data.'
         assert not getattr(args, 'num_experts', None), \
             'DP-SGD does not support MoE (auxiliary loss scaling interaction)'
         # Tied input embedding / output projection share one weight, but ghost
@@ -2602,6 +2615,10 @@ def _add_dp_sgd_args(parser):
                        '--dp-num-records-range) fits the budget is computed from public '
                        'quantities only, and training stops at that step. No stop '
                        'decision depends on the data or its record count.')
+    group.add_argument('--dp-allow-experimental', action='store_true',
+                       help='Allow DP code paths with open privacy findings (currently '
+                       '--dp-clipping-mode per_layer with noise). No certificate; '
+                       'synthetic data only.')
     group.add_argument('--dp-allow-row-level-privacy', action='store_true',
                        help='Allow training on records without privacy_unit_id. The '
                        'guarantee is then per ROW, not per patient/document, and is '
