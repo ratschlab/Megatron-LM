@@ -1004,15 +1004,32 @@ def validate_args(args, defaults={}):
     return args
 
 
+# Attributes of ``args`` that must never be printed or logged (stdout,
+# TensorBoard, wandb): the DP-SGD secret seeds (a known sampling schedule gets
+# no subsampling amplification; a known noise seed lets the noise be subtracted
+# from two consecutive checkpoints) and DP runtime state restored from
+# checkpoints into ``args`` (``_dp_*``: sampler state with its RNG state,
+# accounting state).
+DP_SECRET_ARGS = frozenset({'dp_sampling_seed', 'dp_noise_seed'})
+
+
+def public_args_items(args):
+    """``(name, value)`` pairs of ``args`` that are safe to print or log."""
+    for name in vars(args):
+        if name in DP_SECRET_ARGS or name.startswith('_dp_'):
+            continue
+        yield name, getattr(args, name)
+
+
 def _print_args(title, args):
-    """Print arguments."""
+    """Print arguments (DP secrets and DP runtime state excluded)."""
     if args.rank == 0:
         print(f'------------------------ {title} ------------------------',
               flush=True)
         str_list = []
-        for arg in vars(args):
+        for arg, value in public_args_items(args):
             dots = '.' * (48 - len(arg))
-            str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
+            str_list.append('  {} {} {}'.format(arg, dots, value))
         for arg in sorted(str_list, key=lambda x: x.lower()):
             print(arg, flush=True)
         print(f'-------------------- end of {title} ---------------------',

@@ -17,7 +17,7 @@ from megatron.training import get_args
 from megatron.training import get_tensorboard_writer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.rerun_state_machine import initialize_rerun_state_machine, RerunErrorInjector, RerunDiagnostic, RerunMode
-from megatron.training.arguments import parse_args, validate_args
+from megatron.training.arguments import parse_args, public_args_items, validate_args
 from megatron.training.yaml_arguments import validate_yaml
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
@@ -362,12 +362,13 @@ def _set_random_seed(seed_, data_parallel_random_init=False, te_rng_tracker=Fals
 
 
 def write_args_to_tensorboard():
-    """Write arguments to tensorboard."""
+    """Write arguments to tensorboard (DP secret seeds and DP runtime state,
+    e.g. the restored sampler state, are excluded)."""
     args = get_args()
     writer = get_tensorboard_writer()
     if writer:
-        for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
+        for arg, value in public_args_items(args):
+            writer.add_text(arg, str(value), global_step=args.iteration)
 
 
 def set_jit_fusion_options():

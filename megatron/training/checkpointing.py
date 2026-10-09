@@ -694,7 +694,8 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
             # The event history lets a resumed run recompose exactly at delta.
             state_dict['dp_sgd_accounting'] = {
                 'sampling_method': _dp_accountant.sampling_method,
-                'dataset_size': _dp_accountant.N,
+                'num_records': _dp_accountant.N,
+                'population_bound': _dp_accountant.population_bound,
                 'physical_batch': _dp_accountant.B,
                 'sampling_probability': _dp_accountant.q,
                 'delta': _dp_accountant.delta,

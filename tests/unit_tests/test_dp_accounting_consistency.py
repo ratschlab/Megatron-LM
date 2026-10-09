@@ -26,14 +26,29 @@ from megatron.training.dp_accounting_utils import (  # noqa: E402
 )
 
 N, B, DELTA = 1000, 16, 1e-7
+N_BOUND = 1000  # public population bound from which q is derived (enters no event)
 
 
 def _bundle(method, sigma=0.8, fraction=0.85, **kw):
-    # n = N + 1 is the larger add/remove neighbour of a dataset with N rows.
-    n = N + 1 if method == 'truncated_poisson' else N
-    q = B / n * (fraction if method == 'truncated_poisson' else 1.0)
-    return DPAccountantBundle(method, n, B, q, DELTA, sigma, enable_prv=False,
-                              pld_discretization=1e-2, **kw)
+    # q is a public constant; the bundle takes the record count N and
+    # certifies both add/remove neighbour pairs of a dataset with N records.
+    q = B / N_BOUND * (fraction if method == 'truncated_poisson' else 1.0)
+    return DPAccountantBundle(method, N, B, q, DELTA, sigma, enable_prv=False,
+                              pld_discretization=1e-2, population_bound=N_BOUND, **kw)
+
+
+def _library_epsilon(dataset_size, q, sigma, steps, discretization=1e-2):
+    """Epsilon of one neighbour pair straight from dp-accounting."""
+    from dp_accounting import dp_event
+    from dp_accounting import privacy_accountant as pa
+    from dp_accounting.pld import pld_privacy_accountant
+    acc = pld_privacy_accountant.PLDAccountant(
+        neighboring_relation=pa.NeighboringRelation.ADD_OR_REMOVE_ONE,
+        value_discretization_interval=discretization)
+    acc.compose(dp_event.TruncatedSubsampledGaussianDpEvent(
+        dataset_size=dataset_size, sampling_probability=q,
+        truncated_batch_size=B, noise_multiplier=sigma), steps)
+    return acc.get_epsilon(DELTA)
 
 
 class TestSamplerAccountantConsistency:
@@ -49,10 +64,14 @@ class TestSamplerAccountantConsistency:
     def test_truncated_poisson_uses_certified_event(self):
         from dp_accounting import dp_event
         b = _bundle('truncated_poisson')
+        # The event's dataset_size is the larger neighbour: a dataset of N
+        # records needs the removal pair (N) and the addition pair (N + 1).
+        assert b.pair_sizes() == (N, N + 1)
         ev = b.step_event(0.8, certified=True)
         assert isinstance(ev, dp_event.TruncatedSubsampledGaussianDpEvent)
-        assert ev.dataset_size == N + 1 and ev.truncated_batch_size == B
-        assert abs(ev.sampling_probability - 0.85 * B / (N + 1)) < 1e-12
+        assert ev.dataset_size == N and ev.truncated_batch_size == B
+        assert b.step_event(0.8, dataset_size=N + 1).dataset_size == N + 1
+        assert abs(ev.sampling_probability - 0.85 * B / N_BOUND) < 1e-12
         proxy = b.step_event(0.8, certified=False)
         assert isinstance(proxy, dp_event.PoissonSampledDpEvent)
 
@@ -80,17 +99,47 @@ class TestSamplerAccountantConsistency:
         # this tiny regime; the direction must hold regardless.
         assert full.epsilon(force=True) > part.epsilon(force=True)
 
-    def test_larger_population_bound_is_conservative(self):
-        """At fixed q the certified epsilon is non-decreasing in dataset_size,
-        so using the larger neighbour (or any larger public n) is safe."""
-        q = 0.85 * B / (N + 1)
+    def test_certified_epsilon_is_max_over_both_neighbour_pairs(self):
+        """The certificate for a dataset of N records is the larger of the
+        removal-pair and addition-pair epsilons at the same q."""
+        b = _bundle('truncated_poisson')
+        b.compose_step(0.8, 50)
+        direct = [_library_epsilon(size, b.q, 0.8, 50) for size in (N, N + 1)]
+        assert b.epsilon(force=True) == pytest.approx(max(direct), rel=1e-9)
+        assert b.prospective_epsilon(0.8) == pytest.approx(
+            max(_library_epsilon(size, b.q, 0.8, 51) for size in (N, N + 1)), rel=1e-9)
+
+    def test_epsilon_is_not_monotone_in_dataset_size(self):
+        """Why both pairs are evaluated: at fixed q the removal pair can be
+        strictly worse than the addition pair (independent of the PLD
+        discretization), so no single larger bound replaces the actual pairs."""
+        q = B / 51.0
+        e_removal = _library_epsilon(50, q, 4.0, 1, discretization=1e-3)
+        e_addition = _library_epsilon(51, q, 4.0, 1, discretization=1e-3)
+        assert e_removal > e_addition
+
+    def test_population_bound_enters_no_event(self):
+        """The public bound only defines q; two bundles with the same N, B, q
+        and different bounds certify the same epsilon."""
+        q = 0.85 * B / N_BOUND
         eps = []
-        for n in (N + 1, 2 * N):
-            b = DPAccountantBundle('truncated_poisson', n, B, q, DELTA, 0.8,
-                                   enable_prv=False, pld_discretization=1e-2)
-            b.compose_step(0.8, 50)
+        for bound in (N_BOUND, 5 * N_BOUND):
+            b = DPAccountantBundle('truncated_poisson', N, B, q, DELTA, 0.8,
+                                   enable_prv=False, pld_discretization=1e-2,
+                                   population_bound=bound)
+            b.compose_step(0.8, 20)
             eps.append(b.epsilon(force=True))
-        assert eps[1] >= eps[0] - 1e-9
+        assert eps[0] == eps[1]
+
+    def test_epsilon_for_population_uses_the_composed_history(self):
+        """The informational per-source value recomposes this run's history
+        (including count releases) for another record count; for the run's
+        own N it equals the certificate."""
+        b = _bundle('truncated_poisson')
+        b.compose_step(0.8, 20)
+        b.compose_step(effective_sigma(0.8, 10.0, 1), 20)
+        assert b.epsilon_for_population(N) == pytest.approx(b.epsilon(force=True), rel=1e-9)
+        assert b.epsilon_for_population(N // 2) != b.epsilon(force=True)
 
     def test_epsilon_is_exact_at_the_stated_delta(self):
         """epsilon() is a certified value of the composed history, never an
@@ -171,7 +220,7 @@ class TestSamplerAccountantConsistency:
     def test_epsilon_for_steps_matches_bundle(self):
         b = _bundle('truncated_poisson')
         b.compose_step(0.8, 30)
-        e_direct = epsilon_for_steps('truncated_poisson', N + 1, B, 0.85 * B / (N + 1),
+        e_direct = epsilon_for_steps('truncated_poisson', N, B, 0.85 * B / N_BOUND,
                                      0.8, DELTA, 30)
         # epsilon_for_steps uses the default discretization (1e-3), so compare loosely.
         assert e_direct == pytest.approx(b.epsilon(force=True), rel=0.1)
@@ -247,3 +296,39 @@ class TestPrivateQuantileInit:
         c_large = init_fn(torch.rand(512) * 100.0, 0.5, **kw)
         assert c_small == pytest.approx(0.5, rel=0.15)
         assert c_large == pytest.approx(50.0, rel=0.15)
+
+
+class TestResumeParameterLock:
+    def test_history_is_not_recomposed_under_other_parameters(self):
+        """A checkpointed event history was run with the stored N, n, B, q,
+        delta and sampler; recomposing it under any other value changes the
+        epsilon of the old steps, so a resume with a changed value is refused."""
+        training = pytest.importorskip('megatron.training.training')
+        b = _bundle('truncated_poisson')
+        stored = dict(sampling_method='truncated_poisson', num_records=N,
+                      population_bound=N_BOUND, physical_batch=B,
+                      sampling_probability=b.q, delta=DELTA)
+        training._dp_check_resume_params(b, stored)  # identical: accepted
+        for key, bad in (('num_records', N + 10), ('population_bound', 2 * N_BOUND),
+                         ('physical_batch', B + 1), ('sampling_probability', b.q * 1.01),
+                         ('delta', DELTA / 2), ('sampling_method', 'shuffle_wor')):
+            with pytest.raises(RuntimeError, match=key):
+                training._dp_check_resume_params(b, {**stored, key: bad})
+        with pytest.raises(RuntimeError, match='num_records'):
+            training._dp_check_resume_params(
+                b, {k: v for k, v in stored.items() if k != 'num_records'})
+
+
+class TestArgumentDumpsHideSecrets:
+    def test_public_args_items_drops_seeds_and_runtime_state(self):
+        """stdout, TensorBoard and wandb dumps all go through this filter."""
+        arguments = pytest.importorskip('megatron.training.arguments')
+        import argparse
+        args = argparse.Namespace(
+            seed=1234, dp_noise_multiplier=0.8, dp_accounting_params={'num_records': 10},
+            dp_sampling_seed=42, dp_noise_seed=7,
+            _dp_dataloader_state={'rng_state': 'secret'},
+            _dp_accounting_at_resume={'history': {}},
+        )
+        public = dict(arguments.public_args_items(args))
+        assert set(public) == {'seed', 'dp_noise_multiplier', 'dp_accounting_params'}

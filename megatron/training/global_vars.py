@@ -183,11 +183,13 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
+        from megatron.training.arguments import public_args_items
         wandb_kwargs = {
             'dir': save_dir,
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
-            'config': vars(args)}
+            # DP secret seeds and DP runtime state are never uploaded.
+            'config': dict(public_args_items(args))}
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb

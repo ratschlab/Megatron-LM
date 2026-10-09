@@ -342,11 +342,20 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                 'DP-SGD: dp_sampling_seed not set; the DP external dataloader must '
                 'be built through pretrain() so that a secret seed is generated.')
 
-        # Public population bound n for truncated Poisson: q and the
-        # accountant's dataset_size are derived from n, not from the live row
-        # count, so neighbouring datasets run the same mechanism. n must be at
-        # least N+1 (the larger add/remove neighbour); larger is conservative.
+        # Public population bound n for truncated Poisson: q = fraction * B / n
+        # is a public constant chosen independently of the data, so that
+        # neighbouring datasets run the same mechanism. The accountant certifies
+        # the actual neighbour pairs (N and N+1 records); n enters no event and
+        # is never checked against the row count (a size threshold would leave
+        # the mechanism undefined on one side of a pair).
+        _method = getattr(args, 'dp_sampling_method', 'truncated_poisson')
         _population = args.dp_num_dataset_examples if args.dp_num_dataset_examples > 0 else None
+        if _population is None and _method == 'truncated_poisson' and args.dp_noise_multiplier > 0:
+            raise RuntimeError(
+                'DP-SGD: --dp-num-dataset-examples is required for truncated_poisson with '
+                'noise. It is the public population bound n from which q = fraction * B / n '
+                'is derived: a constant chosen independently of the data (e.g. the data '
+                "card's record count), not the loaded row count.")
 
         train_ds = DPExternalDataloader(
             data_path=args.dp_data_path,
@@ -375,9 +384,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                          f"larger than the {train_ds.N} loaded records: valid, but the "
                          f"expected draw is only {train_ds.q * train_ds.N:.1f} of "
                          f"{train_ds.B_global_step} per step (rest is padding).")
+        elif train_ds.N > train_ds.population_size:
+            print_rank_0(f"  WARNING: {train_ds.N} loaded records exceed the public population "
+                         f"bound n={train_ds.population_size}: expected draw "
+                         f"{train_ds.q * train_ds.N:.1f} of {train_ds.B_global_step} per step, "
+                         f"most steps truncated; epsilon is charged accordingly.")
 
         # Hand the sampler's exact parameters to the accountant so both describe
-        # the same mechanism (sampler, population bound, physical batch, q).
+        # the same mechanism (sampler, record count, physical batch, q).
         _acct = train_ds.accounting_params()
         args.dp_accounting_params = _acct
         if _acct['privacy_unit'] != 'unit':
@@ -385,9 +399,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                          "per ROW, not per patient/document, unless preprocessing "
                          "guarantees one row per unit.")
 
-        print_rank_0(f"  {train_ds.N} training records, n={train_ds.population_size} for accounting, "
-                     f"sampling={train_ds.sampling_method}, q={_acct['sampling_probability']:.6g}, "
-                     f"physical batch={_acct['physical_batch']}, privacy unit={_acct['privacy_unit']}")
+        print_rank_0(f"  {train_ds.N} training records, public population bound "
+                     f"n={train_ds.population_size}, sampling={train_ds.sampling_method}, "
+                     f"q={_acct['sampling_probability']:.6g}, physical batch={_acct['physical_batch']}, "
+                     f"privacy unit={_acct['privacy_unit']}")
         # Return train_ds as validation too (for --skip-train eval with same data).
         # The eval path is forward-only, so reusing train data is fine for loss comparison.
         return train_ds, train_ds, None

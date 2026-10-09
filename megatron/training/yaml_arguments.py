@@ -372,14 +372,15 @@ def validate_yaml(args, defaults={}):
     return args
 
 def _print_args(title, args):
-    """Print arguments."""
+    """Print arguments (DP secrets and DP runtime state excluded)."""
+    from megatron.training.arguments import public_args_items
     if args.rank == 0:
         print(f'------------------------ {title} ------------------------',
               flush=True)
         str_list = []
-        for arg in vars(args):
+        for arg, value in public_args_items(args):
             dots = '.' * (48 - len(arg))
-            str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
+            str_list.append('  {} {} {}'.format(arg, dots, value))
         for arg in sorted(str_list, key=lambda x: x.lower()):
             print(arg, flush=True)
         print(f'-------------------- end of {title} ---------------------',

@@ -67,13 +67,37 @@ _dp_epsilon_clinical = 0.0
 _dp_epsilon_literature = 0.0
 
 
-def _compute_epsilon_for_steps(num_steps, q, sigma, delta, sampling_method,
-                               dataset_size, physical_batch):
-    """Certified epsilon of ``num_steps`` identical steps for one population
-    (used by the dual clinical/literature counters)."""
-    from megatron.training.dp_accounting_utils import epsilon_for_steps
-    return epsilon_for_steps(sampling_method, dataset_size, physical_batch,
-                             q, sigma, delta, num_steps)
+def _dp_check_resume_params(bundle, stored):
+    """Refuse to recompose a checkpointed event history under different
+    mechanism parameters. The stored steps were run with the stored record
+    count, batch size, q and delta; re-evaluating them with other values
+    changes their epsilon (a larger population at fixed q lowered a 50-step
+    history from 9.94 to 6.35 in one reproduction)."""
+    if 'num_records' not in stored:
+        raise RuntimeError(
+            'DP-SGD: the checkpoint accounting state has no num_records (written by '
+            'an earlier accountant whose events used the population bound); its '
+            'history cannot be recomposed under the per-pair accountant.')
+    checks = (
+        ('sampling_method', bundle.sampling_method),
+        ('num_records', bundle.N),
+        ('physical_batch', bundle.B),
+        ('sampling_probability', bundle.q),
+        ('delta', bundle.delta),
+        ('population_bound', bundle.population_bound),
+    )
+    for key, live in checks:
+        old = stored.get(key)
+        if isinstance(live, float):
+            same = old is not None and abs(float(old) - live) <= 1e-12 * max(1.0, abs(live))
+        else:
+            same = old == live
+        if not same:
+            raise RuntimeError(
+                f'DP-SGD: checkpoint accounting {key}={old} differs from the current run '
+                f'({live}); an event history cannot be recomposed under different '
+                f'mechanism parameters. Resume with the original data, batch size, '
+                f'--dp-num-dataset-examples, --dp-poisson-expected-fraction and --dp-delta.')
 
 
 def _dp_step_sigma_eff(args, model, extra_count_queries=0):
@@ -1731,7 +1755,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 if _method == 'truncated_poisson':
                     _q *= getattr(args, 'dp_poisson_expected_fraction', 0.85)
                 _acct_params = dict(sampling_method=_method,
-                                    dataset_size=args.dp_num_dataset_examples,
+                                    num_records=args.dp_num_dataset_examples,
+                                    population_bound=args.dp_num_dataset_examples,
                                     physical_batch=_B,
                                     sampling_probability=min(1.0, _q))
                 if args.rank == 0:
@@ -1742,7 +1767,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 from megatron.training.dp_accounting_utils import DPAccountantBundle
                 _dp_accountant = DPAccountantBundle(
                     sampling_method=_acct_params['sampling_method'],
-                    dataset_size=_acct_params['dataset_size'],
+                    num_records=_acct_params['num_records'],
+                    population_bound=_acct_params.get('population_bound'),
                     physical_batch=_acct_params['physical_batch'],
                     sampling_probability=_acct_params['sampling_probability'],
                     delta=args.dp_delta,
@@ -1768,6 +1794,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 # that needs --dp-allow-legacy-resume and is reported as such.
                 _resume = getattr(args, '_dp_accounting_at_resume', None)
                 if _resume is not None and 'history' in _resume:
+                    _dp_check_resume_params(_dp_accountant, _resume)
                     _dp_accountant.load_history(_resume['history'])
                     if args.rank == 0:
                         print(f'DP-SGD: restored accounting history '
@@ -1787,6 +1814,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                               f'{_dp_accountant.delta_total:g}, not delta.')
                 if args.rank == 0:
                     print(f'DP-SGD: Privacy accountant initialized ({_dp_accountant.describe()})')
+                    if getattr(args, 'dp_num_clinical_examples', 0) > 0 or \
+                            getattr(args, 'dp_num_literature_examples', 0) > 0:
+                        print('DP-SGD: eps_clinical / eps_literature are informational '
+                              '(this run\'s composed history on a hypothetical '
+                              'single-source dataset), not certificates of this run.')
         elif args.rank == 0:
             print('DP-SGD: sigma=0, no privacy accounting (epsilon is infinite).')
 
@@ -1892,14 +1924,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             _log_now = (iteration % args.log_interval == 0) or should_checkpoint or should_exit
             if _log_now:
                 _dp_current_epsilon = _dp_accountant.epsilon(force=True)
-                for _N_src, _steps, _attr in (
-                        (N_clinical, _dp_clinical_steps, '_dp_epsilon_clinical'),
-                        (N_literature, _dp_literature_steps, '_dp_epsilon_literature')):
-                    if _N_src > 0:
-                        _q_src = min(1.0, _dp_accountant.q * _dp_accountant.N / _N_src)
-                        globals()[_attr] = _compute_epsilon_for_steps(
-                            _steps, _q_src, args.dp_noise_multiplier, args.dp_delta,
-                            _dp_accountant.sampling_method, _N_src, _dp_accountant.B)
+                # Informational: the same composed history (every step's joint
+                # sigma_eff, including count releases, same q) on a
+                # hypothetical dataset of N_src records.
+                if N_clinical > 0:
+                    _dp_epsilon_clinical = _dp_accountant.epsilon_for_population(N_clinical)
+                if N_literature > 0:
+                    _dp_epsilon_literature = _dp_accountant.epsilon_for_population(N_literature)
                 if args.rank == 0:
                     eps_str = (f'DP-SGD: step={iteration}, eps={_dp_current_epsilon:.4f} '
                                f'[{_dp_accountant.certified_name}]')

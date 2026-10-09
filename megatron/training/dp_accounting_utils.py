@@ -11,11 +11,20 @@ only accountants that certify them:
     subset of size ``B``; a smaller draw is padded with zero-loss dummies.
     Certified by the PLD accountant with
     ``TruncatedSubsampledGaussianDpEvent`` (Ganesh 2025, arXiv:2508.15089)
-    under add/remove adjacency.  ``dataset_size`` is the public population
-    bound ``n`` (the larger neighbour of the add/remove pair, so at least the
-    number of records plus one); ``q`` must be derived from ``n`` and not
-    from the live row count, so that neighbouring datasets run the same
-    mechanism.  The certified epsilon is monotone in ``n`` at fixed ``q``.
+    under add/remove adjacency.  The event's ``dataset_size`` is the size of
+    the *larger* neighbour (the library computes the truncation probability
+    over ``dataset_size - 1`` other records), so a dataset of ``N`` records
+    is covered by two pairs: removal (``dataset_size = N``) and addition
+    (``dataset_size = N + 1``).  The certified epsilon is the maximum over
+    both pairs, evaluated with the same ``q``.  ``q`` must be a public
+    constant (derived from a public population bound ``n`` chosen
+    independently of the data), never a function of the live row count:
+    neighbouring datasets must run the same mechanism, and a loader that
+    rejects datasets by size would leave the mechanism undefined on one side
+    of a pair.  The epsilon is *not* monotone in ``dataset_size`` at fixed
+    ``q`` in general (e.g. N=50, B=8, sigma=4: removal 0.7923 > addition
+    0.7912), so no single bound substitutes for the two actual pairs.  ``N``
+    is treated as public for accounting, as in every DP-SGD accountant.
     RDP and PRV cannot express truncation; they are kept only as
     *untruncated proxies* for comparison and never gate the budget.
 
@@ -71,7 +80,7 @@ class DPAccountantBundle:
     def __init__(
         self,
         sampling_method: str,
-        dataset_size: int,
+        num_records: int,
         physical_batch: int,
         sampling_probability: float,
         delta: float,
@@ -80,16 +89,23 @@ class DPAccountantBundle:
         enable_prv: bool = True,
         eval_interval: int = 1,
         pld_discretization: float = 1e-3,
+        population_bound: Optional[int] = None,
     ):
+        """``num_records`` is the number of records in the training set (the
+        smaller neighbour of the addition pair and the larger of the removal
+        pair); ``population_bound`` is the public constant ``n`` from which
+        ``sampling_probability`` was derived (informational: it never enters
+        an event)."""
         assert sampling_method in SAMPLING_METHODS, sampling_method
-        assert dataset_size > 0 and physical_batch > 0
+        assert num_records > 0 and physical_batch > 0
         assert 0.0 < sampling_probability <= 1.0, sampling_probability
         from dp_accounting import dp_event  # noqa: F401  (hard requirement)
         from dp_accounting import privacy_accountant as pa
         from dp_accounting.rdp import rdp_privacy_accountant
 
         self.sampling_method = sampling_method
-        self.N = int(dataset_size)
+        self.N = int(num_records)
+        self.population_bound = None if population_bound is None else int(population_bound)
         self.B = int(physical_batch)
         self.q = float(sampling_probability)
         self.delta = float(delta)
@@ -139,13 +155,24 @@ class DPAccountantBundle:
     # ------------------------------------------------------------------
     # Event construction
     # ------------------------------------------------------------------
-    def step_event(self, sigma: float, certified: bool = True):
-        """Event for one optimizer step with joint per-step noise multiplier."""
+    def pair_sizes(self, num_records: Optional[int] = None):
+        """``dataset_size`` values (larger neighbour of each pair) that cover a
+        dataset of ``num_records`` records: removal and addition for
+        truncated Poisson under add/remove; the fixed size for replace-one."""
+        N = self.N if num_records is None else int(num_records)
+        if self.sampling_method == TRUNCATED_POISSON:
+            return (N, N + 1)
+        return (N,)
+
+    def step_event(self, sigma: float, certified: bool = True,
+                   dataset_size: Optional[int] = None):
+        """Event for one optimizer step with joint per-step noise multiplier.
+        ``dataset_size`` selects the neighbour pair (default: removal pair)."""
         from dp_accounting import dp_event
         if self.sampling_method == TRUNCATED_POISSON:
             if certified:
                 return dp_event.TruncatedSubsampledGaussianDpEvent(
-                    dataset_size=self.N,
+                    dataset_size=self.N if dataset_size is None else int(dataset_size),
                     sampling_probability=self.q,
                     truncated_batch_size=self.B,
                     noise_multiplier=sigma,
@@ -206,14 +233,29 @@ class DPAccountantBundle:
             )
         return self._rdp_cls(orders=RDP_ORDERS, neighboring_relation=self._rel_replace)
 
-    def _certified_epsilon_of(self, counts, discretization: Optional[float] = None) -> float:
-        """Certified (pessimistic) epsilon of ``counts``. Any PLD discretization
-        gives a valid upper bound; a coarser one is looser but ~10x cheaper."""
-        acc = self._fresh_certified(discretization)
-        for sigma, count in counts.items():
-            if count > 0:
-                acc.compose(self.step_event(sigma, certified=True), count)
-        return acc.get_epsilon(self.delta)
+    def _certified_epsilon_of(self, counts, discretization: Optional[float] = None,
+                              num_records: Optional[int] = None) -> float:
+        """Certified (pessimistic) epsilon of ``counts``: the maximum over the
+        neighbour pairs of a dataset with ``num_records`` records (default:
+        this run's). Any PLD discretization gives a valid upper bound; a
+        coarser one is looser but ~10x cheaper."""
+        eps = 0.0
+        for size in self.pair_sizes(num_records):
+            acc = self._fresh_certified(discretization)
+            for sigma, count in counts.items():
+                if count > 0:
+                    acc.compose(self.step_event(sigma, certified=True, dataset_size=size),
+                                count)
+            eps = max(eps, acc.get_epsilon(self.delta))
+        return eps
+
+    def epsilon_for_population(self, num_records: int) -> float:
+        """Exact certified epsilon of this run's composed history (same q,
+        same joint per-step noise multipliers) for a hypothetical dataset of
+        ``num_records`` records. Informational only: the certificate for this
+        run is ``epsilon()``."""
+        return self.legacy_epsilon_at_resume + self._certified_epsilon_of(
+            self._step_counts, num_records=num_records)
 
     def _evaluate(self):
         eps = self._certified_epsilon_of(self._step_counts)
@@ -290,7 +332,9 @@ class DPAccountantBundle:
     def describe(self) -> str:
         parts = [
             f'sampler={self.sampling_method}',
-            f'n={self.N}',
+            f'N={self.N}',
+            f'pairs={"/".join(str(m) for m in self.pair_sizes())}',
+            f'n_bound={self.population_bound}',
             f'B={self.B}',
             f'q={self.q:.6g}',
             f'delta={self.delta:g}',
@@ -303,17 +347,17 @@ class DPAccountantBundle:
 
 def epsilon_for_steps(
     sampling_method: str,
-    dataset_size: int,
+    num_records: int,
     physical_batch: int,
     sampling_probability: float,
     sigma: float,
     delta: float,
     num_steps: int,
 ) -> float:
-    """Certified epsilon of ``num_steps`` identical steps (used by the dual
-    clinical/literature counters, which only differ in the population size)."""
+    """Certified epsilon of ``num_steps`` identical steps on ``num_records``
+    records (both neighbour pairs, see ``DPAccountantBundle``)."""
     bundle = DPAccountantBundle(
-        sampling_method, dataset_size, physical_batch, sampling_probability,
+        sampling_method, num_records, physical_batch, sampling_probability,
         delta, sigma, enable_prv=False,
     )
     bundle.compose_step(sigma, num_steps)
