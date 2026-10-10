@@ -422,3 +422,37 @@ class TestNoiseStreamsDoNotCollide:
             'layer0_t1': dp_noise_generator_seed(base, 6, 'layer_count', 0),
         }
         assert len(set(seeds.values())) == len(seeds)
+
+
+class TestEvaluationAndCertificateLabels:
+    def test_internal_dp_tensors_are_not_metrics(self):
+        """The per-example loss vector the loss function hands to the schedule
+        stays out of the scalar metric aggregation (evaluation crashed when it
+        was added to a scalar)."""
+        import torch
+        training = pytest.importorskip('megatron.training.training')
+        assert training._dp_is_internal_metric('dp_per_example_losses', torch.zeros(1))
+        assert training._dp_is_internal_metric('unit_boundaries', torch.zeros(3))
+        assert training._dp_is_internal_metric('anything', torch.zeros(2))
+        assert not training._dp_is_internal_metric('lm loss', torch.tensor(1.0))
+        assert not training._dp_is_internal_metric('lm loss', (torch.tensor(1.0), torch.tensor(2.0)))
+
+    def test_uncertified_runs_are_labelled(self):
+        """Experimental per-layer clipping, public seeds, a legacy resume and
+        the shuffle sampler never yield a certificate."""
+        import argparse
+        training = pytest.importorskip('megatron.training.training')
+        ok = argparse.Namespace(dp_allow_experimental=False, dp_clipping_mode='global',
+                                dp_sampling_method='truncated_poisson')
+        assert training._dp_certificate_status(ok) == []
+        exp = argparse.Namespace(dp_allow_experimental=True, dp_clipping_mode='per_layer',
+                                 dp_sampling_method='truncated_poisson')
+        assert any('per-layer' in r for r in training._dp_certificate_status(exp))
+        pub = argparse.Namespace(_dp_public_seeds=True, dp_sampling_method='truncated_poisson')
+        assert any('public' in r for r in training._dp_certificate_status(pub))
+        wor = argparse.Namespace(dp_sampling_method='shuffle_wor')
+        assert any('heuristic' in r for r in training._dp_certificate_status(wor))
+        b = _bundle('truncated_poisson')
+        b.legacy_epsilon_at_resume = 1.0
+        leg = argparse.Namespace(dp_allow_legacy_resume=True, dp_sampling_method='truncated_poisson')
+        assert any('legacy' in r for r in training._dp_certificate_status(leg, b))

@@ -128,6 +128,35 @@ def _dp_step_sigma_eff(args, model, extra_count_queries=0):
     return effective_sigma(args.dp_noise_multiplier, sigma_b, K)
 
 
+# Entries the DP loss function adds to the metrics dictionary for the schedule
+# (per-example losses for clipping, packing boundaries). They are not metrics
+# and must not reach the scalar aggregation of training or evaluation.
+DP_INTERNAL_METRIC_KEYS = frozenset({'dp_per_example_losses', 'unit_boundaries'})
+
+
+def _dp_is_internal_metric(key, value):
+    if key in DP_INTERNAL_METRIC_KEYS:
+        return True
+    return torch.is_tensor(value) and value.numel() != 1
+
+
+def _dp_certificate_status(args, accountant=None):
+    """Reasons why the reported epsilon is not a certificate for this run
+    (empty list: certified). Used by the log, the checkpoint and the export."""
+    reasons = []
+    if getattr(args, 'dp_allow_experimental', False) and \
+            getattr(args, 'dp_clipping_mode', 'global') == 'per_layer':
+        reasons.append('experimental per-layer clipping (open privacy findings)')
+    if getattr(args, '_dp_public_seeds', False):
+        reasons.append('public sampling/noise seed')
+    if getattr(args, 'dp_allow_legacy_resume', False) and accountant is not None and \
+            accountant.legacy_epsilon_at_resume > 0:
+        reasons.append('legacy resume (basic composition, delta_total = 2*delta)')
+    if getattr(args, 'dp_sampling_method', 'truncated_poisson') == 'shuffle_wor':
+        reasons.append('shuffle_wor accounting is a heuristic')
+    return reasons
+
+
 def _dp_verify_tp_noise_attributes(model, args):
     """Independent noise across tensor-parallel shards relies on the
     ``tensor_model_parallel`` attribute of every parameter: sharded
@@ -1903,9 +1932,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                               f'{_dp_accountant.delta_total:g}, not delta.')
                 if args.rank == 0:
                     print(f'DP-SGD: Privacy accountant initialized ({_dp_accountant.describe()})')
-                    if getattr(args, '_dp_public_seeds', False):
-                        print('DP-SGD: WARNING public sampling/noise seed(s) supplied; the '
-                              'reported epsilon is NOT a certificate for this run.')
+                    _uncert = _dp_certificate_status(args, _dp_accountant)
+                    if _uncert:
+                        print('DP-SGD: WARNING the reported epsilon is NOT a certificate for '
+                              'this run: ' + '; '.join(_uncert) + '.')
                     _lo, _hi = _dp_accountant.records_range
                     if getattr(args, 'dp_num_records_range', None) is None:
                         print(f'DP-SGD: NOTE --dp-num-records-range not given; the certificate '
@@ -2058,9 +2088,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     _dp_epsilon_literature = _dp_accountant.epsilon_for_population(N_literature)
                 if args.rank == 0:
                     _lo, _hi = _dp_accountant.records_range
+                    _uncert = _dp_certificate_status(args, _dp_accountant)
+                    _label = (f'NOT A CERTIFICATE ({"; ".join(_uncert)}); worst case over '
+                              f'record counts in [{_lo}, {_hi}]' if _uncert else
+                              f'certificate for record counts in [{_lo}, {_hi}]')
                     eps_str = (f'DP-SGD: step={iteration}, eps={_dp_accountant.range_epsilon():.4f} '
-                               f'[certificate for record counts in [{_lo}, {_hi}]: '
-                               f'{_dp_accountant.range_certificate_name}], '
+                               f'[{_label}: {_dp_accountant.range_certificate_name}], '
                                f'eps_pairs_N={_dp_current_epsilon:.4f} '
                                f'[this dataset, informational: {_dp_accountant.certified_name}]')
                     for _name, _val in _dp_accountant.proxy_epsilons().items():
@@ -2279,6 +2312,8 @@ def evaluate(forward_step_func,
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
+                        if _dp_is_internal_metric(key, loss_dict[key]):
+                            continue  # per-example loss vector etc., not a metric
                         if key not in total_loss_dict:
                             total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
                         val = loss_dict[key]

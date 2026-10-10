@@ -694,6 +694,9 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
             # dataset's neighbour pairs is stored separately (informational).
             state_dict['dp_sgd_epsilon'] = _dp_accountant.range_epsilon()
             state_dict['dp_sgd_epsilon_pairs'] = _dp_accountant.epsilon(force=True)
+            _uncert = training_module._dp_certificate_status(args, _dp_accountant)
+            state_dict['dp_sgd_certified'] = not _uncert
+            state_dict['dp_sgd_uncertified_reasons'] = list(_uncert)
             # The event history lets a resumed run recompose exactly at delta.
             state_dict['dp_sgd_accounting'] = {
                 'sampling_method': _dp_accountant.sampling_method,
